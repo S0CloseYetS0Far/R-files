@@ -4,6 +4,7 @@ mod config;
 mod docs;
 mod fileops;
 mod preview;
+mod properties;
 mod util;
 
 use gtk::prelude::*;
@@ -83,6 +84,14 @@ popover.ctx-menu separator { margin: 3px 6px; background-color: #2c2c2c; min-hei
 /* ---------- sidebar drag & drop ---------- */
 .sidebar list row.drop-above { box-shadow: inset 0 2px #3584e4; }
 .sidebar list row.drop-below { box-shadow: inset 0 -2px #3584e4; }
+
+/* ---------- properties dialog ---------- */
+window.props .props-name { font-size: 16px; font-weight: bold; color: #ffffff; }
+window.props .props-key { color: #8c8c8c; }
+window.props .props-head { color: #8c8c8c; font-size: 11px; font-weight: bold; }
+window.props .props-mono, window.props entry.props-octal { font-family: monospace; }
+window.props entry.props-octal { min-height: 26px; background: #161616; }
+window.props separator { background-color: #1d1d1d; }
 
 /* ---------- batch rename dialog (batch_rename.rs) ---------- */
 listview.br-list { background-color: #0a0a0a; }
