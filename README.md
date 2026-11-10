@@ -21,11 +21,16 @@ Click once on a PDF to read it page by page, or on a folder to see what's inside
 - **Sidebar** with Home, Recent, Starred, Documents, Downloads, Trash and more. Drag items to reorder them
 - **Pin folders** to the sidebar with one click (click again to unpin)
 - **Copy / cut / paste** (works together with GNOME Files)
+- **Drag and drop** files between folders, the sidebar and other apps (same drive moves, other drive copies; Ctrl copies, Shift moves)
+- **Thumbnails** for images and PDFs, made in the background for the files on screen and shared with GNOME Files
+- **Compress / extract**: .zip, .tar.gz and .tar.xz (Compress… and Extract Here in the right-click menu)
+- **Properties**: size (live folder totals), dates, owner and editable permissions
+- **Batch rename** several files at once: find & replace, or numbering like `Holiday ###`, with a live preview
 - **Open in Terminal** from any folder
 - **Custom icons**: light-blue folders by default, the system theme, your own image, or a different icon per file
 - **Search** at the top right: filters as you type, Enter searches subfolders too
 - Remembers your window size, sidebar and preview widths
-- Light on memory (about 70 MB)
+- Light on memory (about 67 MB)
 
 ## RFiles vs. GNOME Files (Nautilus)
 
@@ -34,9 +39,9 @@ of 28 wallpaper images (average of 3 runs, memory taken 6 s after launch):
 
 | | **RFiles** | **GNOME Files** |
 |---|---|---|
-| Memory actually used (PSS) | **~68 MB** | ~85 MB |
-| Memory shown by system monitor (RSS) | ~178 MB | ~204 MB |
-| Program size | 0.9 MB, one file | 1.7 MB + extra packages |
+| Memory actually used (PSS) | **~67 MB** | ~85 MB |
+| Memory shown by system monitor (RSS) | ~180 MB | ~204 MB |
+| Program size | 1.7 MB, one file | 1.7 MB + extra packages |
 | Background helpers | none | file indexer for search (~24 MB) |
 
 | Feature | **RFiles** | **GNOME Files** |
@@ -48,14 +53,18 @@ of 28 wallpaper images (average of 3 runs, memory taken 6 s after launch):
 | Custom folder icons and size | ✅ light blue, system, or your own image | icon size only |
 | Open in Terminal | ✅ built in | needs an extension |
 | Search | file names, Enter includes subfolders | ✅ faster, also searches inside documents |
-| Copy / cut / paste | ✅ basic | ✅ with progress, undo and overwrite prompts |
-| Drag and drop files | ❌ | ✅ |
-| Creates thumbnails | ❌ uses existing ones | ✅ |
-| Compress / extract, properties, batch rename | ❌ | ✅ |
+| Copy / cut / paste | ✅ with progress; never overwrites (adds “(copy)”) | ✅ with progress, overwrite prompts |
+| Undo (Ctrl+Z) | ❌ | ✅ |
+| Drag and drop files | ✅ | ✅ |
+| Creates thumbnails | ✅ images and PDFs | ✅ also videos |
+| Compress / extract | ✅ zip, tar.gz, tar.xz | ✅ more formats |
+| Properties dialog | ✅ | ✅ |
+| Batch rename | ✅ find & replace, numbering | ✅ |
 
-**In short:** RFiles is built for browsing and looking at files quickly. GNOME
-Files is the more complete tool for managing them. The two work side by side,
-and copy/paste works between them.
+**In short:** RFiles now covers the everyday file-management basics and adds the
+instant preview pane, with less memory. GNOME Files still has undo, faster
+full-text search and more archive formats. The two work side by side: copy/paste,
+drag and drop and thumbnails are shared between them.
 
 ## Install (Ubuntu 24.04 or newer)
 
@@ -84,7 +93,9 @@ To uninstall: `./install.sh uninstall`
 | Preview / open | single-click / double-click or Enter |
 | Copy / cut / paste | Ctrl+C / Ctrl+X / Ctrl+V |
 | Select several | Ctrl+click, Shift+click, drag a box, Ctrl+A |
-| Rename / move to trash | F2 / Delete |
+| Rename / move to trash | F2 (several selected = batch rename) / Delete |
+| Properties | Alt+Enter or Ctrl+I |
+| Drag to copy / move | drag files; hold Ctrl to copy, Shift to move |
 | New folder | Ctrl+Shift+N |
 | Pin / unpin this folder | pin button or Ctrl+D |
 | Open in terminal | Ctrl+Alt+T |
