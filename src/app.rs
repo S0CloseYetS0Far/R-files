@@ -706,6 +706,9 @@ impl App {
         } else {
             m.push(mi("Star / Unstar", "win.star", ""));
             m.push(None);
+            if !trash {
+                m.push(mi("Rename…", "win.rename", "F2"));
+            }
         }
         m.push(mi("Copy Path", "win.copy-path", ""));
         if trash {
@@ -1914,7 +1917,12 @@ impl App {
             if a.in_trash() {
                 return;
             }
-            let Some(info) = a.selected_info() else { return };
+            let mut infos = a.selected_infos();
+            if infos.len() > 1 {
+                crate::batch_rename::open(&a.window, &infos);
+                return;
+            }
+            let Some(info) = infos.pop() else { return };
             let file = item_file(&info);
             let name = info.display_name().to_string();
             a.prompt("Rename", &name, "Rename", move |new| {
