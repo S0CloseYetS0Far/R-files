@@ -3,6 +3,7 @@ mod config;
 mod docs;
 mod fileops;
 mod preview;
+mod thumbs;
 mod util;
 
 use gtk::prelude::*;

@@ -461,10 +461,12 @@ impl App {
             lbl.set_width_chars(chars);
             lbl.set_max_width_chars(chars);
             set_icon(&img, &info, true);
+            crate::thumbs::bind(li, &img, &info);
             lbl.set_text(&info.display_name());
             bx.set_opacity(if info.is_hidden() { 0.55 } else { 1.0 });
         });
         self.grid.set_factory(Some(&f));
+        crate::thumbs::watch_scroll(&self.grid_scroll);
 
         // List view columns
         self.add_column("Name", 0, true);

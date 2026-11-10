@@ -45,7 +45,7 @@ pub fn apply_folder_icon_setting(setting: &str) {
 pub const ATTRS: &str = "standard::name,standard::display-name,standard::icon,\
 standard::type,standard::size,standard::content-type,standard::is-hidden,\
 standard::is-backup,standard::target-uri,time::modified,thumbnail::path,trash::orig-path,\
-metadata::custom-icon";
+metadata::custom-icon,thumbnail::is-valid";
 
 /// The file an item refers to. Items in recent:/// or network:/// carry a
 /// target-uri that points at the real file.
