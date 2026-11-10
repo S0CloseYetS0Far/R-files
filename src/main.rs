@@ -1,4 +1,5 @@
 mod app;
+mod archive;
 mod batch_rename;
 mod config;
 mod dnd;

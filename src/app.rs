@@ -683,6 +683,14 @@ impl App {
         if dir && !many && !trash {
             m.push(mi("Paste Into Folder", "win.paste-into", ""));
         }
+        if !trash {
+            m.push(None);
+            m.push(mi("Compress…", "win.compress", ""));
+            let sel = self.selected_infos();
+            if sel.iter().all(|i| !is_dir_like(i) && crate::archive::is_archive(&i.name().to_string_lossy())) {
+                m.push(mi("Extract Here", "win.extract-here", ""));
+            }
+        }
         m.push(None);
         if !many {
             let starred = cfg.starred.contains(&uri);
@@ -1922,6 +1930,34 @@ impl App {
             if !paths.is_empty() {
                 a.window.clipboard().set_text(&paths.join("\n"));
             }
+        }));
+        add("compress", Box::new(|a| {
+            let infos = a.selected_infos();
+            let paths: Vec<PathBuf> = infos.iter().filter_map(|i| item_file(i).path()).collect();
+            if a.in_trash() || paths.is_empty() {
+                return;
+            }
+            if paths.len() != infos.len() {
+                a.status.set_text("Can only compress local files");
+                return;
+            }
+            // Starred / search results have no folder of their own: use the first item's
+            let dir = a.current_dir().and_then(|d| d.path()).or_else(|| paths[0].parent().map(Path::to_path_buf));
+            if let Some(dir) = dir {
+                crate::archive::compress_dialog(&a.window, &a.status, dir, paths);
+            }
+        }));
+        add("extract-here", Box::new(|a| {
+            let infos = a.selected_infos();
+            let paths: Vec<PathBuf> = infos.iter().filter_map(|i| item_file(i).path()).collect();
+            if a.in_trash() || paths.is_empty() {
+                return;
+            }
+            if paths.len() != infos.len() {
+                a.status.set_text("Can only extract local files");
+                return;
+            }
+            crate::archive::extract_here(&a.status, paths);
         }));
         add("trash", Box::new(|a| a.delete_selected()));
         add("empty-trash", Box::new(|a| a.empty_trash()));
