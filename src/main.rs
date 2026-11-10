@@ -1,8 +1,12 @@
 mod app;
+mod archive;
+mod batch_rename;
 mod config;
+mod dnd;
 mod docs;
 mod fileops;
 mod preview;
+mod properties;
 mod thumbs;
 mod util;
 
@@ -83,6 +87,28 @@ popover.ctx-menu separator { margin: 3px 6px; background-color: #2c2c2c; min-hei
 /* ---------- sidebar drag & drop ---------- */
 .sidebar list row.drop-above { box-shadow: inset 0 2px #3584e4; }
 .sidebar list row.drop-below { box-shadow: inset 0 -2px #3584e4; }
+
+/* ---------- file drag & drop (dnd.rs): highlight the drop target ---------- */
+gridview.files > child.dnd-hover, columnview.files > listview > row.dnd-hover,
+.sidebar list row.dnd-hover { background-color: rgba(53, 132, 228, 0.30); outline: 2px solid #3584e4; outline-offset: -2px; }
+scrolledwindow.files.dnd-hover { outline: 2px solid #3584e4; outline-offset: -2px; }
+
+/* ---------- properties dialog ---------- */
+window.props .props-name { font-size: 16px; font-weight: bold; color: #ffffff; }
+window.props .props-key { color: #8c8c8c; }
+window.props .props-head { color: #8c8c8c; font-size: 11px; font-weight: bold; }
+window.props .props-mono, window.props entry.props-octal { font-family: monospace; }
+window.props entry.props-octal { min-height: 26px; background: #161616; }
+window.props separator { background-color: #1d1d1d; }
+
+/* ---------- batch rename dialog (batch_rename.rs) ---------- */
+listview.br-list { background-color: #0a0a0a; }
+listview.br-list > row { padding: 0; }
+.br-row { padding: 3px 8px; border-radius: 6px; }
+.br-row.br-same { color: #6f6f6f; }
+.br-row.br-bad { background-color: rgba(255, 123, 114, 0.14); }
+.br-arrow { color: #6f6f6f; }
+scrolledwindow.br-scroll { border: 1px solid #1d1d1d; border-radius: 8px; }
 "#;
 
 fn main() -> glib::ExitCode {

@@ -82,7 +82,7 @@ pub struct App {
     dir_list: gtk::DirectoryList,
     filter_model: gtk::FilterListModel,
     filter: gtk::CustomFilter,
-    selection: gtk::MultiSelection,
+    pub(crate) selection: gtk::MultiSelection,
     query: RefCell<String>,
     show_hidden: Cell<bool>,
     path_entry: gtk::Entry,
@@ -94,7 +94,7 @@ pub struct App {
     settings_btn: gtk::MenuButton,
     pin_btn: gtk::Button,
     search: gtk::SearchEntry,
-    status: gtk::Label,
+    pub(crate) status: gtk::Label,
     view_stack: gtk::Stack,
     grid: gtk::GridView,
     list: gtk::ColumnView,
@@ -395,7 +395,7 @@ impl App {
         });
     }
 
-    fn selected_infos(&self) -> Vec<gio::FileInfo> {
+    pub(crate) fn selected_infos(&self) -> Vec<gio::FileInfo> {
         let bs = self.selection.selection();
         (0..bs.size())
             .filter_map(|i| self.selection.item(bs.nth(i as u32)).and_downcast::<gio::FileInfo>())
@@ -412,7 +412,7 @@ impl App {
         }
     }
 
-    fn current_loc(&self) -> Loc {
+    pub(crate) fn current_loc(&self) -> Loc {
         self.tabs.borrow()[self.current.get()].loc.clone()
     }
 
@@ -423,7 +423,7 @@ impl App {
         }
     }
 
-    fn in_trash(&self) -> bool {
+    pub(crate) fn in_trash(&self) -> bool {
         self.current_dir().map(|f| is_trash(&f)).unwrap_or(false)
     }
 
@@ -507,6 +507,7 @@ impl App {
                 glib::Propagation::Stop
             });
             scroll.add_controller(k);
+            crate::dnd::attach_view(self, scroll);
         }
 
         let a = self.clone();
@@ -597,6 +598,7 @@ impl App {
             }
         });
         widget.add_controller(g);
+        crate::dnd::attach_item(self, widget, li);
     }
 
     /// A compact popup menu built from plain buttons: every option is
@@ -683,6 +685,14 @@ impl App {
         if dir && !many && !trash {
             m.push(mi("Paste Into Folder", "win.paste-into", ""));
         }
+        if !trash {
+            m.push(None);
+            m.push(mi("Compress…", "win.compress", ""));
+            let sel = self.selected_infos();
+            if sel.iter().all(|i| !is_dir_like(i) && crate::archive::is_archive(&i.name().to_string_lossy())) {
+                m.push(mi("Extract Here", "win.extract-here", ""));
+            }
+        }
         m.push(None);
         if !many {
             let starred = cfg.starred.contains(&uri);
@@ -708,6 +718,9 @@ impl App {
         } else {
             m.push(mi("Star / Unstar", "win.star", ""));
             m.push(None);
+            if !trash {
+                m.push(mi("Rename…", "win.rename", "F2"));
+            }
         }
         m.push(mi("Copy Path", "win.copy-path", ""));
         if trash {
@@ -715,6 +728,8 @@ impl App {
         } else {
             m.push(mi("Move to Trash", "win.trash", "Delete"));
         }
+        m.push(None);
+        m.push(mi("Properties", "win.properties", "Alt+Enter"));
         m
     }
 
@@ -739,6 +754,10 @@ impl App {
             "Ctrl+H",
         ));
         m.push(mi("Reload", "win.refresh", "F5"));
+        if self.current_dir().is_some() {
+            m.push(None);
+            m.push(mi("Properties", "win.properties", "Alt+Enter"));
+        }
         m
     }
 
@@ -894,7 +913,7 @@ impl App {
         self.update_status();
     }
 
-    fn reload(self: &Rc<Self>) {
+    pub(crate) fn reload(self: &Rc<Self>) {
         self.load_current();
     }
 
@@ -1095,9 +1114,11 @@ impl App {
         }
 
         self.side_header("Pinned");
+        crate::dnd::attach_pin_target(self, &self.sidebar);
         let pins = self.config.borrow().pins.clone();
         if pins.is_empty() {
             self.side_hint("Right-click a folder → Pin to Sidebar");
+            crate::dnd::attach_pin_target(self, &self.sidebar);
         }
         for uri in pins {
             let f = gio::File::for_uri(&uri);
@@ -1147,6 +1168,7 @@ impl App {
         row.set_child(Some(&bx));
         if let Loc::Dir(f) = &loc {
             row.set_tooltip_text(Some(&display_path(f)));
+            crate::dnd::attach_folder_row(self, &row, f);
         }
         let idx = {
             let mut t = self.sidebar_targets.borrow_mut();
@@ -1206,6 +1228,7 @@ impl App {
             row.add_controller(src);
 
             let drop = gtk::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+            crate::dnd::ignore_file_drags(&drop);
             let r = row.clone();
             drop.connect_motion(move |_, _, y| {
                 let above = y < r.height() as f64 / 2.0;
@@ -1339,7 +1362,7 @@ impl App {
         }
     }
 
-    fn set_pinned(self: &Rc<Self>, uri: String, pinned: bool) {
+    pub(crate) fn set_pinned(self: &Rc<Self>, uri: String, pinned: bool) {
         {
             let mut c = self.config.borrow_mut();
             c.pins.retain(|u| u != &uri);
@@ -1910,13 +1933,46 @@ impl App {
                 a.window.clipboard().set_text(&paths.join("\n"));
             }
         }));
+        add("compress", Box::new(|a| {
+            let infos = a.selected_infos();
+            let paths: Vec<PathBuf> = infos.iter().filter_map(|i| item_file(i).path()).collect();
+            if a.in_trash() || paths.is_empty() {
+                return;
+            }
+            if paths.len() != infos.len() {
+                a.status.set_text("Can only compress local files");
+                return;
+            }
+            // Starred / search results have no folder of their own: use the first item's
+            let dir = a.current_dir().and_then(|d| d.path()).or_else(|| paths[0].parent().map(Path::to_path_buf));
+            if let Some(dir) = dir {
+                crate::archive::compress_dialog(&a.window, &a.status, dir, paths);
+            }
+        }));
+        add("extract-here", Box::new(|a| {
+            let infos = a.selected_infos();
+            let paths: Vec<PathBuf> = infos.iter().filter_map(|i| item_file(i).path()).collect();
+            if a.in_trash() || paths.is_empty() {
+                return;
+            }
+            if paths.len() != infos.len() {
+                a.status.set_text("Can only extract local files");
+                return;
+            }
+            crate::archive::extract_here(&a.status, paths);
+        }));
         add("trash", Box::new(|a| a.delete_selected()));
         add("empty-trash", Box::new(|a| a.empty_trash()));
         add("rename", Box::new(|a| {
             if a.in_trash() {
                 return;
             }
-            let Some(info) = a.selected_info() else { return };
+            let mut infos = a.selected_infos();
+            if infos.len() > 1 {
+                crate::batch_rename::open(&a.window, &infos);
+                return;
+            }
+            let Some(info) = infos.pop() else { return };
             let file = item_file(&info);
             let name = info.display_name().to_string();
             a.prompt("Rename", &name, "Rename", move |new| {
@@ -1924,6 +1980,15 @@ impl App {
                     .map(|_| ())
                     .map_err(|e| e.message().to_string())
             });
+        }));
+        // Properties of the selection, or of the current folder when
+        // nothing is selected (the background menu clears the selection).
+        add("properties", Box::new(|a| {
+            let mut files: Vec<gio::File> = a.selected_infos().iter().map(item_file).collect();
+            if files.is_empty() {
+                files.extend(a.current_dir());
+            }
+            crate::properties::show(&a.window, files);
         }));
         add("new-folder", Box::new(|a| {
             let Some(dir) = a.current_dir().filter(|d| !is_trash(d)) else { return };
@@ -1978,6 +2043,7 @@ impl App {
             ("win.terminal-here", &["<Control><Alt>t"]),
             ("win.grid-view", &["<Control>1"]),
             ("win.list-view", &["<Control>2"]),
+            ("win.properties", &["<Alt>Return", "<Control>i"]),
         ];
         for (action, keys) in accels {
             gapp.set_accels_for_action(action, keys);
