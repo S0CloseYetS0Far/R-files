@@ -7,6 +7,7 @@ mod docs;
 mod fileops;
 mod preview;
 mod properties;
+mod thumbs;
 mod util;
 
 use gtk::prelude::*;
