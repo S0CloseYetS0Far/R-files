@@ -82,7 +82,7 @@ pub struct App {
     dir_list: gtk::DirectoryList,
     filter_model: gtk::FilterListModel,
     filter: gtk::CustomFilter,
-    selection: gtk::MultiSelection,
+    pub(crate) selection: gtk::MultiSelection,
     query: RefCell<String>,
     show_hidden: Cell<bool>,
     path_entry: gtk::Entry,
@@ -94,7 +94,7 @@ pub struct App {
     settings_btn: gtk::MenuButton,
     pin_btn: gtk::Button,
     search: gtk::SearchEntry,
-    status: gtk::Label,
+    pub(crate) status: gtk::Label,
     view_stack: gtk::Stack,
     grid: gtk::GridView,
     list: gtk::ColumnView,
@@ -395,7 +395,7 @@ impl App {
         });
     }
 
-    fn selected_infos(&self) -> Vec<gio::FileInfo> {
+    pub(crate) fn selected_infos(&self) -> Vec<gio::FileInfo> {
         let bs = self.selection.selection();
         (0..bs.size())
             .filter_map(|i| self.selection.item(bs.nth(i as u32)).and_downcast::<gio::FileInfo>())
@@ -412,7 +412,7 @@ impl App {
         }
     }
 
-    fn current_loc(&self) -> Loc {
+    pub(crate) fn current_loc(&self) -> Loc {
         self.tabs.borrow()[self.current.get()].loc.clone()
     }
 
@@ -423,7 +423,7 @@ impl App {
         }
     }
 
-    fn in_trash(&self) -> bool {
+    pub(crate) fn in_trash(&self) -> bool {
         self.current_dir().map(|f| is_trash(&f)).unwrap_or(false)
     }
 
@@ -505,6 +505,7 @@ impl App {
                 glib::Propagation::Stop
             });
             scroll.add_controller(k);
+            crate::dnd::attach_view(self, scroll);
         }
 
         let a = self.clone();
@@ -595,6 +596,7 @@ impl App {
             }
         });
         widget.add_controller(g);
+        crate::dnd::attach_item(self, widget, li);
     }
 
     /// A compact popup menu built from plain buttons: every option is
@@ -892,7 +894,7 @@ impl App {
         self.update_status();
     }
 
-    fn reload(self: &Rc<Self>) {
+    pub(crate) fn reload(self: &Rc<Self>) {
         self.load_current();
     }
 
@@ -1093,9 +1095,11 @@ impl App {
         }
 
         self.side_header("Pinned");
+        crate::dnd::attach_pin_target(self, &self.sidebar);
         let pins = self.config.borrow().pins.clone();
         if pins.is_empty() {
             self.side_hint("Right-click a folder → Pin to Sidebar");
+            crate::dnd::attach_pin_target(self, &self.sidebar);
         }
         for uri in pins {
             let f = gio::File::for_uri(&uri);
@@ -1145,6 +1149,7 @@ impl App {
         row.set_child(Some(&bx));
         if let Loc::Dir(f) = &loc {
             row.set_tooltip_text(Some(&display_path(f)));
+            crate::dnd::attach_folder_row(self, &row, f);
         }
         let idx = {
             let mut t = self.sidebar_targets.borrow_mut();
@@ -1204,6 +1209,7 @@ impl App {
             row.add_controller(src);
 
             let drop = gtk::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+            crate::dnd::ignore_file_drags(&drop);
             let r = row.clone();
             drop.connect_motion(move |_, _, y| {
                 let above = y < r.height() as f64 / 2.0;
@@ -1337,7 +1343,7 @@ impl App {
         }
     }
 
-    fn set_pinned(self: &Rc<Self>, uri: String, pinned: bool) {
+    pub(crate) fn set_pinned(self: &Rc<Self>, uri: String, pinned: bool) {
         {
             let mut c = self.config.borrow_mut();
             c.pins.retain(|u| u != &uri);
