@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod dnd;
 mod docs;
 mod fileops;
 mod preview;
@@ -83,6 +84,11 @@ popover.ctx-menu separator { margin: 3px 6px; background-color: #2c2c2c; min-hei
 /* ---------- sidebar drag & drop ---------- */
 .sidebar list row.drop-above { box-shadow: inset 0 2px #3584e4; }
 .sidebar list row.drop-below { box-shadow: inset 0 -2px #3584e4; }
+
+/* ---------- file drag & drop (dnd.rs): highlight the drop target ---------- */
+gridview.files > child.dnd-hover, columnview.files > listview > row.dnd-hover,
+.sidebar list row.dnd-hover { background-color: rgba(53, 132, 228, 0.30); outline: 2px solid #3584e4; outline-offset: -2px; }
+scrolledwindow.files.dnd-hover { outline: 2px solid #3584e4; outline-offset: -2px; }
 
 /* ---------- properties dialog ---------- */
 window.props .props-name { font-size: 16px; font-weight: bold; color: #ffffff; }
