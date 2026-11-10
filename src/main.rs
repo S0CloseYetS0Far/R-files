@@ -1,4 +1,5 @@
 mod app;
+mod batch_rename;
 mod config;
 mod dnd;
 mod docs;
@@ -97,6 +98,15 @@ window.props .props-head { color: #8c8c8c; font-size: 11px; font-weight: bold; }
 window.props .props-mono, window.props entry.props-octal { font-family: monospace; }
 window.props entry.props-octal { min-height: 26px; background: #161616; }
 window.props separator { background-color: #1d1d1d; }
+
+/* ---------- batch rename dialog (batch_rename.rs) ---------- */
+listview.br-list { background-color: #0a0a0a; }
+listview.br-list > row { padding: 0; }
+.br-row { padding: 3px 8px; border-radius: 6px; }
+.br-row.br-same { color: #6f6f6f; }
+.br-row.br-bad { background-color: rgba(255, 123, 114, 0.14); }
+.br-arrow { color: #6f6f6f; }
+scrolledwindow.br-scroll { border: 1px solid #1d1d1d; border-radius: 8px; }
 "#;
 
 fn main() -> glib::ExitCode {
