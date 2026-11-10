@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=RFiles
+Comment=Black, tabbed file explorer with live preview
+Exec=rfiles %U
+Icon=system-file-manager
+Terminal=false
+Type=Application
+Categories=System;Utility;FileManager;
+MimeType=inode/directory;
+StartupWMClass=io.github.rfiles.Files
