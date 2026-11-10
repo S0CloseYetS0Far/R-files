@@ -715,6 +715,8 @@ impl App {
         } else {
             m.push(mi("Move to Trash", "win.trash", "Delete"));
         }
+        m.push(None);
+        m.push(mi("Properties", "win.properties", "Alt+Enter"));
         m
     }
 
@@ -739,6 +741,10 @@ impl App {
             "Ctrl+H",
         ));
         m.push(mi("Reload", "win.refresh", "F5"));
+        if self.current_dir().is_some() {
+            m.push(None);
+            m.push(mi("Properties", "win.properties", "Alt+Enter"));
+        }
         m
     }
 
@@ -1929,6 +1935,15 @@ impl App {
                     .map_err(|e| e.message().to_string())
             });
         }));
+        // Properties of the selection, or of the current folder when
+        // nothing is selected (the background menu clears the selection).
+        add("properties", Box::new(|a| {
+            let mut files: Vec<gio::File> = a.selected_infos().iter().map(item_file).collect();
+            if files.is_empty() {
+                files.extend(a.current_dir());
+            }
+            crate::properties::show(&a.window, files);
+        }));
         add("new-folder", Box::new(|a| {
             let Some(dir) = a.current_dir().filter(|d| !is_trash(d)) else { return };
             a.prompt("New Folder", "New Folder", "Create", move |name| {
@@ -1982,6 +1997,7 @@ impl App {
             ("win.terminal-here", &["<Control><Alt>t"]),
             ("win.grid-view", &["<Control>1"]),
             ("win.list-view", &["<Control>2"]),
+            ("win.properties", &["<Alt>Return", "<Control>i"]),
         ];
         for (action, keys) in accels {
             gapp.set_accels_for_action(action, keys);

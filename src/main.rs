@@ -4,6 +4,7 @@ mod dnd;
 mod docs;
 mod fileops;
 mod preview;
+mod properties;
 mod util;
 
 use gtk::prelude::*;
@@ -88,6 +89,14 @@ popover.ctx-menu separator { margin: 3px 6px; background-color: #2c2c2c; min-hei
 gridview.files > child.dnd-hover, columnview.files > listview > row.dnd-hover,
 .sidebar list row.dnd-hover { background-color: rgba(53, 132, 228, 0.30); outline: 2px solid #3584e4; outline-offset: -2px; }
 scrolledwindow.files.dnd-hover { outline: 2px solid #3584e4; outline-offset: -2px; }
+
+/* ---------- properties dialog ---------- */
+window.props .props-name { font-size: 16px; font-weight: bold; color: #ffffff; }
+window.props .props-key { color: #8c8c8c; }
+window.props .props-head { color: #8c8c8c; font-size: 11px; font-weight: bold; }
+window.props .props-mono, window.props entry.props-octal { font-family: monospace; }
+window.props entry.props-octal { min-height: 26px; background: #161616; }
+window.props separator { background-color: #1d1d1d; }
 "#;
 
 fn main() -> glib::ExitCode {
