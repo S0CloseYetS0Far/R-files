@@ -4,6 +4,16 @@ A fast, lightweight file manager for Ubuntu, written in Rust with GTK4.
 Pitch-black file area, browser-style tabs, and a big live preview pane:
 click once on any file or folder to see it on the right.
 
+![RFiles showing a photo in the preview pane, with three tabs open](docs/screenshots/preview-image.png)
+
+## Screenshots
+
+| PDF preview | Folder preview |
+|---|---|
+| ![Previewing a PDF with page arrows](docs/screenshots/preview-pdf.png) | ![Previewing the contents of a folder](docs/screenshots/preview-folder.png) |
+
+Click once on a PDF to read it page by page, or on a folder to see what's inside without opening it.
+
 ## Features
 
 - **Tabs**: a small **+** right after your tabs opens a new one (or Ctrl+T)

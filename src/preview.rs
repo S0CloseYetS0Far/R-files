@@ -185,7 +185,7 @@ impl Preview {
         if let Some(orig) = info.attribute_byte_string("trash::orig-path") {
             rows.push(("Original", orig.to_string()));
         } else if let Some(parent) = file.parent() {
-            rows.push(("Location", parent.parse_name().to_string()));
+            rows.push(("Location", display_path(&parent)));
         }
         let markup = rows
             .iter()

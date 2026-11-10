@@ -841,7 +841,7 @@ impl App {
             t.label.set_text(&t.loc.title());
             t.icon.set_icon_name(Some(t.loc.icon()));
             t.widget.set_tooltip_text(Some(&match &t.loc {
-                Loc::Dir(f) => f.parse_name().to_string(),
+                Loc::Dir(f) => display_path(f),
                 other => other.title(),
             }));
             (t.loc.clone(), !t.back.is_empty(), !t.fwd.is_empty())
@@ -857,7 +857,7 @@ impl App {
                 self.filter_model.set_model(Some(&self.dir_list));
                 self.dir_list.set_file(None::<&gio::File>);
                 self.dir_list.set_file(Some(f));
-                self.path_entry.set_text(&f.parse_name());
+                self.path_entry.set_text(&display_path(f));
                 self.up_btn.set_sensitive(f.parent().is_some());
                 String::new()
             }
@@ -873,7 +873,7 @@ impl App {
                 let store = infos_store(results.iter().map(gio::File::for_path));
                 self.filter_model.set_model(Some(&store));
                 self.path_entry
-                    .set_text(&format!("Search “{query}” in {}", root.parse_name()));
+                    .set_text(&format!("Search “{query}” in {}", display_path(root)));
                 self.up_btn.set_sensitive(true);
                 query.clone()
             }
@@ -1144,7 +1144,7 @@ impl App {
         let row = gtk::ListBoxRow::new();
         row.set_child(Some(&bx));
         if let Loc::Dir(f) = &loc {
-            row.set_tooltip_text(Some(&f.parse_name()));
+            row.set_tooltip_text(Some(&display_path(f)));
         }
         let idx = {
             let mut t = self.sidebar_targets.borrow_mut();

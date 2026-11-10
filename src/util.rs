@@ -188,6 +188,20 @@ pub fn home() -> gio::File {
     gio::File::for_path(glib::home_dir())
 }
 
+/// Path for display: "~/Pictures" instead of "/home/name/Pictures".
+pub fn display_path(f: &gio::File) -> String {
+    if let Some(p) = f.path() {
+        if let Ok(rest) = p.strip_prefix(glib::home_dir()) {
+            return if rest.as_os_str().is_empty() {
+                "~".into()
+            } else {
+                format!("~/{}", rest.display())
+            };
+        }
+    }
+    f.parse_name().to_string()
+}
+
 pub fn file_title(f: &gio::File) -> String {
     if let Some(p) = f.path() {
         if p == glib::home_dir() {
