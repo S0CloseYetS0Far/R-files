@@ -110,6 +110,8 @@ pub struct App {
     config: RefCell<Config>,
     search_gen: Cell<u64>,
     layout_ready: Cell<bool>,
+    /// File name to select once the folder has loaded ("Show in folder")
+    pending_select: RefCell<Option<String>>,
     save_pending: Cell<bool>,
 }
 
@@ -360,6 +362,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         config: RefCell::new(config),
         search_gen: Cell::new(0),
         layout_ready: Cell::new(false),
+        pending_select: RefCell::new(None),
         save_pending: Cell::new(false),
     });
 
@@ -911,6 +914,27 @@ impl App {
         self.highlight_sidebar(&loc);
         self.update_pin_button();
         self.update_status();
+    }
+
+    /// Selects and scrolls to `name` in the current folder as soon as it
+    /// has finished loading (used when RFiles is asked to show a file).
+    pub fn select_when_loaded(self: &Rc<Self>, name: String) {
+        *self.pending_select.borrow_mut() = Some(name);
+        if !self.dir_list.is_loading() {
+            self.apply_pending_select();
+        }
+    }
+
+    fn apply_pending_select(&self) {
+        let Some(name) = self.pending_select.borrow_mut().take() else { return };
+        for pos in 0..self.selection.n_items() {
+            let Some(info) = self.selection.item(pos).and_downcast::<gio::FileInfo>() else { continue };
+            if info.name().to_string_lossy() == name {
+                self.grid.scroll_to(pos, gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT, None);
+                self.list.scroll_to(pos, None::<&gtk::ColumnViewColumn>, gtk::ListScrollFlags::NONE, None);
+                break;
+            }
+        }
     }
 
     pub(crate) fn reload(self: &Rc<Self>) {
@@ -2056,7 +2080,12 @@ impl App {
         let a = self.clone();
         self.selection.connect_items_changed(move |_, _, _, _| a.update_status());
         let a = self.clone();
-        self.dir_list.connect_loading_notify(move |_| a.update_status());
+        self.dir_list.connect_loading_notify(move |dl| {
+            if !dl.is_loading() {
+                a.apply_pending_select();
+            }
+            a.update_status();
+        });
         let a = self.clone();
         self.dir_list.connect_error_notify(move |dl| {
             let Some(err) = dl.error() else { return };

@@ -84,6 +84,27 @@ Then open **RFiles** from the app grid, or run `rfiles` (or `rfiles ~/Some/Folde
 
 To uninstall: `./install.sh uninstall`
 
+### Make RFiles your default file manager
+
+```bash
+./install.sh set-default
+```
+
+This makes folders open in RFiles (desktop icons, "Open folder" in download
+notifications, other apps) and makes **"Show in folder"** from Firefox, Brave,
+Chrome, VS Code and the desktop portal open RFiles with the file selected.
+For that, RFiles answers the standard `org.freedesktop.FileManager1` D-Bus
+service; it starts only when asked and exits after 30 seconds of inactivity.
+If GNOME Files is already running, close it (or log out and in) first.
+
+Optional extras:
+
+- **Dock:** right-click RFiles in the app grid → *Pin to Dash*, and unpin Files.
+- **Super+E shortcut:** Settings → Keyboard → Custom Shortcuts → add command `rfiles`.
+
+Keep GNOME Files installed; Ubuntu uses it in a few places. To switch back:
+`./install.sh unset-default`.
+
 ## Shortcuts
 
 | Action | How |

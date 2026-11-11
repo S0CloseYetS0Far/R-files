@@ -2,6 +2,7 @@ mod app;
 mod archive;
 mod batch_rename;
 mod config;
+mod dbus_service;
 mod dnd;
 mod docs;
 mod fileops;
@@ -112,6 +113,10 @@ scrolledwindow.br-scroll { border: 1px solid #1d1d1d; border-radius: 8px; }
 "#;
 
 fn main() -> glib::ExitCode {
+    // Started by D-Bus for "Show in folder" requests (see dbus_service.rs)
+    if std::env::args().nth(1).as_deref() == Some("--dbus-service") {
+        return dbus_service::run();
+    }
     let app = gtk::Application::builder()
         .application_id("io.github.rfiles.Files")
         .flags(gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::NON_UNIQUE)
@@ -137,7 +142,21 @@ fn main() -> glib::ExitCode {
     });
     app.connect_open(|a, files, _| {
         let start = files.first().cloned().unwrap_or_else(util::home);
-        let _ = app::build(a, start);
+        // A file (e.g. from "Show in folder"): open its folder, file selected
+        let is_file = start.path().is_some()
+            && !matches!(
+                start.query_file_type(gio::FileQueryInfoFlags::NONE, None::<&gio::Cancellable>),
+                gio::FileType::Directory | gio::FileType::Mountable | gio::FileType::Unknown
+            );
+        match (is_file, start.parent(), start.basename()) {
+            (true, Some(dir), Some(name)) => {
+                let w = app::build(a, dir);
+                w.select_when_loaded(name.to_string_lossy().into_owned());
+            }
+            _ => {
+                let _ = app::build(a, start);
+            }
+        }
     });
 
     app.run()
