@@ -6,6 +6,7 @@ mod dbus_service;
 mod dnd;
 mod docs;
 mod fileops;
+mod gpu;
 mod preview;
 mod properties;
 mod thumbs;
@@ -140,6 +141,9 @@ pub fn open_location(gapp: &gtk::Application, file: &gio::File, startup_id: Opti
 }
 
 fn main() -> glib::ExitCode {
+    // Before anything else: see gpu.rs
+    gpu::keep_sleeping_cards_asleep();
+
     // `--dbus-service`: started by D-Bus for a "Show in folder" request.
     // It becomes the shared RFiles process but opens no window by itself.
     let mut args: Vec<String> = std::env::args().collect();

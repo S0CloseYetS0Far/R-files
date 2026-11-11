@@ -30,17 +30,18 @@ Click once on a PDF to read it page by page, or on a folder to see what's inside
 - **Custom icons**: light-blue folders by default, the system theme, your own image, or a different icon per file
 - **Search** at the top right: filters as you type, Enter searches subfolders too
 - Remembers your window size, sidebar and preview widths
-- Light on memory (about 67 MB)
+- Light on memory (about 45 MB) and quick to open (about 0.2 s). On laptops with two graphics cards it leaves the sleeping one asleep
 
 ## RFiles vs. GNOME Files (Nautilus)
 
 Measured on Ubuntu 26.04 with Nautilus 50.2, both apps opening the same folder
-of 28 wallpaper images (average of 3 runs, memory taken 6 s after launch):
+of 28 wallpaper images (average of 3 runs, memory taken 6 s after launch,
+on a laptop with Intel + NVIDIA graphics; numbers vary with the graphics driver):
 
 | | **RFiles** | **GNOME Files** |
 |---|---|---|
-| Memory actually used (PSS) | **~67 MB** | ~85 MB |
-| Memory shown by system monitor (RSS) | ~180 MB | ~204 MB |
+| Memory actually used (PSS) | **~44 MB** | ~85 MB |
+| Memory shown by system monitor (RSS) | **~85 MB** | ~204 MB |
 | Program size | 1.7 MB, one file | 1.7 MB + extra packages |
 | Background helpers | none | file indexer for search (~24 MB) |
 

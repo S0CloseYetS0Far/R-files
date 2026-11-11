@@ -12,6 +12,18 @@ use std::sync::Arc;
 
 const SEARCH_MAX_RESULTS: usize = 2000;
 const SEARCH_MAX_VISITED: usize = 400_000;
+/// Column limit of the grid before its width is known.
+const GRID_START_COLUMNS: u32 = 16;
+/// No tile is narrower than this (the smallest icon size with its label),
+/// so `width / GRID_MIN_TILE_PX` columns is always at least what fits.
+const GRID_MIN_TILE_PX: f64 = 64.0;
+
+/// The most columns the grid could show in `width` pixels. Used as the
+/// grid's column limit: GTK keeps about 30 rows x that many tiles alive.
+fn grid_columns_for_width(width: f64) -> u32 {
+    ((width / GRID_MIN_TILE_PX).ceil() as u32).clamp(4, 64)
+}
+
 const ICON_SIZES: [(i32, &str); 3] = [(40, "Small"), (56, "Medium"), (72, "Large")];
 
 #[derive(Clone)]
@@ -256,7 +268,10 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     let selection = gtk::MultiSelection::new(Some(sort_model));
 
     let grid = gtk::GridView::new(Some(selection.clone()), None::<gtk::ListItemFactory>);
-    grid.set_max_columns(64);
+    // GTK keeps about 30 rows x max_columns tiles alive, however many
+    // columns really fit, so the limit follows the view's width (see
+    // `fit_grid_columns`) instead of being one big number.
+    grid.set_max_columns(GRID_START_COLUMNS);
     grid.set_min_columns(1);
     grid.set_enable_rubberband(true);
     grid.add_css_class("files");
@@ -485,6 +500,22 @@ impl App {
         });
         self.grid.set_factory(Some(&f));
         crate::thumbs::watch_scroll(&self.grid_scroll);
+
+        // Keep the column limit just above what fits in the current width
+        let grid = self.grid.downgrade();
+        self.grid_scroll.hadjustment().connect_page_size_notify(move |adj| {
+            let Some(g) = grid.upgrade() else { return };
+            let cols = grid_columns_for_width(adj.page_size());
+            if cols != g.max_columns() {
+                // Not during the size allocation that told us the width
+                let g = g.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(g) = g.upgrade() {
+                        g.set_max_columns(cols);
+                    }
+                });
+            }
+        });
 
         // List view columns
         self.add_column("Name", 0, true);
