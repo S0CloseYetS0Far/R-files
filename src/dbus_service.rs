@@ -1,19 +1,19 @@
-//! `rfiles --dbus-service`: answers the freedesktop `org.freedesktop.FileManager1`
-//! D-Bus interface, which browsers, editors and the desktop portal use for
-//! "Show in folder". Each request opens a normal RFiles window (a separate
-//! process, like any other launch). The service itself starts on demand via
-//! D-Bus activation, never touches GTK, and exits after a short idle period,
-//! so it costs no memory while unused.
+//! The freedesktop `org.freedesktop.FileManager1` D-Bus interface, which
+//! browsers, editors and the desktop portal use for "Show in folder".
+//!
+//! All RFiles windows share one process. That process owns the bus name
+//! while it runs and opens a window in-process for each request, so when
+//! RFiles is already open, "Show in folder" costs no process start at all.
+//! When it isn't running, D-Bus starts `rfiles --dbus-service`, which
+//! becomes that process (see `main.rs`).
 
+use gtk::prelude::*;
 use gtk::{gio, glib};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 pub const BUS_NAME: &str = "org.freedesktop.FileManager1";
 const OBJECT_PATH: &str = "/org/freedesktop/FileManager1";
-const IDLE_EXIT: Duration = Duration::from_secs(30);
 
 const XML: &str = r#"<node>
   <interface name="org.freedesktop.FileManager1">
@@ -56,60 +56,61 @@ fn targets(method: &str, uris: &[String]) -> Vec<String> {
     out
 }
 
-fn launch(uri: &str, startup_id: &str) {
-    let Ok(exe) = std::env::current_exe() else { return };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg(uri);
-    if !startup_id.is_empty() {
-        // Lets the new window come to the front (Wayland / X11)
-        cmd.env("XDG_ACTIVATION_TOKEN", startup_id);
-        cmd.env("DESKTOP_STARTUP_ID", startup_id);
-    }
-    if let Ok(mut child) = cmd.spawn() {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+thread_local! {
+    /// The running app, once GTK is set up and windows can be opened.
+    static APP: RefCell<Option<glib::WeakRef<gtk::Application>>> = const { RefCell::new(None) };
+    /// Requests that arrived before that: (uri, startup id).
+    static QUEUE: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    /// Loop to stop when the first request arrives (service start-up).
+    static WAITING: RefCell<Option<glib::MainLoop>> = const { RefCell::new(None) };
+    static OWNED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn dispatch(uri: String, startup_id: String) {
+    match APP.with(|a| a.borrow().as_ref().and_then(|w| w.upgrade())) {
+        Some(app) => crate::open_location(&app, &gio::File::for_uri(&uri), Some(&startup_id)),
+        None => {
+            QUEUE.with(|q| q.borrow_mut().push((uri, startup_id)));
+            if let Some(ml) = WAITING.with(|w| w.borrow_mut().take()) {
+                ml.quit();
+            }
+        }
     }
 }
 
-pub fn run() -> glib::ExitCode {
-    let main_loop = glib::MainLoop::new(None, false);
-    let last_call = Rc::new(Cell::new(Instant::now()));
-
+/// Claims the bus name (once per process). Uses only GIO, never GTK, so it
+/// can run before GTK is set up: GTK's start-up talks to the desktop
+/// portal, and the portal may be the one waiting for our reply.
+pub fn own_name() {
+    if OWNED.replace(true) {
+        return;
+    }
     let node = match gio::DBusNodeInfo::for_xml(XML) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("rfiles: bad D-Bus interface: {e}");
-            return glib::ExitCode::FAILURE;
+            return;
         }
     };
-    let Some(iface) = node.lookup_interface(BUS_NAME) else {
-        return glib::ExitCode::FAILURE;
-    };
-
-    let lc = last_call.clone();
-    let ml = main_loop.clone();
-    let _owner = gio::bus_own_name(
+    let Some(iface) = node.lookup_interface(BUS_NAME) else { return };
+    // The owner id lives as long as the process; never unowned explicitly.
+    let _ = gio::bus_own_name(
         gio::BusType::Session,
         BUS_NAME,
         gio::BusNameOwnerFlags::NONE,
         move |conn, _| {
-            let lc = lc.clone();
             let reg = conn
                 .register_object(OBJECT_PATH, &iface)
-                .method_call(move |_, _, _, _, method, params, invocation| {
-                    lc.set(Instant::now());
-                    match params.get::<(Vec<String>, String)>() {
-                        Some((uris, startup_id)) => {
-                            for t in targets(method, &uris) {
-                                launch(&t, &startup_id);
-                            }
-                            invocation.return_value(None);
-                        }
-                        None => invocation.return_dbus_error(
-                            "org.freedesktop.DBus.Error.InvalidArgs",
-                            "expected (as, s)",
-                        ),
+                .method_call(|_, _, _, _, method, params, invocation| {
+                    let Some((uris, startup_id)) = params.get::<(Vec<String>, String)>() else {
+                        invocation.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs", "expected (as, s)");
+                        return;
+                    };
+                    // Reply first: the caller (often the portal) must not
+                    // wait for windows, or it can't answer GTK's start-up.
+                    invocation.return_value(None);
+                    for t in targets(method, &uris) {
+                        dispatch(t, startup_id.clone());
                     }
                 })
                 .build();
@@ -118,22 +119,58 @@ pub fn run() -> glib::ExitCode {
             }
         },
         |_, _| {},
-        // Another file manager already owns the name, or we lost the bus
-        move |_, _| ml.quit(),
+        |_, _| {
+            // Someone else owns it; stop waiting for requests
+            if let Some(ml) = WAITING.with(|w| w.borrow_mut().take()) {
+                ml.quit();
+            }
+        },
     );
+}
 
-    let ml = main_loop.clone();
-    glib::timeout_add_seconds_local(5, move || {
-        if last_call.get().elapsed() >= IDLE_EXIT {
+/// Service start-up: claims the name and waits (without GTK) until the
+/// request that started us has arrived and been answered.
+pub fn wait_for_first_request(timeout: std::time::Duration) {
+    own_name();
+    if QUEUE.with(|q| !q.borrow().is_empty()) {
+        return;
+    }
+    let ml = glib::MainLoop::new(None, false);
+    WAITING.with(|w| *w.borrow_mut() = Some(ml.clone()));
+    glib::timeout_add_local_once(timeout, || {
+        if let Some(ml) = WAITING.with(|w| w.borrow_mut().take()) {
             ml.quit();
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
         }
     });
+    ml.run();
+}
 
-    main_loop.run();
-    glib::ExitCode::SUCCESS
+/// Called once GTK is ready: later requests open windows right away, and
+/// queued ones are opened now.
+pub fn attach(app: &gtk::Application) {
+    APP.with(|a| *a.borrow_mut() = Some(app.downgrade()));
+    for (uri, id) in QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut())) {
+        crate::open_location(app, &gio::File::for_uri(&uri), Some(&id));
+    }
+}
+
+/// Requests that arrived but can't be handled here (another RFiles is
+/// already running): hands them to it as normal "open" requests.
+pub fn forward_queued(app: &gtk::Application) {
+    let files: Vec<gio::File> = QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()))
+        .into_iter()
+        .map(|(uri, _)| gio::File::for_uri(&uri))
+        .collect();
+    if !files.is_empty() {
+        app.open(&files, "");
+    }
+}
+
+/// Keeps the process alive for `secs` without any window, so a quick
+/// follow-up request (or launch) reuses it instead of starting a new one.
+pub fn linger(app: &gtk::Application, secs: u32) {
+    let guard = app.hold();
+    glib::timeout_add_seconds_local_once(secs, move || drop(guard));
 }
 
 #[cfg(test)]

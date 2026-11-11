@@ -112,17 +112,52 @@ listview.br-list > row { padding: 0; }
 scrolledwindow.br-scroll { border: 1px solid #1d1d1d; border-radius: 8px; }
 "#;
 
-fn main() -> glib::ExitCode {
-    // Started by D-Bus for "Show in folder" requests (see dbus_service.rs)
-    if std::env::args().nth(1).as_deref() == Some("--dbus-service") {
-        return dbus_service::run();
+/// How long the process stays alive with no windows, so the next window
+/// ("Show in folder" or a launch) opens instantly instead of starting over.
+const LINGER_SECS: u32 = 30;
+
+/// Opens a window for `file`: a folder opens as-is; a file opens its folder
+/// with the file selected. `startup_id` lets the window take focus when
+/// another app (a browser, the desktop portal) asked for it.
+pub fn open_location(gapp: &gtk::Application, file: &gio::File, startup_id: Option<&str>) {
+    let is_file = file.path().is_some()
+        && !matches!(
+            file.query_file_type(gio::FileQueryInfoFlags::NONE, None::<&gio::Cancellable>),
+            gio::FileType::Directory | gio::FileType::Mountable | gio::FileType::Unknown
+        );
+    let w = match (is_file, file.parent(), file.basename()) {
+        (true, Some(dir), Some(name)) => {
+            let w = app::build(gapp, dir);
+            w.select_when_loaded(name.to_string_lossy().into_owned());
+            w
+        }
+        _ => app::build(gapp, file.clone()),
+    };
+    if let Some(id) = startup_id.filter(|id| !id.is_empty()) {
+        w.window.set_startup_id(id);
+        w.window.present();
     }
+}
+
+fn main() -> glib::ExitCode {
+    // `--dbus-service`: started by D-Bus for a "Show in folder" request.
+    // It becomes the shared RFiles process but opens no window by itself.
+    let mut args: Vec<String> = std::env::args().collect();
+    let service = args.get(1).map(String::as_str) == Some("--dbus-service");
+    if service {
+        args.remove(1);
+        // Answer the request before GTK starts (see dbus_service.rs)
+        dbus_service::wait_for_first_request(std::time::Duration::from_secs(5));
+    }
+
+    // One process for all RFiles windows: a second launch just asks the
+    // running one to open a window, which is much faster and lighter.
     let app = gtk::Application::builder()
         .application_id("io.github.rfiles.Files")
-        .flags(gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::NON_UNIQUE)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
 
-    app.connect_startup(|_| {
+    app.connect_startup(move |a| {
         if let Some(s) = gtk::Settings::default() {
             s.set_gtk_application_prefer_dark_theme(true);
         }
@@ -135,29 +170,41 @@ fn main() -> glib::ExitCode {
                 gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
         }
+        dbus_service::own_name();
+        // GTK is ready: open "Show in folder" requests from now on
+        let app = a.clone();
+        glib::idle_add_local_once(move || dbus_service::attach(&app));
+        // Keep the process briefly when its last window closes
+        a.connect_window_removed(|a, _| {
+            if a.windows().is_empty() {
+                dbus_service::linger(a, LINGER_SECS);
+            }
+        });
+        if service {
+            // Stay a little even if the request opened nothing
+            dbus_service::linger(a, LINGER_SECS);
+        }
     });
 
-    app.connect_activate(|a| {
+    let skip_activate = std::cell::Cell::new(service);
+    app.connect_activate(move |a| {
+        if skip_activate.replace(false) {
+            return;
+        }
         let _ = app::build(a, util::home());
     });
     app.connect_open(|a, files, _| {
         let start = files.first().cloned().unwrap_or_else(util::home);
-        // A file (e.g. from "Show in folder"): open its folder, file selected
-        let is_file = start.path().is_some()
-            && !matches!(
-                start.query_file_type(gio::FileQueryInfoFlags::NONE, None::<&gio::Cancellable>),
-                gio::FileType::Directory | gio::FileType::Mountable | gio::FileType::Unknown
-            );
-        match (is_file, start.parent(), start.basename()) {
-            (true, Some(dir), Some(name)) => {
-                let w = app::build(a, dir);
-                w.select_when_loaded(name.to_string_lossy().into_owned());
-            }
-            _ => {
-                let _ = app::build(a, start);
-            }
-        }
+        open_location(a, &start, None);
     });
 
-    app.run()
+    // Registering runs `startup` (which claims the D-Bus name), so it must
+    // come after the handlers above. If RFiles is already running, that
+    // process owns the name and answers the request: nothing to do here.
+    if service && (app.register(None::<&gio::Cancellable>).is_err() || app.is_remote()) {
+        dbus_service::forward_queued(&app);
+        return glib::ExitCode::SUCCESS;
+    }
+
+    app.run_with_args(&args)
 }

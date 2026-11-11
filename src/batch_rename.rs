@@ -665,8 +665,12 @@ pub fn open(parent: &impl IsA<gtk::Window>, infos: &[gio::FileInfo]) {
     });
     let f = weak(Dialog::submit);
     ok.connect_clicked(move |_| f());
-    let w = win.clone();
-    cancel.connect_clicked(move |_| w.close());
+    let w = win.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(w) = w.upgrade() {
+            w.close()
+        }
+    });
 
     let keys = gtk::EventControllerKey::new();
     let w = win.downgrade();

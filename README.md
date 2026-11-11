@@ -94,7 +94,9 @@ This makes folders open in RFiles (desktop icons, "Open folder" in download
 notifications, other apps) and makes **"Show in folder"** from Firefox, Brave,
 Chrome, VS Code and the desktop portal open RFiles with the file selected.
 For that, RFiles answers the standard `org.freedesktop.FileManager1` D-Bus
-service; it starts only when asked and exits after 30 seconds of inactivity.
+service. All RFiles windows share one process, so when RFiles is already open
+a "Show in folder" window appears in about 30 ms; otherwise it starts on demand
+and exits 30 seconds after its last window closes.
 If GNOME Files is already running, close it (or log out and in) first.
 
 Optional extras:

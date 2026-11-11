@@ -69,8 +69,9 @@ impl Preview {
             current: RefCell::new(None),
             on_open: RefCell::new(None),
         });
-        let p2 = p.clone();
+        let p2 = Rc::downgrade(&p);
         p.open_btn.connect_clicked(move |_| {
+            let Some(p2) = p2.upgrade() else { return };
             let info = p2.current.borrow().clone();
             let cb = p2.on_open.borrow().clone();
             if let (Some(info), Some(cb)) = (info, cb) {
@@ -255,10 +256,10 @@ impl Preview {
         grid.set_max_columns(12);
         grid.add_css_class("files");
         grid.add_css_class("preview-grid");
-        let p = self.clone();
-        let sm2 = sm.clone();
-        grid.connect_activate(move |_, pos| {
-            let info = sm2.item(pos).and_downcast::<gio::FileInfo>();
+        let p = Rc::downgrade(self);
+        grid.connect_activate(move |g, pos| {
+            let Some(p) = p.upgrade() else { return };
+            let info = g.model().and_then(|m| m.item(pos)).and_downcast::<gio::FileInfo>();
             let cb = p.on_open.borrow().clone();
             if let (Some(info), Some(cb)) = (info, cb) {
                 cb(&info);
@@ -281,11 +282,15 @@ impl Preview {
         stack.set_vexpand(true);
         self.body.append(&stack);
 
-        let p = self.clone();
+        // Everything here is held weakly: these handlers live on the models,
+        // which the widgets below keep alive.
+        let p = Rc::downgrade(self);
+        let (stack, empty) = (stack.downgrade(), empty.downgrade());
         let info = info.clone();
         let file = file.clone();
         let g = self.gen.get();
         let update = move |dl: &gtk::DirectoryList, n: u32| {
+            let (Some(p), Some(stack), Some(empty)) = (p.upgrade(), stack.upgrade(), empty.upgrade()) else { return };
             if p.gen.get() != g {
                 return;
             }
@@ -303,10 +308,18 @@ impl Preview {
             p.set_meta(&info, &file, Some(&txt));
         };
         let update = Rc::new(update);
-        let (u1, dl1) = (update.clone(), dl.clone());
-        sm.connect_items_changed(move |m, _, _, _| u1(&dl1, m.n_items()));
-        let sm3 = sm.clone();
-        dl.connect_loading_notify(move |dl| update(dl, sm3.n_items()));
+        let (u1, dl1) = (update.clone(), dl.downgrade());
+        sm.connect_items_changed(move |m, _, _, _| {
+            if let Some(dl) = dl1.upgrade() {
+                u1(&dl, m.n_items())
+            }
+        });
+        let sm3 = sm.downgrade();
+        dl.connect_loading_notify(move |dl| {
+            if let Some(sm) = sm3.upgrade() {
+                update(dl, sm.n_items())
+            }
+        });
     }
 
     // ---------- images ----------
@@ -404,8 +417,9 @@ impl Preview {
         nav.append(&next);
 
         let go: Rc<dyn Fn(i32)> = {
-            let (page, label, area) = (page.clone(), label.clone(), area.clone());
+            let (page, label, area) = (page.clone(), label.clone(), area.downgrade());
             Rc::new(move |delta: i32| {
+                let Some(area) = area.upgrade() else { return };
                 let np = (page.get() + delta).clamp(0, n - 1);
                 if np != page.get() {
                     page.set(np);

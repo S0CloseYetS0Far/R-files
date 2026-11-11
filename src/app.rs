@@ -112,7 +112,17 @@ pub struct App {
     layout_ready: Cell<bool>,
     /// File name to select once the folder has loaded ("Show in folder")
     pending_select: RefCell<Option<String>>,
+    /// Handlers on objects that outlive the window (models, the volume
+    /// monitor); disconnected on close so a closed window is freed.
+    model_handlers: RefCell<Vec<(glib::Object, glib::SignalHandlerId)>>,
     save_pending: Cell<bool>,
+}
+
+thread_local! {
+    /// Owns every open window's `App`. Signal handlers only hold weak
+    /// references, so removing an entry when its window is destroyed frees
+    /// the whole window (the process is shared by all windows).
+    static OPEN: RefCell<Vec<Rc<App>>> = const { RefCell::new(Vec::new()) };
 }
 
 fn icon_button(icon: &str, tip: &str) -> gtk::Button {
@@ -363,9 +373,11 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         search_gen: Cell::new(0),
         layout_ready: Cell::new(false),
         pending_select: RefCell::new(None),
+        model_handlers: RefCell::new(Vec::new()),
         save_pending: Cell::new(false),
     });
 
+    OPEN.with(|o| o.borrow_mut().push(app.clone()));
     app.setup_filter();
     app.setup_views();
     app.setup_actions(gapp);
@@ -387,8 +399,9 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
 impl App {
     // ================= model / filtering =================
     fn setup_filter(self: &Rc<Self>) {
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         self.filter.set_filter_func(move |obj| {
+            let Some(a) = a.upgrade() else { return false };
             let Some(info) = obj.downcast_ref::<gio::FileInfo>() else { return false };
             if !a.show_hidden.get() && (info.is_hidden() || info.is_backup()) {
                 return false;
@@ -434,8 +447,9 @@ impl App {
     fn setup_views(self: &Rc<Self>) {
         // Grid view tiles
         let f = gtk::SignalListItemFactory::new();
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         f.connect_setup(move |_, obj| {
+            let Some(a) = a.upgrade() else { return };
             let li = obj.downcast_ref::<gtk::ListItem>().unwrap();
             let bx = gtk::Box::new(gtk::Orientation::Vertical, 4);
             bx.add_css_class("tile");
@@ -481,9 +495,11 @@ impl App {
             // Right-click on empty space
             let g = gtk::GestureClick::new();
             g.set_button(3);
-            let a = self.clone();
-            let s = scroll.clone();
+            let a = Rc::downgrade(self);
+            let s = scroll.downgrade();
             g.connect_pressed(move |_, _, x, y| {
+                let Some(a) = a.upgrade() else { return };
+                let Some(s) = s.upgrade() else { return };
                 a.selection.unselect_all();
                 a.popup_menu(&s, x, y, a.background_menu());
             });
@@ -491,8 +507,9 @@ impl App {
 
             // Keys on the file views
             let k = gtk::EventControllerKey::new();
-            let a = self.clone();
+            let a = Rc::downgrade(self);
             k.connect_key_pressed(move |_, key, _, mods| {
+                let Some(a) = a.upgrade() else { return glib::Propagation::Proceed };
                 let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
                 let alt = mods.contains(gdk::ModifierType::ALT_MASK);
                 let action = match key {
@@ -513,16 +530,25 @@ impl App {
             crate::dnd::attach_view(self, scroll);
         }
 
-        let a = self.clone();
-        self.grid.connect_activate(move |_, pos| a.open_position(pos));
-        let a = self.clone();
-        self.list.connect_activate(move |_, pos| a.open_position(pos));
+        let a = Rc::downgrade(self);
+        self.grid.connect_activate(move |_, pos| {
+            if let Some(a) = a.upgrade() {
+                a.open_position(pos)
+            }
+        });
+        let a = Rc::downgrade(self);
+        self.list.connect_activate(move |_, pos| {
+            if let Some(a) = a.upgrade() {
+                a.open_position(pos)
+            }
+        });
     }
 
     fn add_column(self: &Rc<Self>, title: &str, kind: u8, expand: bool) {
         let f = gtk::SignalListItemFactory::new();
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         f.connect_setup(move |_, obj| {
+            let Some(a) = a.upgrade() else { return };
             let li = obj.downcast_ref::<gtk::ListItem>().unwrap();
             let bx = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             if kind == 0 {
@@ -571,10 +597,12 @@ impl App {
     fn attach_item_gesture(self: &Rc<Self>, widget: &gtk::Box, li: &gtk::ListItem) {
         let g = gtk::GestureClick::new();
         g.set_button(0);
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         let weak = li.downgrade();
-        let w = widget.clone();
+        let w = widget.downgrade();
         g.connect_pressed(move |g, _, x, y| {
+            let Some(a) = a.upgrade() else { return };
+            let Some(w) = w.upgrade() else { return };
             let Some(li) = weak.upgrade() else { return };
             let Some(info) = li.item().and_downcast::<gio::FileInfo>() else { return };
             match g.current_button() {
@@ -640,8 +668,12 @@ impl App {
                     if let Some(t) = &m.target {
                         b.set_action_target_value(Some(t));
                     }
-                    let p = pop.clone();
-                    b.connect_clicked(move |_| p.popdown());
+                    let p = pop.downgrade();
+                    b.connect_clicked(move |_| {
+                        if let Some(p) = p.upgrade() {
+                            p.popdown()
+                        }
+                    });
                     bx.append(&b);
                     last_sep = false;
                 }
@@ -937,6 +969,17 @@ impl App {
         }
     }
 
+    /// Stops a closing window's work right away: handlers on shared
+    /// objects (the volume monitor) go, folder monitoring and any playing
+    /// preview stop. The rest is freed when the window is destroyed.
+    fn teardown(&self) {
+        for (obj, id) in self.model_handlers.borrow_mut().drain(..) {
+            obj.disconnect(id);
+        }
+        self.dir_list.set_file(None::<&gio::File>);
+        self.preview.clear();
+    }
+
     pub(crate) fn reload(self: &Rc<Self>) {
         self.load_current();
     }
@@ -1012,9 +1055,11 @@ impl App {
 
         let g = gtk::GestureClick::new();
         g.set_button(0);
-        let a = self.clone();
-        let w = bx.clone();
+        let a = Rc::downgrade(self);
+        let w = bx.downgrade();
         g.connect_pressed(move |g, _, _, _| {
+            let Some(a) = a.upgrade() else { return };
+            let Some(w) = w.upgrade() else { return };
             let Some(i) = a.tab_index(&w) else { return };
             match g.current_button() {
                 1 => a.switch_to(i),
@@ -1023,9 +1068,11 @@ impl App {
             }
         });
         bx.add_controller(g);
-        let a = self.clone();
-        let w = bx.clone();
+        let a = Rc::downgrade(self);
+        let w = bx.downgrade();
         close.connect_clicked(move |_| {
+            let Some(a) = a.upgrade() else { return };
+            let Some(w) = w.upgrade() else { return };
             if let Some(i) = a.tab_index(&w) {
                 a.close_tab(i);
             }
@@ -1203,10 +1250,13 @@ impl App {
         // Right-click / middle-click
         let g = gtk::GestureClick::new();
         g.set_button(0);
-        let a = self.clone();
-        let r = row.clone();
+        let a = Rc::downgrade(self);
+        let r = row.downgrade();
         let menu_key = drag_key.clone();
-        g.connect_pressed(move |g, _, x, y| match g.current_button() {
+        g.connect_pressed(move |g, _, x, y| {
+            let Some(a) = a.upgrade() else { return };
+            let Some(r) = r.upgrade() else { return };
+            match g.current_button() {
             3 => {
                 g.set_state(gtk::EventSequenceState::Claimed);
                 let mut items = vec![Some(MItem {
@@ -1236,6 +1286,7 @@ impl App {
                 a.open_sidebar_in_tab(idx);
             }
             _ => {}
+            }
         });
         row.add_controller(g);
 
@@ -1245,29 +1296,36 @@ impl App {
             src.set_actions(gdk::DragAction::MOVE);
             let k = key.clone();
             src.connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&k.to_value())));
-            let r = row.clone();
+            let r = row.downgrade();
             src.connect_drag_begin(move |s, _| {
-                s.set_icon(Some(&gtk::WidgetPaintable::new(Some(&r))), 20, 16);
+                if let Some(r) = r.upgrade() {
+                    s.set_icon(Some(&gtk::WidgetPaintable::new(Some(&r))), 20, 16);
+                }
             });
             row.add_controller(src);
 
             let drop = gtk::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
             crate::dnd::ignore_file_drags(&drop);
-            let r = row.clone();
+            let r = row.downgrade();
             drop.connect_motion(move |_, _, y| {
+                let Some(r) = r.upgrade() else { return gdk::DragAction::empty() };
                 let above = y < r.height() as f64 / 2.0;
                 r.remove_css_class(if above { "drop-below" } else { "drop-above" });
                 r.add_css_class(if above { "drop-above" } else { "drop-below" });
                 gdk::DragAction::MOVE
             });
-            let r = row.clone();
+            let r = row.downgrade();
             drop.connect_leave(move |_| {
-                r.remove_css_class("drop-above");
-                r.remove_css_class("drop-below");
+                if let Some(r) = r.upgrade() {
+                    r.remove_css_class("drop-above");
+                    r.remove_css_class("drop-below");
+                }
             });
-            let a = self.clone();
-            let r = row.clone();
+            let a = Rc::downgrade(self);
+            let r = row.downgrade();
             drop.connect_drop(move |_, value, _, y| {
+                let Some(a) = a.upgrade() else { return false };
+                let Some(r) = r.upgrade() else { return false };
                 r.remove_css_class("drop-above");
                 r.remove_css_class("drop-below");
                 let Ok(src) = value.get::<String>() else { return false };
@@ -1442,9 +1500,10 @@ impl App {
         pop.set_child(Some(&bx));
         self.settings_btn.set_popover(Some(&pop));
 
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         let busy = Rc::new(Cell::new(false));
         style.connect_selected_notify(move |dd| {
+            let Some(a) = a.upgrade() else { return };
             if busy.get() {
                 return;
             }
@@ -1466,8 +1525,9 @@ impl App {
                 }
             }
         });
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         size.connect_selected_notify(move |dd| {
+            let Some(a) = a.upgrade() else { return };
             let px = ICON_SIZES.get(dd.selected() as usize).map(|s| s.0).unwrap_or(40);
             ICON_SIZE.with(|s| s.set(px));
             {
@@ -1638,8 +1698,9 @@ impl App {
 
         let f = Rc::new(f);
         let submit = {
-            let (win, entry, err) = (win.clone(), entry.clone(), err.clone());
+            let (win, entry, err) = (win.downgrade(), entry.downgrade(), err.downgrade());
             Rc::new(move || {
+                let (Some(win), Some(entry), Some(err)) = (win.upgrade(), entry.upgrade(), err.upgrade()) else { return };
                 let t = entry.text().trim().to_string();
                 if t.is_empty() {
                     return;
@@ -1656,8 +1717,12 @@ impl App {
         let s = submit.clone();
         okb.connect_clicked(move |_| s());
         entry.connect_activate(move |_| submit());
-        let w = win.clone();
-        cancel.connect_clicked(move |_| w.close());
+        let w = win.downgrade();
+        cancel.connect_clicked(move |_| {
+            if let Some(w) = w.upgrade() {
+                w.close()
+            }
+        });
         win.present();
         let stem = Path::new(initial)
             .file_stem()
@@ -1786,8 +1851,12 @@ impl App {
         // Save shortly after any layout change, not only when closing, so
         // sizes survive however the app is closed.
         let watch = |obj: &glib::Object, prop: &str| {
-            let a = self.clone();
-            obj.connect_notify_local(Some(prop), move |_, _| a.schedule_save());
+            let a = Rc::downgrade(self);
+            obj.connect_notify_local(Some(prop), move |_, _| {
+                if let Some(a) = a.upgrade() {
+                    a.schedule_save()
+                }
+            });
         };
         watch(self.outer.upcast_ref(), "position");
         watch(self.inner.upcast_ref(), "position");
@@ -1853,8 +1922,12 @@ impl App {
     fn setup_actions(self: &Rc<Self>, gapp: &gtk::Application) {
         let add = |name: &str, f: Box<dyn Fn(&Rc<App>)>| {
             let act = gio::SimpleAction::new(name, None);
-            let a = self.clone();
-            act.connect_activate(move |_, _| f(&a));
+            let a = Rc::downgrade(self);
+            act.connect_activate(move |_, _| {
+                if let Some(a) = a.upgrade() {
+                    f(&a)
+                }
+            });
             self.window.add_action(&act);
         };
         add("new-tab", Box::new(|a| a.new_tab(Loc::Dir(home()))));
@@ -2024,8 +2097,9 @@ impl App {
         }));
 
         let unpin = gio::SimpleAction::new("unpin", Some(glib::VariantTy::STRING));
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         unpin.connect_activate(move |_, v| {
+            let Some(a) = a.upgrade() else { return };
             if let Some(uri) = v.and_then(|v| v.get::<String>()) {
                 a.set_pinned(uri, false);
             }
@@ -2033,8 +2107,9 @@ impl App {
         self.window.add_action(&unpin);
         for (name, up) in [("side-up", true), ("side-down", false)] {
             let act = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
-            let a = self.clone();
+            let a = Rc::downgrade(self);
             act.connect_activate(move |_, v| {
+                let Some(a) = a.upgrade() else { return };
                 if let Some(k) = v.and_then(|v| v.get::<String>()) {
                     a.move_sidebar_item(&k, up);
                 }
@@ -2042,8 +2117,9 @@ impl App {
             self.window.add_action(&act);
         }
         let stab = gio::SimpleAction::new("sidebar-tab", Some(glib::VariantTy::INT32));
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         stab.connect_activate(move |_, v| {
+            let Some(a) = a.upgrade() else { return };
             if let Some(i) = v.and_then(|v| v.get::<i32>()) {
                 a.open_sidebar_in_tab(i as usize);
             }
@@ -2075,19 +2151,33 @@ impl App {
     }
 
     fn setup_signals(self: &Rc<Self>) {
-        let a = self.clone();
-        self.selection.connect_selection_changed(move |_, _, _| a.on_selection_changed());
-        let a = self.clone();
-        self.selection.connect_items_changed(move |_, _, _, _| a.update_status());
-        let a = self.clone();
-        self.dir_list.connect_loading_notify(move |dl| {
+        let track = |obj: &glib::Object, id: glib::SignalHandlerId| {
+            self.model_handlers.borrow_mut().push((obj.clone(), id));
+        };
+        let a = Rc::downgrade(self);
+        track(self.selection.upcast_ref(), self.selection.connect_selection_changed(move |_, _, _| {
+            if let Some(a) = a.upgrade() {
+                a.on_selection_changed()
+            }
+        }));
+        let a = Rc::downgrade(self);
+        track(self.selection.upcast_ref(), self.selection.connect_items_changed(move |_, _, _, _| {
+            if let Some(a) = a.upgrade() {
+                a.update_status()
+            }
+        }));
+        let a = Rc::downgrade(self);
+        let id = self.dir_list.connect_loading_notify(move |dl| {
+            let Some(a) = a.upgrade() else { return };
             if !dl.is_loading() {
                 a.apply_pending_select();
             }
             a.update_status();
         });
-        let a = self.clone();
-        self.dir_list.connect_error_notify(move |dl| {
+        track(self.dir_list.upcast_ref(), id);
+        let a = Rc::downgrade(self);
+        let id = self.dir_list.connect_error_notify(move |dl| {
+            let Some(a) = a.upgrade() else { return };
             let Some(err) = dl.error() else { return };
             if err.matches(gio::IOErrorEnum::NotMounted) {
                 if let Some(f) = dl.file() {
@@ -2103,29 +2193,38 @@ impl App {
                 a.status.set_text(&format!("Can't open folder: {}", err.message()));
             }
         });
+        track(self.dir_list.upcast_ref(), id);
 
         // Preview "Open" button and double-clicks inside the folder preview
-        let a = self.clone();
-        *self.preview.on_open.borrow_mut() = Some(Rc::new(move |info: &gio::FileInfo| a.open_info(info)));
+        let a = Rc::downgrade(self);
+        *self.preview.on_open.borrow_mut() = Some(Rc::new(move |info: &gio::FileInfo| {
+            if let Some(a) = a.upgrade() {
+                a.open_info(info)
+            }
+        }));
 
         // Sidebar
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         self.sidebar.connect_row_activated(move |_, row| {
+            let Some(a) = a.upgrade() else { return };
             if let Some(loc) = a.sidebar_loc(row.index() as usize) {
                 a.navigate(loc);
             }
         });
         for sig in ["mount-added", "mount-removed", "mount-changed"] {
-            let a = self.clone();
-            self.volumes.connect_local(sig, false, move |_| {
+            let a = Rc::downgrade(self);
+            let id = self.volumes.connect_local(sig, false, move |_| {
+                let a = a.upgrade()?;
                 a.rebuild_sidebar();
                 None
             });
+            track(self.volumes.upcast_ref(), id);
         }
 
         // Path bar: type a path and press Enter
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         self.path_entry.connect_activate(move |e| {
+            let Some(a) = a.upgrade() else { return };
             let mut t = e.text().trim().to_string();
             if t == "~" || t.starts_with("~/") {
                 t = format!("{}{}", glib::home_dir().display(), &t[1..]);
@@ -2143,16 +2242,18 @@ impl App {
         });
 
         // Search box (top right)
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         self.search.connect_search_changed(move |e| {
+            let Some(a) = a.upgrade() else { return };
             let q = e.text().to_lowercase();
             if *a.query.borrow() != q {
                 *a.query.borrow_mut() = q;
                 a.filter.changed(gtk::FilterChange::Different);
             }
         });
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         self.search.connect_activate(move |e| {
+            let Some(a) = a.upgrade() else { return };
             let q = e.text().trim().to_string();
             if q.is_empty() {
                 return;
@@ -2164,27 +2265,37 @@ impl App {
             };
             a.run_search(root, q);
         });
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         self.search.connect_stop_search(move |e| {
+            let Some(a) = a.upgrade() else { return };
             e.set_text("");
             a.grid.grab_focus();
         });
 
         // Toggles
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         self.hidden_btn.connect_toggled(move |b| {
+            let Some(a) = a.upgrade() else { return };
             a.show_hidden.set(b.is_active());
             a.filter.changed(gtk::FilterChange::Different);
         });
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         self.view_btn.connect_toggled(move |b| {
+            let Some(a) = a.upgrade() else { return };
             a.view_stack
                 .set_visible_child_name(if b.is_active() { "list" } else { "grid" });
         });
 
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         self.window.connect_close_request(move |_| {
+            let Some(a) = a.upgrade() else { return glib::Propagation::Proceed };
             a.save_layout();
+            a.teardown();
+            // Release the window's data once GTK has finished closing it
+            let w = a.window.clone();
+            glib::idle_add_local_once(move || {
+                OPEN.with(|o| o.borrow_mut().retain(|a| a.window != w));
+            });
             glib::Propagation::Proceed
         });
     }

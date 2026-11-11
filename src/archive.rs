@@ -733,8 +733,13 @@ pub fn compress_dialog(parent: &impl IsA<gtk::Window>, status: &gtk::Label, dir:
 
     let sources = std::rc::Rc::new(sources);
     let submit = {
-        let (win, entry, format, errl, status) = (win.clone(), entry.clone(), format.clone(), errl.clone(), status.clone());
+        // Weak: these closures live on widgets inside `win`
+        let (win, entry, format, errl) = (win.downgrade(), entry.downgrade(), format.downgrade(), errl.downgrade());
+        let status = status.clone();
         std::rc::Rc::new(move || {
+            let (Some(win), Some(entry), Some(format), Some(errl)) = (win.upgrade(), entry.upgrade(), format.upgrade(), errl.upgrade()) else {
+                return;
+            };
             let text = entry.text().trim().to_string();
             // A typed extension wins over the drop-down
             let (stem, ext, fmt) = match split_archive_name(&text) {
@@ -769,13 +774,19 @@ pub fn compress_dialog(parent: &impl IsA<gtk::Window>, status: &gtk::Label, dir:
     let s = submit.clone();
     okb.connect_clicked(move |_| s());
     entry.connect_activate(move |_| submit());
-    let w = win.clone();
-    cancel.connect_clicked(move |_| w.close());
+    let w = win.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(w) = w.upgrade() {
+            w.close()
+        }
+    });
     let keys = gtk::EventControllerKey::new();
-    let w = win.clone();
+    let w = win.downgrade();
     keys.connect_key_pressed(move |_, key, _, _| {
         if key == gdk::Key::Escape {
-            w.close();
+            if let Some(w) = w.upgrade() {
+                w.close();
+            }
             glib::Propagation::Stop
         } else {
             glib::Propagation::Proceed
