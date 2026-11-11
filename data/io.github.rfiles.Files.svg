@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- RFiles app icon: a simple light-blue folder -->
+  <path d="M10 30a8 8 0 0 1 8-8h30l10 10h52a8 8 0 0 1 8 8v58a8 8 0 0 1-8 8H18a8 8 0 0 1-8-8z" fill="#5eaef0"/>
+  <path d="M10 46a8 8 0 0 1 8-8h92a8 8 0 0 1 8 8v52a8 8 0 0 1-8 8H18a8 8 0 0 1-8-8z" fill="#a6daff"/>
+  <path d="M18 38h92a8 8 0 0 1 8 8v3H10v-3a8 8 0 0 1 8-8z" fill="#d4efff"/>
+</svg>

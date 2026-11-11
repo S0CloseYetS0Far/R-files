@@ -2,7 +2,7 @@
 Name=RFiles
 Comment=Black, tabbed file explorer with live preview
 Exec=rfiles %U
-Icon=system-file-manager
+Icon=io.github.rfiles.Files
 Terminal=false
 Type=Application
 Categories=System;Utility;FileManager;

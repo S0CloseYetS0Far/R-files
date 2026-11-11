@@ -8,6 +8,7 @@ set -euo pipefail
 
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$HOME/.local/share/applications"
+ICON_FILE="$HOME/.local/share/icons/hicolor/scalable/apps/io.github.rfiles.Files.svg"
 DBUS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dbus-1/services"
 DBUS_FILE="$DBUS_DIR/org.freedesktop.FileManager1.service"
 cd "$(dirname "$0")"
@@ -28,7 +29,7 @@ unset_default() {
 case "${1:-}" in
     uninstall)
         unset_default
-        rm -f "$BIN_DIR/rfiles" "$APP_DIR/rfiles.desktop"
+        rm -f "$BIN_DIR/rfiles" "$APP_DIR/rfiles.desktop" "$ICON_FILE"
         echo "RFiles removed. (Your settings are kept in ~/.config/rfiles)"
         exit 0
         ;;
@@ -69,8 +70,9 @@ echo "==> Building RFiles (first build takes a few minutes)"
 cargo build --release
 
 echo "==> Installing"
-mkdir -p "$BIN_DIR" "$APP_DIR"
+mkdir -p "$BIN_DIR" "$APP_DIR" "$(dirname "$ICON_FILE")"
 install -m755 target/release/rfiles "$BIN_DIR/rfiles"
+install -m644 data/io.github.rfiles.Files.svg "$ICON_FILE"
 sed "s|^Exec=.*|Exec=$BIN_DIR/rfiles %U|" rfiles.desktop > "$APP_DIR/rfiles.desktop"
 update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
 

@@ -148,7 +148,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     let window = gtk::ApplicationWindow::builder()
         .application(gapp)
         .title("Files")
-        .icon_name("system-file-manager")
+        .icon_name("io.github.rfiles.Files")
         .default_width(config.width)
         .default_height(config.height)
         .build();
@@ -157,7 +157,8 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     // ---------- title bar: window buttons on top, then tabs [+] ... search ----------
     let controls = gtk::WindowControls::new(gtk::PackType::End);
     controls.set_decoration_layout(Some(":minimize,maximize,close"));
-    let app_icon = gtk::Image::from_icon_name("system-file-manager-symbolic");
+    let app_icon = gtk::Image::from_icon_name("io.github.rfiles.Files");
+    app_icon.set_pixel_size(18);
     let title = gtk::Label::new(Some("Files"));
     title.add_css_class("app-title");
     let row1 = gtk::Box::new(gtk::Orientation::Horizontal, 8);
