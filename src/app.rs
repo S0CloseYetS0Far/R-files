@@ -1004,11 +1004,40 @@ impl App {
 
     fn apply_pending_select(&self) {
         let Some(name) = self.pending_select.borrow_mut().take() else { return };
+        // Look in the unfiltered folder, so a file the filter hides is
+        // made visible instead of silently not selected.
+        let Some(all) = self.filter_model.model() else { return };
+        let Some(target) = (0..all.n_items())
+            .filter_map(|i| all.item(i).and_downcast::<gio::FileInfo>())
+            .find(|info| info.name().to_string_lossy() == name)
+        else {
+            return;
+        };
+        let (show_hidden, clear_query) = reveal_changes(
+            self.show_hidden.get(),
+            target.is_hidden() || target.is_backup(),
+            &self.query.borrow(),
+            &target.display_name(),
+        );
+        if clear_query {
+            // Clear the query first so the entry's search-changed is a no-op
+            self.query.borrow_mut().clear();
+            self.search.set_text("");
+            self.filter.changed(gtk::FilterChange::LessStrict);
+        }
+        if show_hidden {
+            // Through the button, so it, the filter and the saved setting stay in step
+            self.hidden_btn.set_active(true);
+        }
         for pos in 0..self.selection.n_items() {
             let Some(info) = self.selection.item(pos).and_downcast::<gio::FileInfo>() else { continue };
             if info.name().to_string_lossy() == name {
-                self.grid.scroll_to(pos, gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT, None);
-                self.list.scroll_to(pos, None::<&gtk::ColumnViewColumn>, gtk::ListScrollFlags::NONE, None);
+                // Select and focus in the visible view; the other only scrolls
+                let flags = gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT;
+                let none = gtk::ListScrollFlags::NONE;
+                let (grid_flags, list_flags) = if self.view_btn.is_active() { (none, flags) } else { (flags, none) };
+                self.grid.scroll_to(pos, grid_flags, None);
+                self.list.scroll_to(pos, None::<&gtk::ColumnViewColumn>, list_flags, None);
                 break;
             }
         }
@@ -2397,6 +2426,33 @@ fn folder_name_problem(name: &str) -> Option<&'static str> {
 }
 
 /// Recursive name search, run on a worker thread.
+/// What "Show in folder" must change so its target passes the filter:
+/// (turn hidden files on, clear the search). `query` is lowercase.
+fn reveal_changes(show_hidden: bool, target_hidden: bool, query: &str, display_name: &str) -> (bool, bool) {
+    let need_hidden = target_hidden && !show_hidden;
+    let need_clear = !query.is_empty() && !display_name.to_lowercase().contains(query);
+    (need_hidden, need_clear)
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::reveal_changes;
+
+    #[test]
+    fn hidden_target_turns_hidden_files_on() {
+        assert_eq!(reveal_changes(false, true, "", ".bashrc"), (true, false));
+        assert_eq!(reveal_changes(true, true, "", ".bashrc"), (false, false));
+        assert_eq!(reveal_changes(false, false, "", "notes.txt"), (false, false));
+    }
+
+    #[test]
+    fn search_that_hides_target_is_cleared() {
+        assert_eq!(reveal_changes(false, false, "zzz", "notes.txt"), (false, true));
+        assert_eq!(reveal_changes(false, false, "note", "Notes.txt"), (false, false));
+        assert_eq!(reveal_changes(false, true, "zzz", "file~"), (true, true));
+    }
+}
+
 fn search_walk(root: &Path, q: &str, hidden: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
