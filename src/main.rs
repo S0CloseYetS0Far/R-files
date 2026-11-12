@@ -118,16 +118,20 @@ scrolledwindow.br-scroll { border: 1px solid #1d1d1d; border-radius: 8px; }
 /// ("Show in folder" or a launch) opens instantly instead of starting over.
 const LINGER_SECS: u32 = 30;
 
+/// Whether `file` is a local file that is not a folder (so it opens as its folder, selected).
+fn is_file(file: &gio::File) -> bool {
+    file.path().is_some()
+        && !matches!(
+            file.query_file_type(gio::FileQueryInfoFlags::NONE, None::<&gio::Cancellable>),
+            gio::FileType::Directory | gio::FileType::Mountable | gio::FileType::Unknown
+        )
+}
+
 /// Opens a window for `file`: a folder opens as-is; a file opens its folder
 /// with the file selected. `startup_id` lets the window take focus when
 /// another app (a browser, the desktop portal) asked for it.
 pub fn open_location(gapp: &gtk::Application, file: &gio::File, startup_id: Option<&str>) {
-    let is_file = file.path().is_some()
-        && !matches!(
-            file.query_file_type(gio::FileQueryInfoFlags::NONE, None::<&gio::Cancellable>),
-            gio::FileType::Directory | gio::FileType::Mountable | gio::FileType::Unknown
-        );
-    let w = match (is_file, file.parent(), file.basename()) {
+    let w = match (is_file(file), file.parent(), file.basename()) {
         (true, Some(dir), Some(name)) => {
             let w = app::build(gapp, dir);
             w.select_when_loaded(name.to_string_lossy().into_owned());
@@ -198,9 +202,18 @@ fn main() -> glib::ExitCode {
         }
         let _ = app::build(a, util::home());
     });
-    app.connect_open(|a, files, _| {
-        let start = files.first().cloned().unwrap_or_else(util::home);
-        open_location(a, &start, None);
+    app.connect_open(|a, files, hint| {
+        // The hint carries the startup id of forwarded requests
+        let id = Some(hint).filter(|h| !h.is_empty());
+        if files.is_empty() {
+            open_location(a, &util::home(), id);
+            return;
+        }
+        // One window per distinct folder, in order
+        let items: Vec<(String, bool)> = files.iter().map(|f| (f.uri().to_string(), !is_file(f))).collect();
+        for i in dbus_service::distinct_windows(&items) {
+            open_location(a, &files[i], id);
+        }
     });
 
     // Registering runs `startup` (which claims the D-Bus name), so it must
