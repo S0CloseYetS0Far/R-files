@@ -2122,6 +2122,9 @@ impl App {
         add("new-folder", Box::new(|a| {
             let Some(dir) = a.current_dir().filter(|d| !is_trash(d)) else { return };
             a.prompt("New Folder", "New Folder", "Create", move |name| {
+                if let Some(p) = folder_name_problem(&name) {
+                    return Err(p.to_string());
+                }
                 dir.child(&name)
                     .make_directory(None::<&gio::Cancellable>)
                     .map_err(|e| e.message().to_string())
@@ -2345,6 +2348,16 @@ fn delete_recursive(f: &gio::File) -> Result<(), glib::Error> {
     f.delete(None::<&gio::Cancellable>)
 }
 
+/// Why `name` can't be a new folder's name, if it can't. `child()` would read "a/b" or ".." as a path and
+/// create the folder somewhere else, so these are refused before it is called.
+fn folder_name_problem(name: &str) -> Option<&'static str> {
+    if name.contains(['/', '\0']) || name == "." || name == ".." {
+        Some("The name can't contain “/”")
+    } else {
+        None
+    }
+}
+
 /// Recursive name search, run on a worker thread.
 fn search_walk(root: &Path, q: &str, hidden: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -2375,4 +2388,32 @@ fn search_walk(root: &Path, q: &str, hidden: bool) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::folder_name_problem;
+
+    #[test]
+    fn folder_names() {
+        for ok in ["New Folder", "a.b", "...", ".hidden", "x~"] {
+            assert_eq!(folder_name_problem(ok), None, "{ok}");
+        }
+        for bad in ["a/b", "../x", "/", ".", "..", "x/", "a\0b"] {
+            assert!(folder_name_problem(bad).is_some(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn accepted_names_stay_in_the_folder() {
+        use gtk::gio;
+        use gtk::prelude::*;
+        let dir = gio::File::for_path(std::env::temp_dir().join("rfiles-test-dir"));
+        for name in ["New Folder", "...", ".hidden", "a b"] {
+            assert_eq!(folder_name_problem(name), None);
+            let child = dir.child(name);
+            assert_eq!(child.parent().map(|p| p.equal(&dir)), Some(true), "{name}");
+            assert_eq!(child.basename().as_deref(), Some(std::path::Path::new(name)));
+        }
+    }
 }
