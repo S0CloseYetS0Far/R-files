@@ -19,7 +19,7 @@ use std::time::Duration;
 const PROPS_ATTRS: &str = "standard::name,standard::display-name,standard::icon,\
 standard::type,standard::size,standard::content-type,standard::is-symlink,\
 standard::symlink-target,time::modified,time::access,time::created,unix::mode,\
-owner::user,owner::user-real,owner::group,thumbnail::path,metadata::custom-icon";
+owner::user,owner::user-real,owner::group,thumbnail::path,metadata::custom-icon,unix::blocks";
 
 /// How often the live folder size is redrawn.
 const TICK: Duration = Duration::from_millis(200);
@@ -135,6 +135,54 @@ fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{} {}", group_digits(n), if n == 1 { one } else { many })
 }
 
+/// Below this difference the "on disk" figure is just block rounding and not worth showing.
+const DISK_SLACK: u64 = 4096;
+
+/// "1.3 MB on disk", or None when the space used is within one block of the size.
+fn on_disk_text(bytes: u64, disk: u64) -> Option<String> {
+    (disk.abs_diff(bytes) > DISK_SLACK).then(|| format!("{} on disk", glib::format_size(disk)))
+}
+
+/// `size_text` plus the on-disk figure when it differs noticeably.
+fn size_with_disk(bytes: u64, disk: u64) -> String {
+    match on_disk_text(bytes, disk) {
+        Some(d) => format!("{}, {d}", size_text(bytes)),
+        None => size_text(bytes),
+    }
+}
+
+/// "12.3 GB free of 500.1 GB", or None when the values are missing or inconsistent.
+fn free_space_text(free: u64, total: u64) -> Option<String> {
+    (total > 0 && free <= total).then(|| format!("{} free of {}", glib::format_size(free), glib::format_size(total)))
+}
+
+/// Used share of a file system, 0.0 to 1.0.
+fn used_fraction(free: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    (total.saturating_sub(free) as f64 / total as f64).clamp(0.0, 1.0)
+}
+
+/// Whether `path` is the root of a file system (a mount point).
+fn is_mount_point(path: &Path) -> bool {
+    let Ok(m) = std::fs::metadata(path) else { return false };
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        None => true,
+        Some(parent) => std::fs::metadata(parent).map(|pm| pm.dev() != m.dev()).unwrap_or(false),
+    }
+}
+
+/// New permission bits for an entry inside a folder whose mode is `folder_mode`.
+/// Folders get the folder's read/write/enter bits; files get the same bits with
+/// execute removed unless the file already has an execute bit. Setuid, setgid
+/// and sticky bits are never taken from the folder: the entry keeps its own.
+fn enclosed_mode(folder_mode: u32, entry_mode: u32, is_dir: bool) -> u32 {
+    let rwx = folder_mode & 0o777;
+    let bits = if is_dir || entry_mode & 0o111 != 0 { rwx } else { rwx & !0o111 };
+    (entry_mode & 0o7000) | bits
+}
+
 // ================= folder size walk =================
 
 /// Running totals, written by the worker thread and read by the UI.
@@ -146,6 +194,8 @@ struct Totals {
     bytes: AtomicU64,
     /// Entries or folders that could not be read.
     errors: AtomicU64,
+    /// Space really used by those files (st_blocks * 512), hard links once.
+    disk: AtomicU64,
     done: AtomicBool,
 }
 
@@ -156,6 +206,7 @@ fn add_file(m: &std::fs::Metadata, t: &Totals, seen: &mut HashSet<(u64, u64)>) {
         return;
     }
     t.bytes.fetch_add(m.len(), Relaxed);
+    t.disk.fetch_add(m.blocks().saturating_mul(512), Relaxed);
 }
 
 /// Totals the sizes under `roots`. Symlinks inside are never followed
@@ -236,8 +287,9 @@ fn start_walk(
         };
         let done = t.done.load(Relaxed);
         let (items, bytes, errors) = (t.items.load(Relaxed), t.bytes.load(Relaxed), t.errors.load(Relaxed));
+        let disk = t.disk.load(Relaxed);
         let more = if done { "" } else { " …" };
-        size.set_text(&format!("{}{more}", size_text(bytes)));
+        size.set_text(&format!("{}{more}", size_with_disk(bytes, disk)));
         let mut c = plural(items, "item", "items");
         if errors > 0 {
             c.push_str(&format!(", {} unreadable", group_digits(errors)));
@@ -432,6 +484,13 @@ fn perms_section(file: &gio::File, info: &gio::FileInfo, owner: &str) -> (gtk::B
         hint.set_xalign(0.0);
         bx.append(&hint);
     }
+    let apply_btn = (is_dir && editable && file.path().is_some()).then(|| {
+        let b = gtk::Button::with_label("Apply to enclosed files…");
+        b.set_halign(gtk::Align::Start);
+        b.set_tooltip_text(Some("Give everything inside this folder permissions based on the folder's"));
+        bx.append(&b);
+        b
+    });
     let err = gtk::Label::new(None);
     err.add_css_class("error");
     err.set_xalign(0.0);
@@ -484,7 +543,478 @@ fn perms_section(file: &gio::File, info: &gio::FileInfo, owner: &str) -> (gtk::B
             None => p.show_error("Enter an octal mode such as 644 or 755."),
         }
     });
+    if let (Some(b), Some(path)) = (apply_btn, file.path()) {
+        let (w, name) = (Rc::downgrade(&p), file_title(file));
+        b.connect_clicked(move |b| {
+            let (Some(p), Some(win)) = (w.upgrade(), b.root().and_downcast::<gtk::Window>()) else { return };
+            apply_to_enclosed(&win, path.clone(), &name, p.mode.get());
+        });
+    }
     (bx, p)
+}
+
+// ================= free space, open with =================
+
+/// Adds the "Free space" row (and a usage bar for a mount point), filled in
+/// asynchronously so a slow mount can't freeze the dialog. Stays hidden when
+/// the file system does not report its size.
+fn free_space_row(grid: &gtk::Grid, row: &mut i32, path: PathBuf) {
+    let (key, value) = add_row(grid, row, "Free space", "");
+    let bar = gtk::LevelBar::for_interval(0.0, 1.0);
+    bar.set_hexpand(true);
+    grid.attach(&bar, 1, *row, 1, 1);
+    *row += 1;
+    for w in [key.upcast_ref::<gtk::Widget>(), value.upcast_ref(), bar.upcast_ref()] {
+        w.set_visible(false);
+    }
+    let (key, value, bar) = (key.downgrade(), value.downgrade(), bar.downgrade());
+    glib::spawn_future_local(async move {
+        let info = gio::spawn_blocking(move || {
+            let attrs = "filesystem::size,filesystem::free";
+            let info = gio::File::for_path(&path).query_filesystem_info(attrs, None::<&gio::Cancellable>).ok()?;
+            if !info.has_attribute("filesystem::size") || !info.has_attribute("filesystem::free") {
+                return None;
+            }
+            let (free, total) = (info.attribute_uint64("filesystem::free"), info.attribute_uint64("filesystem::size"));
+            Some((free, total, is_mount_point(&path)))
+        })
+        .await
+        .ok()
+        .flatten();
+        let (Some(key), Some(value), Some(bar)) = (key.upgrade(), value.upgrade(), bar.upgrade()) else { return };
+        let Some((free, total, mount)) = info else { return };
+        let Some(text) = free_space_text(free, total) else { return };
+        value.set_text(&text);
+        key.set_visible(true);
+        value.set_visible(true);
+        if mount {
+            bar.set_value(used_fraction(free, total));
+            bar.set_visible(true);
+        }
+    });
+}
+
+/// Apps for a content type: the registered ones first, then the others.
+fn apps_for_type(ct: &str) -> Vec<gio::AppInfo> {
+    let mut seen = HashSet::new();
+    let mut apps = gio::AppInfo::all_for_type(ct);
+    apps.extend(gio::AppInfo::fallback_for_type(ct));
+    apps.retain(|a| a.should_show() && seen.insert(a.id().map(|i| i.to_string()).unwrap_or_else(|| a.name().to_string())));
+    apps
+}
+
+/// Adds the "Opens with" row: the default app and a "Change…" button that
+/// opens a small list of apps (the GTK app chooser widgets are deprecated).
+fn open_with_row(grid: &gtk::Grid, row: &mut i32, ct: &str) {
+    let (_, value) = add_row(grid, row, "Opens with", "");
+    let default_name = gio::AppInfo::default_for_type(ct, false).map(|a| a.name().to_string());
+    value.set_text(&default_name.unwrap_or_else(|| "No default app".into()));
+    let button = gtk::MenuButton::builder().label("Change…").valign(gtk::Align::Center).build();
+    // Put the label and the button side by side in the value cell.
+    grid.remove(&value);
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    line.append(&value);
+    line.append(&button);
+    grid.attach(&line, 1, *row - 1, 1, 1);
+
+    let (ct, value) = (ct.to_string(), value.downgrade());
+    button.set_create_popup_func(move |mb| {
+        let apps = apps_for_type(&ct);
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.set_activate_on_single_click(true);
+        for a in &apps {
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            line.set_margin_top(4);
+            line.set_margin_bottom(4);
+            line.set_margin_start(6);
+            line.set_margin_end(6);
+            let img = gtk::Image::new();
+            img.set_pixel_size(24);
+            match a.icon() {
+                Some(i) => img.set_from_gicon(&i),
+                None => img.set_icon_name(Some("application-x-executable-symbolic")),
+            }
+            line.append(&img);
+            line.append(&gtk::Label::new(Some(&a.name())));
+            list.append(&line);
+        }
+        let err = gtk::Label::new(None);
+        err.add_css_class("error");
+        err.set_xalign(0.0);
+        err.set_wrap(true);
+        err.set_max_width_chars(34);
+        err.set_visible(false);
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(280)
+            .child(&list)
+            .build();
+        let bx = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        if apps.is_empty() {
+            let none = gtk::Label::new(Some("No apps found for this file type."));
+            none.add_css_class("dim");
+            bx.append(&none);
+        } else {
+            bx.append(&scroll);
+        }
+        bx.append(&err);
+        let pop = gtk::Popover::new();
+        pop.set_child(Some(&bx));
+        let (ct, value, pop_weak, err) = (ct.clone(), value.clone(), pop.downgrade(), err.downgrade());
+        list.connect_row_activated(move |_, r| {
+            let (Some(app), Some(err)) = (apps.get(r.index() as usize), err.upgrade()) else { return };
+            match app.set_as_default_for_type(&ct) {
+                Ok(()) => {
+                    if let Some(v) = value.upgrade() {
+                        v.set_text(&app.name());
+                    }
+                    if let Some(p) = pop_weak.upgrade() {
+                        p.popdown();
+                    }
+                }
+                Err(e) => {
+                    err.set_text(&format!("Could not change the default app: {}", e.message()));
+                    err.set_visible(true);
+                }
+            }
+        });
+        mb.set_popover(Some(&pop));
+    });
+}
+
+#[cfg(test)]
+mod free_space_tests {
+    use super::*;
+
+    #[test]
+    fn on_disk_rule() {
+        assert_eq!(on_disk_text(1000, 4096), None);
+        assert_eq!(on_disk_text(5000, 1000), None);
+        assert_eq!(on_disk_text(0, 4096), None);
+        assert_eq!(on_disk_text(0, 4097), Some(format!("{} on disk", glib::format_size(4097))));
+        assert_eq!(on_disk_text(1_000_000, 1_300_000), Some(format!("{} on disk", glib::format_size(1_300_000))));
+        // Sparse files: far less used than the apparent size.
+        assert!(on_disk_text(10_000_000, 4096).is_some());
+        assert_eq!(size_with_disk(100, 4096), size_text(100));
+        let s = size_with_disk(1_234_567, 1_300_000);
+        assert!(s.starts_with(&size_text(1_234_567)) && s.ends_with(" on disk") && s.contains(", "), "{s}");
+    }
+
+    #[test]
+    fn free_space_rules() {
+        assert_eq!(
+            free_space_text(250, 1000),
+            Some(format!("{} free of {}", glib::format_size(250), glib::format_size(1000)))
+        );
+        assert!(free_space_text(0, 1000).is_some());
+        assert_eq!(free_space_text(0, 0), None);
+        assert_eq!(free_space_text(2000, 1000), None);
+        assert_eq!(used_fraction(250, 1000), 0.75);
+        assert_eq!(used_fraction(0, 0), 0.0);
+        assert_eq!(used_fraction(2000, 1000), 0.0);
+        assert_eq!(used_fraction(0, 1000), 1.0);
+    }
+
+    #[test]
+    fn mount_points() {
+        assert!(is_mount_point(Path::new("/")));
+        assert!(!is_mount_point(&std::env::temp_dir().join("rfiles-no-such-dir-xyz")));
+    }
+
+    #[test]
+    fn walk_counts_disk_use_and_hard_links_once() {
+        let root = std::env::temp_dir().join(format!("rfiles-props-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/f"), vec![1u8; 10_000]).unwrap();
+        let run = |root: &Path| {
+            let t = Totals::default();
+            walk(&[root.to_path_buf()], true, &t, &AtomicBool::new(false));
+            (t.bytes.load(Relaxed), t.disk.load(Relaxed))
+        };
+        let (bytes, disk) = run(&root);
+        assert_eq!(bytes, 10_000);
+        assert!(disk > 0);
+        std::fs::hard_link(root.join("d/f"), root.join("link")).unwrap();
+        assert_eq!(run(&root), (bytes, disk));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+// ================= apply permissions to enclosed files =================
+
+/// Progress of the apply walk, written by the worker and read by the UI.
+#[derive(Default)]
+struct ApplyCounts {
+    seen: AtomicU64,
+    changed: AtomicU64,
+    failed: AtomicU64,
+    done: AtomicBool,
+}
+
+/// Sets the permissions of everything inside `root` from `folder_mode` (see
+/// `enclosed_mode`). Symlinks are never touched or followed, and folders on
+/// other file systems are skipped. Folders are changed last, deepest first,
+/// so a folder without the enter bit can't block the walk.
+fn apply_walk(root: &Path, folder_mode: u32, c: &ApplyCounts, cancel: &AtomicBool) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(rm) = std::fs::metadata(root) else {
+        c.failed.fetch_add(1, Relaxed);
+        return;
+    };
+    let dev = rm.dev();
+    let set = |path: &Path, old: u32, new: u32| {
+        if new & 0o7777 == old & 0o7777 {
+            return;
+        }
+        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(new)) {
+            Ok(()) => c.changed.fetch_add(1, Relaxed),
+            Err(_) => c.failed.fetch_add(1, Relaxed),
+        };
+    };
+    let mut stack = vec![root.to_path_buf()];
+    let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            c.failed.fetch_add(1, Relaxed);
+            continue;
+        };
+        for e in rd {
+            if cancel.load(Relaxed) {
+                return;
+            }
+            let Ok((e, m)) = e.and_then(|e| e.metadata().map(|m| (e, m))) else {
+                c.failed.fetch_add(1, Relaxed);
+                continue;
+            };
+            c.seen.fetch_add(1, Relaxed);
+            let ft = m.file_type();
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if m.dev() == dev {
+                    stack.push(e.path());
+                    dirs.push((e.path(), m.mode()));
+                }
+            } else if ft.is_file() {
+                set(&e.path(), m.mode(), enclosed_mode(folder_mode, m.mode(), false));
+            }
+        }
+    }
+    for (path, old) in dirs.into_iter().rev() {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        set(&path, old, enclosed_mode(folder_mode, old, true));
+    }
+}
+
+/// Confirmation and progress window for "Apply to enclosed files…".
+fn apply_to_enclosed(parent: &gtk::Window, path: PathBuf, name: &str, folder_mode: u32) {
+    let win = gtk::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .destroy_with_parent(true)
+        .title("Apply to enclosed files")
+        .default_width(400)
+        .resizable(false)
+        .build();
+    win.add_css_class("rfiles");
+    let (dir_m, file_m, exec_m) = (
+        octal_mode(enclosed_mode(folder_mode, 0, true)),
+        octal_mode(enclosed_mode(folder_mode, 0, false)),
+        octal_mode(enclosed_mode(folder_mode, 0o100, false)),
+    );
+    let files = if file_m == exec_m { file_m } else { format!("{file_m} ({exec_m} if already executable)") };
+    let text = format!(
+        "Set the permissions of everything inside “{name}” to match this folder?\n\nFolders get {dir_m}. Files get {files}. \
+         Links are left alone and other file systems are skipped. Owner and group are not changed. \
+         This cannot be undone."
+    );
+    let msg = gtk::Label::new(Some(&text));
+    msg.set_wrap(true);
+    msg.set_xalign(0.0);
+    msg.set_max_width_chars(48);
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.set_visible(false);
+    let cancel_btn = gtk::Button::with_label("Cancel");
+    cancel_btn.set_action_name(Some("window.close"));
+    let apply = gtk::Button::with_label("Apply");
+    apply.add_css_class("suggested-action");
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    buttons.append(&cancel_btn);
+    buttons.append(&apply);
+    let bx = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    bx.set_margin_top(16);
+    bx.set_margin_bottom(14);
+    bx.set_margin_start(16);
+    bx.set_margin_end(16);
+    bx.append(&msg);
+    bx.append(&status);
+    bx.append(&buttons);
+    win.set_child(Some(&bx));
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let cancel = cancel.clone();
+        win.connect_destroy(move |_| cancel.store(true, Relaxed));
+    }
+    let (status_w, apply_w, cancel_btn_w) = (status.downgrade(), apply.downgrade(), cancel_btn.downgrade());
+    apply.connect_clicked(move |b| {
+        b.set_sensitive(false);
+        let c = Arc::new(ApplyCounts::default());
+        {
+            let (c, cancel, path) = (c.clone(), cancel.clone(), path.clone());
+            let spawned = std::thread::Builder::new().name("rfiles-chmod".into()).spawn(move || {
+                apply_walk(&path, folder_mode, &c, &cancel);
+                c.done.store(true, Relaxed);
+            });
+            if spawned.is_err() {
+                if let Some(s) = status_w.upgrade() {
+                    s.set_text("Could not start.");
+                    s.set_visible(true);
+                }
+                return;
+            }
+        }
+        let (status_w, apply_w, cancel_btn_w, cancel) = (status_w.clone(), apply_w.clone(), cancel_btn_w.clone(), cancel.clone());
+        let update = move || -> glib::ControlFlow {
+            let (Some(status), Some(apply), Some(close)) = (status_w.upgrade(), apply_w.upgrade(), cancel_btn_w.upgrade())
+            else {
+                cancel.store(true, Relaxed);
+                return glib::ControlFlow::Break;
+            };
+            let done = c.done.load(Relaxed);
+            let (seen, changed, failed) = (c.seen.load(Relaxed), c.changed.load(Relaxed), c.failed.load(Relaxed));
+            status.set_visible(true);
+            if done {
+                status.set_text(&format!(
+                    "{} changed, {} failed ({} checked).",
+                    group_digits(changed),
+                    group_digits(failed),
+                    group_digits(seen)
+                ));
+                apply.set_visible(false);
+                close.set_label("Close");
+                glib::ControlFlow::Break
+            } else {
+                status.set_text(&format!("Working… {} checked, {} changed.", group_digits(seen), group_digits(changed)));
+                glib::ControlFlow::Continue
+            }
+        };
+        if update() == glib::ControlFlow::Continue {
+            glib::timeout_add_local(TICK, update);
+        }
+    });
+    win.present();
+}
+
+#[cfg(test)]
+mod enclosed_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn enclosed_mode_rules() {
+        // 755 -> folders 755, plain files 644, executable files 755
+        assert_eq!(enclosed_mode(0o755, 0o600, true), 0o755);
+        assert_eq!(enclosed_mode(0o755, 0o600, false), 0o644);
+        assert_eq!(enclosed_mode(0o755, 0o644, false), 0o644);
+        assert_eq!(enclosed_mode(0o755, 0o700, false), 0o755);
+        assert_eq!(enclosed_mode(0o755, 0o001, false), 0o755);
+        // 700 -> 600 / 700
+        assert_eq!(enclosed_mode(0o700, 0o644, false), 0o600);
+        assert_eq!(enclosed_mode(0o700, 0o755, false), 0o700);
+        assert_eq!(enclosed_mode(0o700, 0o644, true), 0o700);
+        // 775, 770, 750, 000
+        assert_eq!(enclosed_mode(0o775, 0o664, false), 0o664);
+        assert_eq!(enclosed_mode(0o750, 0o600, false), 0o640);
+        assert_eq!(enclosed_mode(0o000, 0o644, false), 0o000);
+        assert_eq!(enclosed_mode(0o000, 0o755, true), 0o000);
+    }
+
+    #[test]
+    fn special_bits_are_never_propagated() {
+        for folder in [0o4755, 0o2755, 0o1755, 0o7755, 0o7700] {
+            let f = enclosed_mode(folder, 0o600, false);
+            assert_eq!(f & 0o7000, 0, "{folder:o}");
+            let x = enclosed_mode(folder, 0o700, false);
+            assert_eq!(x & 0o7000, 0, "{folder:o}");
+            assert_eq!(enclosed_mode(folder, 0o644, true) & 0o7000, 0, "{folder:o}");
+        }
+        // An entry keeps the special bits it already has.
+        assert_eq!(enclosed_mode(0o755, 0o2755, true), 0o2755);
+        assert_eq!(enclosed_mode(0o755, 0o4700, false), 0o4755);
+        // Result never includes file type bits.
+        assert_eq!(enclosed_mode(0o100755, 0o100600, false), 0o644);
+    }
+
+    #[test]
+    fn apply_walk_on_temp_tree() {
+        let root = std::env::temp_dir().join(format!("rfiles-props-chmod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (plain, exe, deep) = (root.join("plain"), root.join("exe"), sub.join("deep"));
+        for f in [&plain, &exe, &deep] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let chmod = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        chmod(&plain, 0o666);
+        chmod(&exe, 0o700);
+        chmod(&deep, 0o664);
+        chmod(&sub, 0o777);
+        // A link outside must not be followed or touched.
+        let outside = std::env::temp_dir().join(format!("rfiles-props-chmod-out-{}", std::process::id()));
+        std::fs::write(&outside, b"x").unwrap();
+        chmod(&outside, 0o666);
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let c = ApplyCounts::default();
+        apply_walk(&root, 0o750, &c, &AtomicBool::new(false));
+        assert_eq!(mode(&plain), 0o640);
+        assert_eq!(mode(&exe), 0o750);
+        assert_eq!(mode(&deep), 0o640);
+        assert_eq!(mode(&sub), 0o750);
+        assert_eq!(mode(&root.join("a")) & 0o777, 0o750);
+        assert_eq!(mode(&outside), 0o666);
+        assert_eq!(c.failed.load(Relaxed), 0);
+        assert_eq!(c.changed.load(Relaxed), 5);
+
+        // Nothing left to change on a second run.
+        let c = ApplyCounts::default();
+        apply_walk(&root, 0o750, &c, &AtomicBool::new(false));
+        assert_eq!(c.changed.load(Relaxed), 0);
+
+        // A folder mode without the enter bit still reaches everything.
+        let c = ApplyCounts::default();
+        apply_walk(&root, 0o600, &c, &AtomicBool::new(false));
+        assert_eq!(c.failed.load(Relaxed), 0);
+        // (the folders can't be entered any more, so look one level at a time)
+        assert_eq!(mode(&root.join("a")), 0o600);
+        chmod(&root.join("a"), 0o755);
+        assert_eq!(mode(&sub), 0o600);
+        chmod(&sub, 0o755);
+        assert_eq!(mode(&deep), 0o600);
+
+        // A cancelled walk changes nothing.
+        let c = ApplyCounts::default();
+        apply_walk(&root, 0o755, &c, &AtomicBool::new(true));
+        assert_eq!(c.changed.load(Relaxed), 0);
+
+        for d in [&sub, &root.join("a")] {
+            chmod(d, 0o755);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_file(&outside).unwrap();
+    }
 }
 
 // ================= dialog =================
@@ -598,7 +1128,10 @@ pub fn show(parent: &impl IsA<gtk::Window>, files: Vec<gio::File>) {
                     let (_, size) = add_row(&grid, &mut row, "Size", "");
                     let (ck, contents) = add_row(&grid, &mut row, "Contents", "");
                     match file.path() {
-                        Some(p) => start_walk(vec![p], true, false, &size, &contents, &ck, cancel.clone()),
+                        Some(p) => {
+                            free_space_row(&grid, &mut row, p.clone());
+                            start_walk(vec![p], true, false, &size, &contents, &ck, cancel.clone());
+                        }
                         None => {
                             size.set_text("Unknown (not a local folder)");
                             ck.set_visible(false);
@@ -606,7 +1139,13 @@ pub fn show(parent: &impl IsA<gtk::Window>, files: Vec<gio::File>) {
                         }
                     }
                 } else if !is_dir_like(&info) && !broken {
-                    add_row(&grid, &mut row, "Size", &size_text(info.size().max(0) as u64));
+                    let bytes = info.size().max(0) as u64;
+                    let disk = info.attribute_uint64("unix::blocks").saturating_mul(512);
+                    add_row(&grid, &mut row, "Size", &size_with_disk(bytes, disk));
+                }
+                // Not for folders, and not when the type is unknown.
+                if info.file_type() == gio::FileType::Regular && !broken && !ct.is_empty() && ct != "application/octet-stream" {
+                    open_with_row(&grid, &mut row, &ct);
                 }
                 if ct.starts_with("image/") {
                     if let Some(path) = file.path() {
