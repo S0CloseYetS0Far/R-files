@@ -276,10 +276,23 @@ fn drive_mount_candidates(path: &std::path::Path) -> Option<Vec<PathBuf>> {
     Some(out)
 }
 
-/// The decision for a starred entry whose file could not be read: drop it only when
-/// the error is "not found" and its drive, if it is on a removable one, is mounted.
-fn may_drop_star(err: std::io::ErrorKind, drive_mounted: Option<bool>) -> bool {
-    err == std::io::ErrorKind::NotFound && drive_mounted != Some(false)
+/// What the folder a starred file lived in looks like now.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Parent {
+    /// Missing or unreadable: a drive that isn't there, or a folder deleted as a whole
+    Gone,
+    /// An existing empty folder, which is what an unmounted mount point looks like
+    Empty,
+    HasEntries,
+}
+
+/// The decision for a starred entry whose file could not be read. Drop it only on positive
+/// evidence that the place it lived in is really there: the error is "not found", its
+/// folder exists and is not empty, and its drive, if under /media, /run/media or /mnt, is
+/// mounted. So stars in a folder deleted as a whole are kept on purpose: that can't be told
+/// apart from a drive mounted somewhere else (fstab, a locked encrypted folder) that is absent.
+fn may_drop_star(err: std::io::ErrorKind, parent: Parent, drive_mounted: Option<bool>) -> bool {
+    err == std::io::ErrorKind::NotFound && parent == Parent::HasEntries && drive_mounted != Some(false)
 }
 
 fn is_mount_point(dir: &std::path::Path) -> bool {
@@ -288,16 +301,26 @@ fn is_mount_point(dir: &std::path::Path) -> bool {
     std::fs::metadata(parent).map(|p| p.dev() != m.dev()).unwrap_or(false)
 }
 
-/// Whether a starred file is gone for good, so its entry can be dropped. Anything unsure
-/// (other URIs, permission or I/O errors, an unplugged drive) is kept. Blocking.
+/// Whether a starred file is gone for good, so its entry can be dropped (see `may_drop_star`).
+/// Anything unsure (other URIs, permission or I/O errors, a missing or empty folder, an
+/// unplugged drive) is kept. Blocking.
 pub fn star_is_dead(uri: &str) -> bool {
     let Some(path) = checkable_path(uri) else { return false };
     let err = match std::fs::symlink_metadata(&path) {
         Ok(_) => return false,
         Err(e) => e.kind(),
     };
+    if err != std::io::ErrorKind::NotFound {
+        return false;
+    }
+    let parent = match path.parent().map(std::fs::read_dir) {
+        Some(Ok(mut entries)) => {
+            if entries.next().is_some() { Parent::HasEntries } else { Parent::Empty }
+        }
+        _ => Parent::Gone,
+    };
     let mounted = drive_mount_candidates(&path).map(|dirs| dirs.iter().any(|d| is_mount_point(d)));
-    may_drop_star(err, mounted)
+    may_drop_star(err, parent, mounted)
 }
 
 #[cfg(test)]
@@ -309,12 +332,17 @@ mod dead_star_tests {
 
     #[test]
     fn decision() {
-        assert!(may_drop_star(ErrorKind::NotFound, None));
-        assert!(may_drop_star(ErrorKind::NotFound, Some(true)));
-        assert!(!may_drop_star(ErrorKind::NotFound, Some(false)), "unplugged drive");
-        assert!(!may_drop_star(ErrorKind::PermissionDenied, None));
-        assert!(!may_drop_star(ErrorKind::PermissionDenied, Some(true)));
-        assert!(!may_drop_star(ErrorKind::Other, None));
+        use Parent::*;
+        assert!(may_drop_star(ErrorKind::NotFound, HasEntries, None), "file gone, folder still has others");
+        assert!(!may_drop_star(ErrorKind::NotFound, Gone, None), "folder missing: absent drive or deleted");
+        assert!(!may_drop_star(ErrorKind::NotFound, Empty, None), "empty folder: maybe an unmounted mount point");
+        // Under /media and friends the drive must be mounted too
+        assert!(may_drop_star(ErrorKind::NotFound, HasEntries, Some(true)));
+        assert!(!may_drop_star(ErrorKind::NotFound, HasEntries, Some(false)), "unplugged drive");
+        assert!(!may_drop_star(ErrorKind::NotFound, Gone, Some(false)));
+        assert!(!may_drop_star(ErrorKind::PermissionDenied, HasEntries, None));
+        assert!(!may_drop_star(ErrorKind::PermissionDenied, HasEntries, Some(true)));
+        assert!(!may_drop_star(ErrorKind::Other, HasEntries, None));
     }
 
     #[test]
@@ -350,8 +378,16 @@ mod dead_star_tests {
         let dir_uri = gtk::gio::File::for_path(&d).uri().to_string();
         assert!(!star_is_dead(&uri));
         assert!(!pin_is_missing(&dir_uri));
-        std::fs::remove_dir_all(&d).unwrap();
+        // Gone from a folder that still has other entries: dead
+        std::fs::write(d.join("other"), "y").unwrap();
+        std::fs::remove_file(&f).unwrap();
         assert!(star_is_dead(&uri));
+        // Gone from a folder that is now empty: kept (may be an unmounted mount point)
+        std::fs::remove_file(d.join("other")).unwrap();
+        assert!(!star_is_dead(&uri));
+        // The folder itself is gone: kept, but the folder's pin is missing
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(!star_is_dead(&uri));
         assert!(pin_is_missing(&dir_uri));
         // A file on a drive that isn't mounted is kept
         assert!(!star_is_dead("file:///media/no-such-user-rfiles/Disk/file.txt"));
