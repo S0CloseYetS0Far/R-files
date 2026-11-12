@@ -168,6 +168,11 @@ pub struct App {
     /// monitor); disconnected on close so a closed window is freed.
     model_handlers: RefCell<Vec<(glib::Object, glib::SignalHandlerId)>>,
     save_pending: Cell<bool>,
+    /// Sort key and reversed flag of both views. Set only from the list view's
+    /// header sorter (`header_sort_changed`), which the menu drives too.
+    sort: Rc<Cell<(SortKey, bool)>>,
+    /// The file model's sorter; reads `sort`
+    sorter: gtk::CustomSorter,
 }
 
 thread_local! {
@@ -303,8 +308,16 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     let dir_list = gtk::DirectoryList::new(Some(ATTRS), None::<&gio::File>);
     let filter = gtk::CustomFilter::new(|_| true);
     let filter_model = gtk::FilterListModel::new(Some(dir_list.clone()), Some(filter.clone()));
-    let sort_model =
-        gtk::SortListModel::new(Some(filter_model.clone()), Some(gtk::CustomSorter::new(sort_infos)));
+    let sort = Rc::new(Cell::new((config.sort, config.sort_desc)));
+    let s = sort.clone();
+    let sorter = gtk::CustomSorter::new(move |a, b| {
+        let (Some(a), Some(b)) = (a.downcast_ref::<gio::FileInfo>(), b.downcast_ref::<gio::FileInfo>()) else {
+            return gtk::Ordering::Equal;
+        };
+        let (key, desc) = s.get();
+        compare_infos(a, b, key, desc).into()
+    });
+    let sort_model = gtk::SortListModel::new(Some(filter_model.clone()), Some(sorter.clone()));
     let selection = gtk::MultiSelection::new(Some(sort_model));
 
     let grid = gtk::GridView::new(Some(selection.clone()), None::<gtk::ListItemFactory>);
@@ -456,6 +469,8 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         pending_select: RefCell::new(None),
         model_handlers: RefCell::new(Vec::new()),
         save_pending: Cell::new(false),
+        sort,
+        sorter,
     });
 
     OPEN.with(|o| o.borrow_mut().push(app.clone()));
@@ -587,6 +602,16 @@ impl App {
         self.add_column("Size", 1, false);
         self.add_column("Modified", 2, false);
         self.add_column("Type", 3, false);
+        let (key, desc) = self.sort.get();
+        self.set_sort(key, desc);
+        if let Some(s) = self.list.sorter() {
+            let a = Rc::downgrade(self);
+            s.connect_changed(move |s, _| {
+                if let Some(a) = a.upgrade() {
+                    a.header_sort_changed(s);
+                }
+            });
+        }
 
         for scroll in [&self.grid_scroll, &self.list_scroll] {
             // Right-click on empty space
@@ -687,7 +712,38 @@ impl App {
         if !expand {
             col.set_fixed_width(if kind == 3 { 170 } else { 140 });
         }
+        col.set_id(Some(SortKey::ALL[kind as usize].as_str()));
+        // Only makes the header clickable and show the arrow: the model is sorted by
+        // `App::sorter`, because a reversed column sorter would put folders last.
+        col.set_sorter(Some(&gtk::CustomSorter::new(|_, _| gtk::Ordering::Equal)));
         self.list.append_column(&col);
+    }
+
+    /// Sorts both views. Goes through the list view's header sorter so its arrow
+    /// always matches; `header_sort_changed` does the rest.
+    fn set_sort(&self, key: SortKey, desc: bool) {
+        let cols = self.list.columns();
+        let col = (0..cols.n_items())
+            .filter_map(|i| cols.item(i).and_downcast::<gtk::ColumnViewColumn>())
+            .find(|c| c.id().as_deref() == Some(key.as_str()));
+        let order = if desc { gtk::SortType::Descending } else { gtk::SortType::Ascending };
+        self.list.sort_by_column(col.as_ref(), order);
+    }
+
+    /// A header click or `set_sort`: re-sorts the model in place (no reload; the
+    /// selection follows its items) and remembers the choice.
+    fn header_sort_changed(&self, s: &gtk::Sorter) {
+        let Some(s) = s.downcast_ref::<gtk::ColumnViewSorter>() else { return };
+        let key = s.primary_sort_column().and_then(|c| c.id()).and_then(|id| SortKey::parse(&id));
+        let desc = key.is_some() && s.primary_sort_order() == gtk::SortType::Descending;
+        let state = (key.unwrap_or(SortKey::Name), desc);
+        if self.sort.replace(state) == state {
+            return;
+        }
+        self.sorter.changed(gtk::SorterChange::Different);
+        let mut c = self.config.borrow_mut();
+        (c.sort, c.sort_desc) = state;
+        c.save();
     }
 
     /// Right-click (menu) and middle-click (open in new tab) on a file.
@@ -886,6 +942,18 @@ impl App {
             "Ctrl+H",
         ));
         m.push(mi("Reload", "win.refresh", "F5"));
+        m.push(None);
+        let (key, desc) = self.sort.get();
+        for (k, label) in [
+            (SortKey::Name, "Sort by Name"),
+            (SortKey::Size, "Sort by Size"),
+            (SortKey::Modified, "Sort by Modified"),
+            (SortKey::Type, "Sort by Type"),
+        ] {
+            let accel = if k == key { "✓" } else { "" };
+            m.push(Some(MItem { label: label.into(), action: "win.sort-by", target: Some(k.as_str().to_variant()), accel }));
+        }
+        m.push(mi("Reversed Order", "win.sort-reversed", if desc { "✓" } else { "" }));
         if self.current_dir().is_some() {
             m.push(None);
             m.push(mi("Properties", "win.properties", "Alt+Enter"));
@@ -2344,6 +2412,19 @@ impl App {
             }
         });
         self.window.add_action(&stab);
+        let sort_by = gio::SimpleAction::new("sort-by", Some(glib::VariantTy::STRING));
+        let a = Rc::downgrade(self);
+        sort_by.connect_activate(move |_, v| {
+            let Some(a) = a.upgrade() else { return };
+            if let Some(k) = v.and_then(|v| v.get::<String>()).and_then(|k| SortKey::parse(&k)) {
+                a.set_sort(k, a.sort.get().1);
+            }
+        });
+        self.window.add_action(&sort_by);
+        add("sort-reversed", Box::new(|a| {
+            let (key, desc) = a.sort.get();
+            a.set_sort(key, !desc);
+        }));
 
         let accels: &[(&str, &[&str])] = &[
             ("win.new-tab", &["<Control>t"]),

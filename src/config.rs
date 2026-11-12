@@ -1,3 +1,4 @@
+use crate::util::SortKey;
 use gtk::glib;
 use std::path::PathBuf;
 
@@ -19,6 +20,9 @@ pub struct Config {
     pub icon_size: i32,
     /// Order of the built-in sidebar places, by key
     pub places_order: Vec<String>,
+    /// What the file views are sorted by, and whether reversed
+    pub sort: SortKey,
+    pub sort_desc: bool,
 }
 
 fn dir() -> PathBuf {
@@ -51,6 +55,8 @@ impl Config {
             folder_icon: "blue".into(),
             icon_size: 40,
             places_order: Vec::new(),
+            sort: SortKey::Name,
+            sort_desc: false,
         };
         for line in read_lines("settings") {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -61,6 +67,10 @@ impl Config {
                 }
                 "places" => {
                     c.places_order = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    continue;
+                }
+                "sort" => {
+                    c.sort = SortKey::parse(v.trim()).unwrap_or(SortKey::Name);
                     continue;
                 }
                 _ => {}
@@ -75,6 +85,7 @@ impl Config {
                 ("maximized", Some(n)) => c.maximized = n != 0,
                 ("list_view", Some(n)) => c.list_view = n != 0,
                 ("show_hidden", Some(n)) => c.show_hidden = n != 0,
+                ("sort_desc", Some(n)) => c.sort_desc = n != 0,
                 ("icon_size", Some(n)) if (24..=128).contains(&n) => c.icon_size = n,
                 _ => {}
             }
@@ -90,7 +101,7 @@ impl Config {
         let _ = std::fs::write(
             d.join("settings"),
             format!(
-                "width={}\nheight={}\nmaximized={}\nsidebar={}\npreview={}\nfiles={}\nlist_view={}\nshow_hidden={}\nfolder_icon={}\nicon_size={}\nplaces={}\n",
+                "width={}\nheight={}\nmaximized={}\nsidebar={}\npreview={}\nfiles={}\nlist_view={}\nshow_hidden={}\nfolder_icon={}\nicon_size={}\nplaces={}\nsort={}\nsort_desc={}\n",
                 self.width,
                 self.height,
                 self.maximized as i32,
@@ -101,7 +112,9 @@ impl Config {
                 self.show_hidden as i32,
                 self.folder_icon,
                 self.icon_size,
-                self.places_order.join(",")
+                self.places_order.join(","),
+                self.sort.as_str(),
+                self.sort_desc as i32
             ),
         );
     }
