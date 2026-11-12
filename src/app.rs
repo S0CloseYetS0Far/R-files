@@ -1727,6 +1727,13 @@ impl App {
         bx.append(&err);
         bx.append(&btns);
         win.set_child(Some(&bx));
+        // Escape cancels like the Cancel button; bubble phase so the entry's own popups get it first
+        let keys = gtk::ShortcutController::new();
+        keys.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("Escape"),
+            Some(gtk::NamedAction::new("window.close")),
+        ));
+        win.add_controller(keys);
 
         let f = Rc::new(f);
         let submit = {
