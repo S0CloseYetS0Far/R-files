@@ -2399,33 +2399,6 @@ impl App {
     }
 }
 
-fn delete_recursive(f: &gio::File) -> Result<(), glib::Error> {
-    if f.query_file_type(gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, None::<&gio::Cancellable>)
-        == gio::FileType::Directory
-    {
-        let en = f.enumerate_children("standard::name", gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, None::<&gio::Cancellable>)?;
-        while let Some(info) = en.next_file(None::<&gio::Cancellable>)? {
-            delete_recursive(&f.child(info.name()))?;
-        }
-    }
-    f.delete(None::<&gio::Cancellable>)
-}
-
-/// Why `name` can't be a new folder's name, if it can't. `child()` would read "a/b" or ".." as a path and
-/// create the folder somewhere else, so these are refused before it is called.
-fn folder_name_problem(name: &str) -> Option<&'static str> {
-    if name == "." || name == ".." {
-        // Same wording as batch rename
-        Some("“.” and “..” are not allowed")
-    } else if name.contains(['/', '\0']) {
-        // A NUL can't come from a GTK entry; refused anyway since it would cut the name short
-        Some("The name can't contain “/”")
-    } else {
-        None
-    }
-}
-
-/// Recursive name search, run on a worker thread.
 /// What "Show in folder" must change so its target passes the filter:
 /// (turn hidden files on, clear the search). `query` is lowercase.
 fn reveal_changes(show_hidden: bool, target_hidden: bool, query: &str, display_name: &str) -> (bool, bool) {
@@ -2453,6 +2426,33 @@ mod reveal_tests {
     }
 }
 
+fn delete_recursive(f: &gio::File) -> Result<(), glib::Error> {
+    if f.query_file_type(gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, None::<&gio::Cancellable>)
+        == gio::FileType::Directory
+    {
+        let en = f.enumerate_children("standard::name", gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, None::<&gio::Cancellable>)?;
+        while let Some(info) = en.next_file(None::<&gio::Cancellable>)? {
+            delete_recursive(&f.child(info.name()))?;
+        }
+    }
+    f.delete(None::<&gio::Cancellable>)
+}
+
+/// Why `name` can't be a new folder's name, if it can't. `child()` would read "a/b" or ".." as a path and
+/// create the folder somewhere else, so these are refused before it is called.
+fn folder_name_problem(name: &str) -> Option<&'static str> {
+    if name == "." || name == ".." {
+        // Same wording as batch rename
+        Some("“.” and “..” are not allowed")
+    } else if name.contains(['/', '\0']) {
+        // A NUL can't come from a GTK entry; refused anyway since it would cut the name short
+        Some("The name can't contain “/”")
+    } else {
+        None
+    }
+}
+
+/// Recursive name search, run on a worker thread.
 fn search_walk(root: &Path, q: &str, hidden: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
