@@ -135,6 +135,217 @@ pub fn sort_infos(a: &glib::Object, b: &glib::Object) -> gtk::Ordering {
     o.then_with(|| a.display_name().cmp(&b.display_name())).then_with(|| a.name().cmp(&b.name())).into()
 }
 
+/// What the file views are sorted by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Size,
+    Modified,
+    Type,
+}
+
+impl SortKey {
+    pub const ALL: [SortKey; 4] = [SortKey::Name, SortKey::Size, SortKey::Modified, SortKey::Type];
+
+    /// Name in the settings file, the list view column id and the menu action target.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Size => "size",
+            SortKey::Modified => "modified",
+            SortKey::Type => "type",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<SortKey> {
+        SortKey::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+}
+
+/// The type description shown in the Type column, kept on the FileInfo like `name_key`
+/// because looking it up on every comparison would make big sorts slow.
+fn type_key(info: &gio::FileInfo) -> std::ptr::NonNull<String> {
+    static QUARK: std::sync::OnceLock<glib::Quark> = std::sync::OnceLock::new();
+    let q = *QUARK.get_or_init(|| glib::Quark::from_str("rfiles-type-key"));
+    // SAFETY: only this function uses this quark, and it always stores this type.
+    unsafe {
+        if let Some(k) = info.qdata::<String>(q) {
+            return k;
+        }
+        let d = if info.has_attribute("standard::content-type") { type_description(info) } else { String::new() };
+        info.set_qdata(q, d);
+        info.qdata(q).expect("key was just set")
+    }
+}
+
+/// Unset attributes are checked first: GIO logs a critical when asked for one.
+fn size_of(info: &gio::FileInfo) -> Option<i64> {
+    info.has_attribute("standard::size").then(|| info.size())
+}
+
+fn modified_of(info: &gio::FileInfo) -> Option<(u64, u32)> {
+    info.has_attribute("time::modified").then(|| {
+        let usec = if info.has_attribute("time::modified-usec") { info.attribute_uint32("time::modified-usec") } else { 0 };
+        (info.attribute_uint64("time::modified"), usec)
+    })
+}
+
+/// Folders first in every mode, then `key`, then the name order of `sort_infos`, so the
+/// order is total. Folders have no known size, so Size and Type keep them in name order.
+/// Missing sizes and times sort before known ones. `desc` reverses files and folders
+/// but keeps folders first.
+pub fn compare_infos(a: &gio::FileInfo, b: &gio::FileInfo, key: SortKey, desc: bool) -> Ordering {
+    let (ad, bd) = (is_dir_like(a), is_dir_like(b));
+    if ad != bd {
+        return if ad { Ordering::Less } else { Ordering::Greater };
+    }
+    let o = match key {
+        SortKey::Name => Ordering::Equal,
+        SortKey::Size | SortKey::Type if ad => Ordering::Equal,
+        SortKey::Size => size_of(a).cmp(&size_of(b)),
+        SortKey::Modified => modified_of(a).cmp(&modified_of(b)),
+        // SAFETY: nothing replaces the keys while `a` and `b` are borrowed here.
+        SortKey::Type => unsafe { natural_cmp(type_key(a).as_ref(), type_key(b).as_ref()) },
+    };
+    let o = o.then_with(|| sort_infos(a.upcast_ref(), b.upcast_ref()).into());
+    if desc {
+        o.reverse()
+    } else {
+        o
+    }
+}
+
+#[cfg(test)]
+mod compare_infos_tests {
+    use super::*;
+
+    struct F {
+        name: &'static str,
+        dir: bool,
+        size: Option<i64>,
+        mtime: Option<u64>,
+        ctype: Option<&'static str>,
+    }
+
+    fn f(name: &'static str, size: Option<i64>, mtime: Option<u64>, ctype: Option<&'static str>) -> F {
+        F { name, dir: false, size, mtime, ctype }
+    }
+
+    fn d(name: &'static str, mtime: Option<u64>) -> F {
+        F { name, dir: true, size: None, mtime, ctype: None }
+    }
+
+    fn make(x: &F) -> gio::FileInfo {
+        let i = gio::FileInfo::new();
+        i.set_name(x.name);
+        i.set_display_name(x.name);
+        i.set_file_type(if x.dir { gio::FileType::Directory } else { gio::FileType::Regular });
+        if let Some(s) = x.size {
+            i.set_size(s);
+        }
+        if let Some(t) = x.mtime {
+            i.set_attribute_uint64("time::modified", t);
+        }
+        if let Some(c) = x.ctype {
+            i.set_content_type(c);
+        }
+        i
+    }
+
+    fn sorted(files: &[F], key: SortKey, desc: bool) -> Vec<&'static str> {
+        let mut v: Vec<(gio::FileInfo, &'static str)> = files.iter().map(|x| (make(x), x.name)).collect();
+        v.sort_by(|a, b| compare_infos(&a.0, &b.0, key, desc));
+        v.into_iter().map(|(_, n)| n).collect()
+    }
+
+    fn sample() -> Vec<F> {
+        vec![
+            f("b.txt", Some(300), Some(20), Some("text/plain")),
+            d("zdir", Some(5)),
+            f("a.png", Some(100), Some(30), Some("image/png")),
+            f("c.txt", Some(100), Some(10), Some("text/plain")),
+            d("adir", Some(50)),
+            f("nothing", None, None, None),
+        ]
+    }
+
+    #[test]
+    fn key_parse_round_trip() {
+        for k in SortKey::ALL {
+            assert_eq!(SortKey::parse(k.as_str()), Some(k));
+        }
+        assert_eq!(SortKey::parse("colour"), None);
+        assert_eq!(SortKey::parse(""), None);
+    }
+
+    #[test]
+    fn by_name() {
+        assert_eq!(sorted(&sample(), SortKey::Name, false), ["adir", "zdir", "a.png", "b.txt", "c.txt", "nothing"]);
+        assert_eq!(sorted(&sample(), SortKey::Name, true), ["zdir", "adir", "nothing", "c.txt", "b.txt", "a.png"]);
+    }
+
+    #[test]
+    fn by_size_ties_and_missing() {
+        // Missing size first; equal sizes (a.png, c.txt) in name order; folders by name.
+        assert_eq!(sorted(&sample(), SortKey::Size, false), ["adir", "zdir", "nothing", "a.png", "c.txt", "b.txt"]);
+        assert_eq!(sorted(&sample(), SortKey::Size, true), ["zdir", "adir", "b.txt", "c.txt", "a.png", "nothing"]);
+    }
+
+    #[test]
+    fn by_modified_sorts_folders_too() {
+        assert_eq!(sorted(&sample(), SortKey::Modified, false), ["zdir", "adir", "nothing", "c.txt", "b.txt", "a.png"]);
+        assert_eq!(sorted(&sample(), SortKey::Modified, true), ["adir", "zdir", "a.png", "b.txt", "c.txt", "nothing"]);
+    }
+
+    #[test]
+    fn by_modified_uses_microseconds() {
+        let a = make(&f("a", None, Some(7), None));
+        let b = make(&f("b", None, Some(7), None));
+        a.set_attribute_uint32("time::modified-usec", 900);
+        b.set_attribute_uint32("time::modified-usec", 100);
+        assert_eq!(compare_infos(&a, &b, SortKey::Modified, false), Ordering::Greater);
+    }
+
+    #[test]
+    fn by_type() {
+        let png = gio::content_type_get_description("image/png").to_string();
+        let txt = gio::content_type_get_description("text/plain").to_string();
+        // No content type has an empty description, so it comes first.
+        let mut want = vec!["nothing"];
+        if natural_cmp(&png, &txt) != Ordering::Greater {
+            want.extend(["a.png", "b.txt", "c.txt"]);
+        } else {
+            want.extend(["b.txt", "c.txt", "a.png"]);
+        }
+        let mut all = vec!["adir", "zdir"];
+        all.extend(&want);
+        assert_eq!(sorted(&sample(), SortKey::Type, false), all);
+        let mut rev = vec!["zdir", "adir"];
+        rev.extend(want.iter().rev());
+        assert_eq!(sorted(&sample(), SortKey::Type, true), rev);
+    }
+
+    #[test]
+    fn folders_first_and_total_in_every_mode() {
+        let s = sample();
+        let infos: Vec<gio::FileInfo> = s.iter().map(make).collect();
+        for key in SortKey::ALL {
+            for desc in [false, true] {
+                for (x, a) in s.iter().zip(&infos) {
+                    for (y, b) in s.iter().zip(&infos) {
+                        let o = compare_infos(a, b, key, desc);
+                        assert_eq!(o == Ordering::Equal, x.name == y.name, "{} vs {} {key:?}", x.name, y.name);
+                        assert_eq!(o, compare_infos(b, a, key, desc).reverse());
+                        if x.dir && !y.dir {
+                            assert_eq!(o, Ordering::Less, "{} vs {} {key:?} {desc}", x.name, y.name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Uses an existing system thumbnail when there is one (cheap, already on
 /// disk), otherwise the themed icon.
 pub fn set_icon(img: &gtk::Image, info: &gio::FileInfo, thumbs: bool) {

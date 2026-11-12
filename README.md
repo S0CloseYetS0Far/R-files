@@ -29,6 +29,7 @@ Click once on a PDF to read it page by page, or on a folder to see what's inside
 - **Open in Terminal** from any folder
 - **Custom icons**: light-blue folders by default, the system theme, your own image, or a different icon per file
 - **Search** at the top right: filters as you type, Enter searches subfolders too
+- **Sort** by name, size, modified date or type, folders always first: right-click empty space, or click a column header in the list view (click again to reverse)
 - Remembers your window size, sidebar and preview widths
 - Light on memory (about 45 MB) and quick to open (about 0.2 s). On laptops with two graphics cards it leaves the sleeping one asleep
 
