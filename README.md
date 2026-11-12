@@ -129,6 +129,7 @@ Keep GNOME Files installed; Ubuntu uses it in a few places. To switch back:
 | Back / forward / up | Alt+Left / Alt+Right / Alt+Up |
 | Hidden files | Ctrl+H |
 | Grid / list view | Ctrl+1 / Ctrl+2 |
+| Right-click menu from the keyboard | Menu key or Shift+F10 (on files or a sidebar item); arrows to move, Enter to choose |
 | Keyboard shortcuts list | Ctrl+? or F1 (also in the gear menu, with About) |
 
 Right-click anything for more (star, change icon, open with, etc.).
