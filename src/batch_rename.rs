@@ -373,6 +373,9 @@ use row::Row;
 const DEBOUNCE_ABOVE: usize = 300;
 const DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// Told the (old URI, new URI) of each item after a successful batch.
+type OnRenamed = Box<dyn Fn(&[(String, String)])>;
+
 struct Dialog {
     win: gtk::Window,
     items: Vec<Item>,
@@ -384,6 +387,7 @@ struct Dialog {
     /// Set when undoing a failed batch failed too: names on disk no longer
     /// match the items, so renaming again is refused.
     broken: Cell<bool>,
+    on_renamed: OnRenamed,
     template_mode: gtk::ToggleButton,
     find: gtk::Entry,
     with: gtk::Entry,
@@ -476,8 +480,13 @@ fn preview_factory() -> gtk::SignalListItemFactory {
     f
 }
 
-/// Opens the batch rename dialog for `infos` (in display order).
-pub fn open(parent: &impl IsA<gtk::Window>, infos: &[gio::FileInfo]) {
+/// Opens the batch rename dialog for `infos` (in display order). After a successful batch,
+/// `on_renamed` gets the (old URI, new URI) of each renamed item.
+pub fn open(
+    parent: &impl IsA<gtk::Window>,
+    infos: &[gio::FileInfo],
+    on_renamed: impl Fn(&[(String, String)]) + 'static,
+) {
     // Group items by folder; read each folder's names once for clash checks.
     let mut dir_index: HashMap<String, usize> = HashMap::new();
     let mut dirs = Vec::new();
@@ -603,6 +612,7 @@ pub fn open(parent: &impl IsA<gtk::Window>, infos: &[gio::FileInfo]) {
         existing: RefCell::new(existing),
         rows,
         broken: Cell::new(false),
+        on_renamed: Box::new(on_renamed),
         template_mode: template_mode.clone(),
         find: find.clone(),
         with: with.clone(),
@@ -752,9 +762,13 @@ impl Dialog {
         if !self.ok.is_sensitive() {
             return;
         }
-        let Err(report) = self.execute() else {
-            self.win.close();
-            return;
+        let report = match self.execute() {
+            Ok(renames) => {
+                (self.on_renamed)(&renames);
+                self.win.close();
+                return;
+            }
+            Err(report) => report,
         };
         self.error.set_text(&report);
         self.error.set_visible(true);
@@ -767,7 +781,7 @@ impl Dialog {
     }
 
     /// Renames everything, or undoes what was done and explains why not.
-    fn execute(&self) -> Result<(), String> {
+    fn execute(&self) -> Result<Vec<(String, String)>, String> {
         // Plan again from the current inputs: the single source of truth,
         // whatever state the preview is in.
         let existing = self.existing.borrow();
@@ -819,8 +833,9 @@ struct Failure {
 }
 
 /// Runs `steps` on `files` (one per item). On the first failure, reverts
-/// the completed steps in reverse order.
-fn apply_steps(files: &[gio::File], items: &[Item], steps: &[Move]) -> Result<(), Failure> {
+/// the completed steps in reverse order. On success, returns (old URI, new URI) of each
+/// renamed item; an item inside a renamed folder gets its new name in the old folder.
+fn apply_steps(files: &[gio::File], items: &[Item], steps: &[Move]) -> Result<Vec<(String, String)>, Failure> {
     let mut cur = files.to_vec();
     // (item, file before the step, file after it)
     let mut done: Vec<(usize, gio::File, gio::File)> = Vec::with_capacity(steps.len());
@@ -849,7 +864,37 @@ fn apply_steps(files: &[gio::File], items: &[Item], steps: &[Move]) -> Result<()
             }
         }
     }
-    Ok(())
+    Ok(files
+        .iter()
+        .zip(&cur)
+        .map(|(a, b)| (a.uri().to_string(), b.uri().to_string()))
+        .filter(|(a, b)| a != b)
+        .collect())
+}
+
+#[cfg(test)]
+mod rename_pairs_tests {
+    use super::*;
+
+    #[test]
+    fn success_reports_old_and_new_uris() {
+        let d = std::env::temp_dir().join(format!("rfiles-br-pairs-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        for n in ["a", "b", "c d"] {
+            std::fs::write(d.join(n), n).unwrap();
+        }
+        let dir = gio::File::for_path(&d);
+        let it: Vec<Item> =
+            ["a", "b", "c d"].iter().map(|n| Item { name: n.to_string(), is_dir: false, dir: 0 }).collect();
+        let names: Vec<String> = ["b", "a", "c d"].iter().map(|s| s.to_string()).collect();
+        let existing = vec![names_in(&dir)];
+        let files: Vec<gio::File> = it.iter().map(|i| dir.child(&i.name)).collect();
+        let steps = build_steps(&it, &names, std::slice::from_ref(&dir), &existing);
+        let pairs = apply_steps(&files, &it, &steps).unwrap_or_else(|f| panic!("{}", f.report));
+        let uri = |n: &str| dir.child(n).uri().to_string();
+        assert_eq!(pairs, vec![(uri("a"), uri("b")), (uri("b"), uri("a"))], "unchanged items are left out");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }
 
 /// Reverts `done` in reverse order; returns a line per item it couldn't.
