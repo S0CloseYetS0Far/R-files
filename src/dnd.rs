@@ -422,31 +422,14 @@ fn run_transfer(app: &Rc<App>, srcs: Vec<PathBuf>, dest: PathBuf, cut: bool) {
 }
 
 fn trash_files(app: &Rc<App>, paths: Vec<PathBuf>) {
-    if paths.is_empty() {
-        return;
-    }
-    let app = app.clone();
-    glib::spawn_future_local(async move {
-        let res = gio::spawn_blocking(move || {
-            let mut failed = None;
-            let n = paths.len();
-            for p in paths {
-                if let Err(e) = gio::File::for_path(&p).trash(None::<&gio::Cancellable>) {
-                    failed = Some(e.message().to_string());
-                }
-            }
-            (n, failed)
+    let items = paths
+        .into_iter()
+        .map(|p| {
+            let label = p.file_name().unwrap_or(p.as_os_str()).to_string_lossy().into_owned();
+            (gio::File::for_path(&p), label)
         })
-        .await;
-        app.status.set_text(&match res {
-            Ok((n, None)) => format!("Moved {n} item(s) to the trash"),
-            Ok((_, Some(e))) => format!("Couldn't move to trash: {e}"),
-            Err(_) => "Couldn't move to trash".into(),
-        });
-        if !matches!(app.current_loc(), Loc::Dir(_)) {
-            app.reload();
-        }
-    });
+        .collect();
+    crate::trash::move_to_trash(app, items);
 }
 
 /// Pins the dropped folders (checked off the UI thread; files are skipped).
