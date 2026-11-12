@@ -7,7 +7,7 @@ use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 const SEARCH_MAX_RESULTS: usize = 2000;
@@ -43,7 +43,28 @@ const ICON_SIZES: [(i32, &str); 3] = [(40, "Small"), (56, "Medium"), (72, "Large
 pub enum Loc {
     Dir(gio::File),
     Starred,
-    Search { root: gio::File, query: String, results: Rc<Vec<PathBuf>> },
+    Search { root: gio::File, query: String, results: Rc<Vec<PathBuf>>, end: SearchEnd },
+}
+
+/// Why a deep search walk stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchEnd {
+    Done,
+    ResultLimit,
+    VisitedLimit,
+    Cancelled,
+}
+
+impl SearchEnd {
+    /// What to tell the user when a limit cut the search short.
+    fn note(self) -> Option<String> {
+        use crate::properties::group_digits;
+        match self {
+            SearchEnd::ResultLimit => Some(format!("first {} results", group_digits(SEARCH_MAX_RESULTS as u64))),
+            SearchEnd::VisitedLimit => Some(format!("stopped after {} files", group_digits(SEARCH_MAX_VISITED as u64))),
+            SearchEnd::Done | SearchEnd::Cancelled => None,
+        }
+    }
 }
 
 impl Loc {
@@ -134,6 +155,8 @@ pub struct App {
     volumes: gio::VolumeMonitor,
     config: RefCell<Config>,
     search_gen: Cell<u64>,
+    /// Set to stop the running deep search walk, if there is one
+    search_cancel: RefCell<Option<Arc<AtomicBool>>>,
     layout_ready: Cell<bool>,
     /// File name to select once the folder has loaded ("Show in folder")
     pending_select: RefCell<Option<String>>,
@@ -400,6 +423,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         volumes: gio::VolumeMonitor::get(),
         config: RefCell::new(config),
         search_gen: Cell::new(0),
+        search_cancel: RefCell::new(None),
         layout_ready: Cell::new(false),
         pending_select: RefCell::new(None),
         model_handlers: RefCell::new(Vec::new()),
@@ -948,6 +972,7 @@ impl App {
             (t.loc.clone(), !t.back.is_empty(), !t.fwd.is_empty())
         };
         self.search_gen.set(self.search_gen.get() + 1);
+        self.cancel_search();
         self.back_btn.set_sensitive(can_back);
         self.fwd_btn.set_sensitive(can_fwd);
         *self.previewed.borrow_mut() = None;
@@ -970,11 +995,14 @@ impl App {
                 self.up_btn.set_sensitive(false);
                 String::new()
             }
-            Loc::Search { root, query, results } => {
+            Loc::Search { root, query, results, end } => {
                 let store = infos_store(results.iter().map(gio::File::for_path));
                 self.filter_model.set_model(Some(&store));
-                self.path_entry
-                    .set_text(&format!("Search “{query}” in {}", display_path(root)));
+                let mut text = format!("Search “{query}” in {}", display_path(root));
+                if let Some(note) = end.note() {
+                    text.push_str(&format!(" ({note})"));
+                }
+                self.path_entry.set_text(&text);
                 self.up_btn.set_sensitive(true);
                 query.clone()
             }
@@ -1023,6 +1051,7 @@ impl App {
         }
         self.dir_list.set_file(None::<&gio::File>);
         self.preview.clear();
+        self.cancel_search();
     }
 
     pub(crate) fn reload(self: &Rc<Self>) {
@@ -1064,6 +1093,11 @@ impl App {
         let mut s = format!("{n} item{}", if n == 1 { "" } else { "s" });
         if matches!(self.current_loc(), Loc::Dir(_)) && self.dir_list.is_loading() {
             s.push_str("  ·  loading…");
+        }
+        if let Loc::Search { end, .. } = self.current_loc() {
+            if let Some(note) = end.note() {
+                s.push_str(&format!("  ·  {note}"));
+            }
         }
         let sel = self.selected_infos();
         if sel.len() == 1 {
@@ -1638,19 +1672,50 @@ impl App {
         };
         let g = self.search_gen.get() + 1;
         self.search_gen.set(g);
+        self.cancel_search();
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self.search_cancel.borrow_mut() = Some(cancel.clone());
         self.status.set_text(&format!("Searching for “{query}” in {}…", path.display()));
         let hidden = self.show_hidden.get();
-        let a = self.clone();
+        let a = Rc::downgrade(self);
         let q = query.to_lowercase();
         glib::spawn_future_local(async move {
-            let res = gio::spawn_blocking(move || search_walk(&path, &q, hidden)).await;
+            let res = gio::spawn_blocking(move || {
+                search_walk(&path, &q, hidden, &cancel, SEARCH_MAX_RESULTS, SEARCH_MAX_VISITED)
+            })
+            .await;
+            // The window may have closed while the walk ran
+            let Some(a) = a.upgrade() else { return };
             if a.search_gen.get() != g {
                 return;
             }
-            if let Ok(results) = res {
-                a.navigate(Loc::Search { root, query, results: Rc::new(results) });
+            a.search_cancel.borrow_mut().take();
+            if let Ok((results, end)) = res {
+                if end != SearchEnd::Cancelled {
+                    a.navigate(Loc::Search { root, query, results: Rc::new(results), end });
+                }
             }
         });
+    }
+
+    /// Stops the running deep search walk, if any. Returns whether one was running.
+    fn cancel_search(&self) -> bool {
+        match self.search_cancel.borrow_mut().take() {
+            Some(c) => {
+                c.store(true, AtomicOrdering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The user stopped a deep search (Escape or an emptied search box).
+    fn stop_search_by_user(&self) {
+        if self.cancel_search() {
+            // Its result is ignored even if the walk already finished
+            self.search_gen.set(self.search_gen.get() + 1);
+            self.status.set_text("Search stopped");
+        }
     }
 
     // ================= copy / cut / paste =================
@@ -2315,6 +2380,9 @@ impl App {
         self.search.connect_search_changed(move |e| {
             let Some(a) = a.upgrade() else { return };
             let q = e.text().to_lowercase();
+            if q.is_empty() {
+                a.stop_search_by_user();
+            }
             if *a.query.borrow() != q {
                 *a.query.borrow_mut() = q;
                 a.filter.changed(gtk::FilterChange::Different);
@@ -2337,6 +2405,7 @@ impl App {
         let a = Rc::downgrade(self);
         self.search.connect_stop_search(move |e| {
             let Some(a) = a.upgrade() else { return };
+            a.stop_search_by_user();
             e.set_text("");
             a.grid.grab_focus();
         });
@@ -2396,18 +2465,33 @@ fn folder_name_problem(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Recursive name search, run on a worker thread.
-fn search_walk(root: &Path, q: &str, hidden: bool) -> Vec<PathBuf> {
+/// Recursive name search, run on a worker thread. Stops once `cancel` is set or a limit is reached, and
+/// says which.
+fn search_walk(
+    root: &Path,
+    q: &str,
+    hidden: bool,
+    cancel: &AtomicBool,
+    max_results: usize,
+    max_visited: usize,
+) -> (Vec<PathBuf>, SearchEnd) {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     let mut visited = 0usize;
     let skip: &[&str] = &["/proc", "/sys", "/dev", "/run", "/snap"];
     while let Some(dir) = stack.pop() {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return (out, SearchEnd::Cancelled);
+        }
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for e in rd.flatten() {
+            // Checked per entry too: one folder can hold a huge number of files
+            if cancel.load(AtomicOrdering::Relaxed) {
+                return (out, SearchEnd::Cancelled);
+            }
             visited += 1;
-            if visited > SEARCH_MAX_VISITED || out.len() >= SEARCH_MAX_RESULTS {
-                return out;
+            if visited > max_visited {
+                return (out, SearchEnd::VisitedLimit);
             }
             let name = e.file_name();
             let name = name.to_string_lossy();
@@ -2416,6 +2500,10 @@ fn search_walk(root: &Path, q: &str, hidden: bool) -> Vec<PathBuf> {
             }
             let path = e.path();
             if name.to_lowercase().contains(q) {
+                // Only a match past the limit means results were left out
+                if out.len() >= max_results {
+                    return (out, SearchEnd::ResultLimit);
+                }
                 out.push(path.clone());
             }
             if let Ok(ft) = e.file_type() {
@@ -2425,12 +2513,76 @@ fn search_walk(root: &Path, q: &str, hidden: bool) -> Vec<PathBuf> {
             }
         }
     }
-    out
+    (out, SearchEnd::Done)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{folder_name_problem, folder_style_index};
+    use super::{folder_name_problem, folder_style_index, search_walk, SearchEnd};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    /// root/{Alpha.txt, beta.txt, .alpha-hidden, sub/{alpha2, deep/ALPHA3}, .hid/alpha4}
+    fn search_tree(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("rfiles-search-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        std::fs::create_dir_all(root.join(".hid")).unwrap();
+        for f in ["Alpha.txt", "beta.txt", ".alpha-hidden", "sub/alpha2", "sub/deep/ALPHA3", ".hid/alpha4"] {
+            std::fs::write(root.join(f), b"").unwrap();
+        }
+        root
+    }
+
+    fn names(found: &[PathBuf], root: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> =
+            found.iter().map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn search_walk_matches_and_hidden() {
+        let root = search_tree("match");
+        let no = AtomicBool::new(false);
+        let (found, end) = search_walk(&root, "alpha", false, &no, 100, 100);
+        assert_eq!(end, SearchEnd::Done);
+        assert_eq!(names(&found, &root), ["Alpha.txt", "sub/alpha2", "sub/deep/ALPHA3"]);
+        let (found, end) = search_walk(&root, "alpha", true, &no, 100, 100);
+        assert_eq!(end, SearchEnd::Done);
+        assert_eq!(
+            names(&found, &root),
+            [".alpha-hidden", ".hid/alpha4", "Alpha.txt", "sub/alpha2", "sub/deep/ALPHA3"]
+        );
+        // Exactly as many results as the limit is not a cut-off search
+        let (found, end) = search_walk(&root, "alpha", false, &no, 3, 100);
+        assert_eq!((found.len(), end), (3, SearchEnd::Done));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_walk_limits() {
+        let root = search_tree("limits");
+        let no = AtomicBool::new(false);
+        let (found, end) = search_walk(&root, "alpha", true, &no, 2, 100);
+        assert_eq!((found.len(), end), (2, SearchEnd::ResultLimit));
+        assert_eq!(end.note().as_deref(), Some("first 2,000 results"));
+        // Root holds 5 entries; a limit of 3 visited stops inside it
+        let (found, end) = search_walk(&root, "zzz", true, &no, 100, 3);
+        assert_eq!((found.len(), end), (0, SearchEnd::VisitedLimit));
+        assert_eq!(end.note().as_deref(), Some("stopped after 400,000 files"));
+        assert_eq!(SearchEnd::Done.note(), None);
+        assert_eq!(SearchEnd::Cancelled.note(), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_walk_cancelled() {
+        let root = search_tree("cancel");
+        let (found, end) = search_walk(&root, "alpha", true, &AtomicBool::new(true), 100, 100);
+        assert_eq!((found.len(), end), (0, SearchEnd::Cancelled));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn folder_style_indexes() {
