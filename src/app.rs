@@ -103,6 +103,111 @@ fn mi(label: impl Into<String>, action: &'static str, accel: &'static str) -> Op
     Some(MItem { label: label.into(), action, target: None, accel })
 }
 
+/// Menu key or Shift+F10: the keyboard's way to ask for a right-click menu.
+fn is_menu_key(key: gdk::Key, mods: gdk::ModifierType) -> bool {
+    let other = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK;
+    match key {
+        gdk::Key::Menu => !mods.intersects(other),
+        gdk::Key::F10 => mods.contains(gdk::ModifierType::SHIFT_MASK) && !mods.intersects(other),
+        _ => false,
+    }
+}
+
+/// A focus move inside a popup menu.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MenuNav {
+    Up,
+    Down,
+    Home,
+    End,
+}
+
+/// Where focus goes in a popup menu. `usable[i]` is false for separators and disabled
+/// entries; Up and Down wrap at the ends. None when nothing can take focus.
+fn menu_nav_target(usable: &[bool], current: Option<usize>, nav: MenuNav) -> Option<usize> {
+    let n = usable.len();
+    let first = usable.iter().position(|&u| u)?;
+    let last = usable.iter().rposition(|&u| u)?;
+    let cur = current.filter(|&c| c < n);
+    match (nav, cur) {
+        (MenuNav::Home, _) | (MenuNav::Down, None) => Some(first),
+        (MenuNav::End, _) | (MenuNav::Up, None) => Some(last),
+        (MenuNav::Down, Some(c)) => (1..=n).map(|d| (c + d) % n).find(|&i| usable[i]),
+        (MenuNav::Up, Some(c)) => (1..=n).map(|d| (c + n - d) % n).find(|&i| usable[i]),
+    }
+}
+
+#[cfg(test)]
+mod menu_nav_tests {
+    use super::{is_menu_key, menu_nav_target, MenuNav::*};
+    use gtk::gdk;
+
+    // entry, separator, entry, disabled entry, entry
+    const M: [bool; 5] = [true, false, true, false, true];
+
+    #[test]
+    fn down_skips_separators_and_wraps() {
+        assert_eq!(menu_nav_target(&M, Some(0), Down), Some(2));
+        assert_eq!(menu_nav_target(&M, Some(2), Down), Some(4));
+        assert_eq!(menu_nav_target(&M, Some(4), Down), Some(0));
+        assert_eq!(menu_nav_target(&M, None, Down), Some(0));
+    }
+
+    #[test]
+    fn up_skips_separators_and_wraps() {
+        assert_eq!(menu_nav_target(&M, Some(4), Up), Some(2));
+        assert_eq!(menu_nav_target(&M, Some(2), Up), Some(0));
+        assert_eq!(menu_nav_target(&M, Some(0), Up), Some(4));
+        assert_eq!(menu_nav_target(&M, None, Up), Some(4));
+    }
+
+    #[test]
+    fn home_and_end_jump_to_usable_ends() {
+        let m = [false, true, true, false];
+        assert_eq!(menu_nav_target(&m, Some(2), Home), Some(1));
+        assert_eq!(menu_nav_target(&m, Some(1), End), Some(2));
+        assert_eq!(menu_nav_target(&m, None, Home), Some(1));
+    }
+
+    #[test]
+    fn single_entry_and_out_of_range_current() {
+        assert_eq!(menu_nav_target(&[true], Some(0), Down), Some(0));
+        assert_eq!(menu_nav_target(&[true], Some(0), Up), Some(0));
+        assert_eq!(menu_nav_target(&M, Some(9), Down), Some(0));
+    }
+
+    #[test]
+    fn nothing_focusable() {
+        for nav in [Up, Down, Home, End] {
+            assert_eq!(menu_nav_target(&[], None, nav), None);
+            assert_eq!(menu_nav_target(&[false, false], Some(0), nav), None);
+        }
+    }
+
+    #[test]
+    fn menu_keys() {
+        let none = gdk::ModifierType::empty();
+        let shift = gdk::ModifierType::SHIFT_MASK;
+        assert!(is_menu_key(gdk::Key::Menu, none));
+        assert!(is_menu_key(gdk::Key::F10, shift));
+        assert!(!is_menu_key(gdk::Key::F10, none));
+        assert!(!is_menu_key(gdk::Key::F10, shift | gdk::ModifierType::CONTROL_MASK));
+        assert!(!is_menu_key(gdk::Key::F2, shift));
+    }
+}
+
+/// Moves focus between the entries of a `popup_menu` box.
+fn menu_focus(bx: &gtk::Box, nav: MenuNav) {
+    let kids: Vec<gtk::Widget> =
+        std::iter::successors(bx.first_child(), |w| w.next_sibling()).collect();
+    let usable: Vec<bool> =
+        kids.iter().map(|w| w.is::<gtk::Button>() && w.is_visible() && w.is_sensitive()).collect();
+    let current = bx.focus_child().and_then(|f| kids.iter().position(|w| *w == f));
+    if let Some(i) = menu_nav_target(&usable, current, nav) {
+        kids[i].grab_focus();
+    }
+}
+
 struct Tab {
     loc: Loc,
     /// How `loc` looked when it was last left (tab switch, reload); put back on the next load
@@ -817,10 +922,17 @@ impl App {
             // Keys on the file views
             let k = gtk::EventControllerKey::new();
             let a = Rc::downgrade(self);
+            let s = scroll.downgrade();
             k.connect_key_pressed(move |_, key, _, mods| {
                 let Some(a) = a.upgrade() else { return glib::Propagation::Proceed };
                 let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
                 let alt = mods.contains(gdk::ModifierType::ALT_MASK);
+                if is_menu_key(key, mods) {
+                    if let Some(s) = s.upgrade() {
+                        a.keyboard_menu(&s);
+                    }
+                    return glib::Propagation::Stop;
+                }
                 let action = match key {
                     gdk::Key::Delete if !ctrl && !alt => "trash",
                     gdk::Key::F2 => "rename",
@@ -979,7 +1091,11 @@ impl App {
         pop.add_css_class("ctx-menu");
         pop.set_has_arrow(false);
         pop.set_position(gtk::PositionType::Bottom);
-        let bx = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        // The role can only be set at construction
+        let bx = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .accessible_role(gtk::AccessibleRole::Menu)
+            .build();
         let mut last_sep = true;
         for it in items {
             match it {
@@ -990,7 +1106,8 @@ impl App {
                     }
                 }
                 Some(m) => {
-                    let b = gtk::Button::new();
+                    let b = gtk::Button::builder().accessible_role(gtk::AccessibleRole::MenuItem).build();
+                    b.update_property(&[gtk::accessible::Property::Label(&m.label)]);
                     b.add_css_class("flat");
                     b.add_css_class("ctx-item");
                     let row = gtk::Box::new(gtk::Orientation::Horizontal, 28);
@@ -1031,7 +1148,64 @@ impl App {
             let p = p.clone();
             glib::idle_add_local_once(move || p.unparent());
         });
+
+        // Keyboard: arrows, Home/End and Tab move between entries; Escape goes back to
+        // whatever had focus. Capture, so the box's own arrow handling doesn't stop at the ends.
+        let prev = parent.root().and_then(|r| r.focus()).map(|w| w.downgrade());
+        let k = gtk::EventControllerKey::new();
+        k.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let b = bx.downgrade();
+        let p = pop.downgrade();
+        k.connect_key_pressed(move |_, key, _, mods| {
+            let Some(bx) = b.upgrade() else { return glib::Propagation::Proceed };
+            let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+            let nav = match key {
+                gdk::Key::Up | gdk::Key::KP_Up => MenuNav::Up,
+                gdk::Key::Down | gdk::Key::KP_Down => MenuNav::Down,
+                gdk::Key::Home | gdk::Key::KP_Home => MenuNav::Home,
+                gdk::Key::End | gdk::Key::KP_End => MenuNav::End,
+                gdk::Key::ISO_Left_Tab => MenuNav::Up,
+                gdk::Key::Tab | gdk::Key::KP_Tab => if shift { MenuNav::Up } else { MenuNav::Down },
+                gdk::Key::Escape => {
+                    // Focus back first, so closing doesn't drop it somewhere else
+                    if let Some(w) = prev.as_ref().and_then(|w| w.upgrade()) {
+                        w.grab_focus();
+                    }
+                    if let Some(p) = p.upgrade() {
+                        p.popdown();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                _ => return glib::Propagation::Proceed,
+            };
+            menu_focus(&bx, nav);
+            glib::Propagation::Stop
+        });
+        pop.add_controller(k);
+
         pop.popup();
+        menu_focus(&bx, MenuNav::Home);
+    }
+
+    /// Menu key / Shift+F10 on a file view: the item menu for the selection, anchored at
+    /// the focused item when it is in view, or the background menu when nothing is selected.
+    fn keyboard_menu(&self, scroll: &gtk::ScrolledWindow) {
+        let Some(info) = self.selected_infos().into_iter().next() else {
+            self.popup_menu(scroll, 16.0, 16.0, self.background_menu());
+            return;
+        };
+        // Like right-click, attach to the view stack, not the tile
+        let stack = &self.view_stack;
+        let visible = scroll.compute_bounds(stack);
+        let focus = scroll.root().and_then(|r| r.focus()).filter(|f| {
+            f.is_ancestor(scroll) && !f.is::<gtk::GridView>() && !f.is::<gtk::ListView>() && !f.is::<gtk::ColumnView>()
+        });
+        let at = focus
+            .and_then(|f| f.compute_bounds(stack))
+            .filter(|r| visible.is_none_or(|v| v.intersection(r).is_some()))
+            .map(|r| (r.x() + (r.width() / 2.0).min(48.0), r.y() + r.height() * 0.75));
+        let (x, y) = at.unwrap_or_else(|| visible.map_or((16.0, 16.0), |v| (v.x() + 16.0, v.y() + 16.0)));
+        self.popup_menu(stack, x as f64, y as f64, self.item_menu(&info));
     }
 
     fn item_menu(&self, info: &gio::FileInfo) -> Vec<Option<MItem>> {
@@ -1872,6 +2046,32 @@ impl App {
         self.side_row_gicon(&gicon, name, loc, pin, drag_key);
     }
 
+    /// A sidebar row's menu (right-click or Menu key). `drag_key`: the row can be moved; `pin`: its pinned URI.
+    fn sidebar_menu(idx: usize, drag_key: Option<&str>, pin: Option<&str>) -> Vec<Option<MItem>> {
+        let mut items = vec![Some(MItem {
+            label: "Open in New Tab".into(),
+            action: "win.sidebar-tab",
+            target: Some((idx as i32).to_variant()),
+            accel: "",
+        })];
+        if let Some(k) = drag_key {
+            items.push(None);
+            let target = Some(k.to_variant());
+            items.push(Some(MItem { label: "Move Up".into(), action: "win.side-up", target: target.clone(), accel: "" }));
+            items.push(Some(MItem { label: "Move Down".into(), action: "win.side-down", target, accel: "" }));
+            items.push(None);
+        }
+        if let Some(uri) = pin {
+            items.push(Some(MItem {
+                label: "Unpin".into(),
+                action: "win.unpin",
+                target: Some(uri.to_variant()),
+                accel: "",
+            }));
+        }
+        items
+    }
+
     fn side_row_gicon(
         self: &Rc<Self>,
         icon: &gio::Icon,
@@ -1901,6 +2101,22 @@ impl App {
             t.len() - 1
         };
 
+        // Menu key / Shift+F10 on the focused row
+        let k = gtk::EventControllerKey::new();
+        let a = Rc::downgrade(self);
+        let r = row.downgrade();
+        let (menu_key, menu_pin) = (drag_key.clone(), pin.clone());
+        k.connect_key_pressed(move |_, key, _, mods| {
+            if !is_menu_key(key, mods) {
+                return glib::Propagation::Proceed;
+            }
+            let (Some(a), Some(r)) = (a.upgrade(), r.upgrade()) else { return glib::Propagation::Proceed };
+            let items = Self::sidebar_menu(idx, menu_key.as_deref(), menu_pin.as_deref());
+            a.popup_menu(&r, 24.0, r.height() as f64 * 0.75, items);
+            glib::Propagation::Stop
+        });
+        row.add_controller(k);
+
         // Right-click / middle-click
         let g = gtk::GestureClick::new();
         g.set_button(0);
@@ -1913,27 +2129,7 @@ impl App {
             match g.current_button() {
             3 => {
                 g.set_state(gtk::EventSequenceState::Claimed);
-                let mut items = vec![Some(MItem {
-                    label: "Open in New Tab".into(),
-                    action: "win.sidebar-tab",
-                    target: Some((idx as i32).to_variant()),
-                    accel: "",
-                })];
-                if let Some(k) = &menu_key {
-                    items.push(None);
-                    items.push(Some(MItem { label: "Move Up".into(), action: "win.side-up", target: Some(k.to_variant()), accel: "" }));
-                    items.push(Some(MItem { label: "Move Down".into(), action: "win.side-down", target: Some(k.to_variant()), accel: "" }));
-                    items.push(None);
-                }
-                if let Some(uri) = &pin {
-                    items.push(Some(MItem {
-                        label: "Unpin".into(),
-                        action: "win.unpin",
-                        target: Some(uri.to_variant()),
-                        accel: "",
-                    }));
-                }
-                a.popup_menu(&r, x, y, items);
+                a.popup_menu(&r, x, y, Self::sidebar_menu(idx, menu_key.as_deref(), pin.as_deref()));
             }
             2 => {
                 g.set_state(gtk::EventSequenceState::Claimed);
@@ -3298,6 +3494,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Back / forward / up", "Alt+Left / Alt+Right / Alt+Up"),
     ("Hidden files", "Ctrl+H"),
     ("Grid / list view", "Ctrl+1 / Ctrl+2"),
+    ("Right-click menu from the keyboard", "Menu key or Shift+F10"),
     ("This list", "Ctrl+? or F1"),
 ];
 
