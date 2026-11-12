@@ -10,6 +10,7 @@ mod gpu;
 mod preview;
 mod properties;
 mod thumbs;
+mod trash;
 mod util;
 
 use gtk::prelude::*;

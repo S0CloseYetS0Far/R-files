@@ -854,6 +854,12 @@ impl App {
         let cfg = self.config.borrow();
         let uri = item_file(info).uri().to_string();
         let mut m = Vec::new();
+        // Only top-level trash items know where they came from
+        let origs: Vec<Option<PathBuf>> = self.selected_infos().iter().map(crate::trash::orig_path).collect();
+        if trash && crate::trash::can_restore(&origs) {
+            m.push(mi("Restore", "win.restore", ""));
+            m.push(None);
+        }
         if !many {
             m.push(mi("Open", "win.open", "Enter"));
             if dir {
@@ -1903,11 +1909,13 @@ impl App {
                 return;
             };
             let srcs: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
-            if srcs.is_empty() {
-                a.status.set_text("Can only paste local files");
+            // Items with no local path (the trash) are copied through GIO; moving them out is Restore's job
+            let remote = srcs.len() < files.len();
+            if remote && cut {
+                a.status.set_text("Can only move local files");
                 return;
             }
-            let n = srcs.len();
+            let n = files.len();
             let verb = if cut { "Moving" } else { "Copying" };
             a.status.set_text(&format!("{verb} {n} item(s)…"));
             let progress = Arc::new(AtomicU64::new(0));
@@ -1917,7 +1925,14 @@ impl App {
                 a2.status.set_text(&format!("{verb} {n} item(s)…  {}", glib::format_size(done)));
                 glib::ControlFlow::Continue
             });
-            let out = gio::spawn_blocking(move || fileops::transfer(srcs, dest_path, cut, progress)).await;
+            let out = gio::spawn_blocking(move || {
+                if remote {
+                    crate::trash::copy_into(files, dest_path, progress)
+                } else {
+                    fileops::transfer(srcs, dest_path, cut, progress)
+                }
+            })
+            .await;
             timer.remove();
             match out {
                 Ok(o) => {
@@ -2066,6 +2081,41 @@ impl App {
                 self.reload();
             }
         }
+    }
+
+    /// Moves the selected trash items back to where they were deleted from.
+    fn restore_selected(self: &Rc<Self>) {
+        if !self.in_trash() {
+            return;
+        }
+        let infos = self.selected_infos();
+        let origs: Vec<Option<PathBuf>> = infos.iter().map(crate::trash::orig_path).collect();
+        if !crate::trash::can_restore(&origs) {
+            if !infos.is_empty() {
+                self.status.set_text("Only items at the top of the trash can be restored");
+            }
+            return;
+        }
+        // The trash:/// item itself, so GIO also removes its trash record
+        let items: Vec<(gio::File, PathBuf, bool)> = infos
+            .iter()
+            .zip(origs.into_iter().flatten())
+            .map(|(i, orig)| {
+                let f = i
+                    .attribute_object("standard::file")
+                    .and_downcast::<gio::File>()
+                    .unwrap_or_else(|| item_file(i));
+                (f, orig, i.file_type() == gio::FileType::Directory)
+            })
+            .collect();
+        self.status.set_text(&format!("Restoring {} item(s)…", items.len()));
+        let a = self.clone();
+        glib::spawn_future_local(async move {
+            match gio::spawn_blocking(move || crate::trash::restore(items)).await {
+                Ok(o) => a.status.set_text(&crate::trash::restore_message(&o)),
+                Err(_) => a.status.set_text("Restore failed"),
+            }
+        });
     }
 
     fn empty_trash(self: &Rc<Self>) {
@@ -2343,6 +2393,7 @@ impl App {
         }));
         add("trash", Box::new(|a| a.delete_selected()));
         add("empty-trash", Box::new(|a| a.empty_trash()));
+        add("restore", Box::new(|a| a.restore_selected()));
         add("rename", Box::new(|a| {
             if a.in_trash() {
                 return;
