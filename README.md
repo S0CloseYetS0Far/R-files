@@ -30,6 +30,7 @@ Click once on a PDF to read it page by page, or on a folder to see what's inside
 - **Custom icons**: light-blue folders by default, the system theme, your own image, or a different icon per file
 - **Search** at the top right: filters as you type, Enter searches subfolders too
 - **Sort** by name, size, modified date or type, folders always first: right-click empty space, or click a column header in the list view (click again to reverse)
+- **Hide the sidebar or the preview pane** for more room (F9 / F4); nothing is previewed while the preview is hidden
 - Remembers your window size, sidebar and preview widths
 - Light on memory (about 45 MB) and quick to open (about 0.2 s). On laptops with two graphics cards it leaves the sleeping one asleep
 
@@ -131,6 +132,7 @@ Keep GNOME Files installed; Ubuntu uses it in a few places. To switch back:
 | Hidden files | Ctrl+H |
 | Grid / list view | Ctrl+1 / Ctrl+2 |
 | Right-click menu from the keyboard | Menu key or Shift+F10 (on files or a sidebar item); arrows to move, Enter to choose |
+| Show / hide sidebar / preview pane | F9 / F4 (or their buttons in the path bar) |
 | Keyboard shortcuts list | Ctrl+? or F1 (also in the gear menu, with About) |
 
 Right-click anything for more (star, change icon, open with, etc.).

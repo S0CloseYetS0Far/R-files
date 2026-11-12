@@ -546,6 +546,8 @@ pub struct App {
     up_btn: gtk::Button,
     hidden_btn: gtk::ToggleButton,
     view_btn: gtk::ToggleButton,
+    sidebar_btn: gtk::ToggleButton,
+    preview_btn: gtk::ToggleButton,
     settings_btn: gtk::MenuButton,
     pin_btn: gtk::Button,
     search: gtk::SearchEntry,
@@ -562,6 +564,9 @@ pub struct App {
     preview: Rc<Preview>,
     previewed: RefCell<Option<String>>,
     sidebar: gtk::ListBox,
+    side_scroll: gtk::ScrolledWindow,
+    /// Width of `inner` when the preview pane was last hidden (0: never), see `preview_show_position`
+    preview_hidden_at: Cell<i32>,
     sidebar_targets: RefCell<Vec<Option<SideTarget>>>,
     outer: gtk::Paned,
     inner: gtk::Paned,
@@ -693,6 +698,8 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     newdir_btn.set_action_name(Some("win.new-folder"));
     let hidden_btn = icon_toggle("view-reveal-symbolic", "Show hidden files (Ctrl+H)");
     let view_btn = icon_toggle("view-list-symbolic", "List view (Ctrl+2) / grid view (Ctrl+1)");
+    let sidebar_btn = icon_toggle("sidebar-show-symbolic", "Show sidebar (F9)");
+    let preview_btn = icon_toggle("sidebar-show-right-symbolic", "Show preview pane (F4)");
     let settings_btn = gtk::MenuButton::builder()
         .icon_name("emblem-system-symbolic")
         .tooltip_text("Icons & appearance")
@@ -702,7 +709,8 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     let nav = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     nav.add_css_class("navbar");
     for w in [
-        back_btn.upcast_ref::<gtk::Widget>(),
+        sidebar_btn.upcast_ref::<gtk::Widget>(),
+        back_btn.upcast_ref(),
         fwd_btn.upcast_ref(),
         up_btn.upcast_ref(),
         refresh_btn.upcast_ref(),
@@ -712,6 +720,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         pin_btn.upcast_ref(),
         hidden_btn.upcast_ref(),
         view_btn.upcast_ref(),
+        preview_btn.upcast_ref(),
         settings_btn.upcast_ref(),
     ] {
         nav.append(w);
@@ -833,6 +842,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     let show_hidden = config.show_hidden;
     let list_view = config.list_view;
     let preview_width = config.preview_width;
+    let (show_sidebar, show_preview) = (config.show_sidebar, config.show_preview);
     if config.maximized {
         window.maximize();
     }
@@ -856,6 +866,8 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         up_btn,
         hidden_btn,
         view_btn,
+        sidebar_btn,
+        preview_btn,
         settings_btn,
         pin_btn,
         search,
@@ -871,6 +883,8 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         preview,
         previewed: RefCell::new(None),
         sidebar,
+        side_scroll,
+        preview_hidden_at: Cell::new(0),
         sidebar_targets: RefCell::new(Vec::new()),
         outer,
         inner,
@@ -900,6 +914,11 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     app.hidden_btn.set_active(show_hidden);
     app.view_btn.set_active(list_view);
     app.view_stack.set_visible_child_name(if list_view { "list" } else { "grid" });
+    // Applied before the buttons, so their toggled handlers find nothing to change or save
+    app.side_scroll.set_visible(show_sidebar);
+    app.preview.root.set_visible(show_preview);
+    app.sidebar_btn.set_active(show_sidebar);
+    app.preview_btn.set_active(show_preview);
 
     app.new_tab(Loc::Dir(start));
     app.restore_layout(preview_width);
@@ -1879,6 +1898,11 @@ impl App {
     }
 
     fn on_selection_changed(self: &Rc<Self>) {
+        // A hidden preview pane does no work; showing it previews the selection
+        if !self.preview.root.is_visible() {
+            self.update_status();
+            return;
+        }
         let infos = self.selected_infos();
         match infos.len() {
             0 => {
@@ -3189,16 +3213,90 @@ impl App {
             }
         }
         if self.layout_ready.get() {
-            c.sidebar_pos = self.outer.position();
-            let iw = self.inner.width();
-            if iw > 0 {
-                c.preview_width = (iw - self.inner.position()).max(150);
-                c.files_pos = self.inner.position();
-            }
+            self.note_widths(&mut c);
         }
         c.list_view = self.view_btn.is_active();
+        c.show_sidebar = self.sidebar_btn.is_active();
+        c.show_preview = self.preview_btn.is_active();
         c.show_hidden = self.show_hidden.get();
         c.save();
+    }
+
+    /// Puts the pane widths into `c`. A hidden pane keeps the width it had.
+    fn note_widths(&self, c: &mut Config) {
+        let sidebar = self.side_scroll.is_visible().then(|| self.outer.position());
+        let iw = self.inner.width();
+        let inner = (self.preview.root.is_visible() && iw > 0).then(|| (iw, self.inner.position()));
+        (c.sidebar_pos, c.preview_width, c.files_pos) =
+            widths_to_save((c.sidebar_pos, c.preview_width, c.files_pos), sidebar, inner);
+    }
+
+    /// Moves keyboard focus to the file view if it is inside `pane`, which is about to be hidden.
+    fn focus_files_if_in(&self, pane: &gtk::Widget) {
+        let inside = GtkWindowExt::focus(&self.window).is_some_and(|f| &f == pane || f.is_ancestor(pane));
+        if inside {
+            if self.view_btn.is_active() {
+                self.list.grab_focus();
+            } else {
+                self.grid.grab_focus();
+            }
+        }
+    }
+
+    /// Saves the shown/hidden state of the panes, once the window is up.
+    fn save_pane_state(&self) {
+        let mut c = self.config.borrow_mut();
+        c.show_sidebar = self.sidebar_btn.is_active();
+        c.show_preview = self.preview_btn.is_active();
+        if self.window.is_mapped() {
+            c.save();
+        }
+    }
+
+    /// Shows or hides the sidebar (F9). GtkPaned gives the rest all the room and keeps its
+    /// position (the sidebar width) while the sidebar is hidden.
+    fn set_sidebar_shown(&self, show: bool) {
+        if self.side_scroll.is_visible() == show {
+            return;
+        }
+        if !show {
+            if self.layout_ready.get() {
+                self.note_widths(&mut self.config.borrow_mut());
+            }
+            self.focus_files_if_in(self.side_scroll.upcast_ref());
+        }
+        self.side_scroll.set_visible(show);
+        self.save_pane_state();
+    }
+
+    /// Shows or hides the preview pane (F4). While hidden nothing is previewed and a playing
+    /// video stops; showing it again previews the selection at the width it had.
+    fn set_preview_shown(self: &Rc<Self>, show: bool) {
+        let root = &self.preview.root;
+        if root.is_visible() == show {
+            return;
+        }
+        if show {
+            root.set_visible(true);
+            let w = self.inner.width();
+            // Not laid out yet: `restore_layout` places the divider
+            if w > 0 {
+                let pw = self.config.borrow().preview_width;
+                self.inner.set_position(preview_show_position(self.preview_hidden_at.get(), w, pw));
+            }
+            self.on_selection_changed();
+        } else {
+            // Note its width now: a later save can't see it any more
+            if self.layout_ready.get() {
+                self.note_widths(&mut self.config.borrow_mut());
+            }
+            self.preview_hidden_at.set(self.inner.width());
+            self.focus_files_if_in(root.upcast_ref());
+            root.set_visible(false);
+            *self.previewed.borrow_mut() = None;
+            self.preview.clear();
+        }
+        self.save_pane_state();
     }
 
     fn is_pinned(&self, f: &gio::File) -> bool {
@@ -3249,6 +3347,8 @@ impl App {
         add("toggle-hidden", Box::new(|a| a.hidden_btn.set_active(!a.hidden_btn.is_active())));
         add("grid-view", Box::new(|a| a.view_btn.set_active(false)));
         add("list-view", Box::new(|a| a.view_btn.set_active(true)));
+        add("toggle-sidebar", Box::new(|a| a.sidebar_btn.set_active(!a.sidebar_btn.is_active())));
+        add("toggle-preview", Box::new(|a| a.preview_btn.set_active(!a.preview_btn.is_active())));
         add("select-all", Box::new(|a| {
             a.selection.select_all();
         }));
@@ -3497,6 +3597,8 @@ impl App {
             ("win.terminal-here", &["<Control><Alt>t"]),
             ("win.grid-view", &["<Control>1"]),
             ("win.list-view", &["<Control>2"]),
+            ("win.toggle-sidebar", &["F9"]),
+            ("win.toggle-preview", &["F4"]),
             ("win.properties", &["<Alt>Return", "<Control>i"]),
         ];
         for (action, keys) in accels {
@@ -3663,6 +3765,18 @@ impl App {
             a.view_stack
                 .set_visible_child_name(if b.is_active() { "list" } else { "grid" });
         });
+        let a = Rc::downgrade(self);
+        self.sidebar_btn.connect_toggled(move |b| {
+            if let Some(a) = a.upgrade() {
+                a.set_sidebar_shown(b.is_active())
+            }
+        });
+        let a = Rc::downgrade(self);
+        self.preview_btn.connect_toggled(move |b| {
+            if let Some(a) = a.upgrade() {
+                a.set_preview_shown(b.is_active())
+            }
+        });
 
         let a = Rc::downgrade(self);
         self.window.connect_close_request(move |_| {
@@ -3758,6 +3872,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Hidden files", "Ctrl+H"),
     ("Grid / list view", "Ctrl+1 / Ctrl+2"),
     ("Right-click menu from the keyboard", "Menu key or Shift+F10"),
+    ("Show / hide sidebar / preview pane", "F9 / F4"),
     ("This list", "Ctrl+? or F1"),
 ];
 
@@ -3816,6 +3931,62 @@ fn show_about(parent: &gtk::ApplicationWindow) {
         .website("https://github.com/S0CloseYetS0Far/R-files")
         .build()
         .present();
+}
+
+/// The (sidebar, preview, files) widths to save. `sidebar` is the outer divider position and
+/// `inner` the inner paned's (width, divider position), each None while that pane is hidden:
+/// its paned position then says nothing about it, so the width saved for it is kept.
+fn widths_to_save(saved: (i32, i32, i32), sidebar: Option<i32>, inner: Option<(i32, i32)>) -> (i32, i32, i32) {
+    let (mut side, mut preview, mut files) = saved;
+    if let Some(pos) = sidebar {
+        side = pos;
+    }
+    if let Some((width, pos)) = inner {
+        preview = (width - pos).max(150);
+        files = pos;
+    }
+    (side, preview, files)
+}
+
+#[cfg(test)]
+mod pane_width_tests {
+    use super::*;
+
+    #[test]
+    fn shown_panes_are_measured() {
+        assert_eq!(widths_to_save((220, 420, 700), Some(250), Some((1000, 600))), (250, 400, 600));
+        // A divider pushed to the end still saves a usable preview width
+        assert_eq!(widths_to_save((220, 420, 700), Some(250), Some((1000, 990))), (250, 150, 990));
+    }
+
+    #[test]
+    fn hidden_panes_keep_their_width() {
+        assert_eq!(widths_to_save((220, 420, 700), None, Some((1200, 800))), (220, 400, 800));
+        assert_eq!(widths_to_save((220, 420, 700), Some(180), None), (180, 420, 700));
+        assert_eq!(widths_to_save((220, 420, 700), None, None), (220, 420, 700));
+    }
+
+    #[test]
+    fn show_position_keeps_the_preview_width() {
+        // GtkPaned later adds (width now - width when it last laid out both children);
+        // the preview must come back `preview` wide either way.
+        let pos = preview_show_position(1000, 1600, 420);
+        assert_eq!(pos + 1600 - 1000, 1600 - 420);
+        assert_eq!(preview_show_position(1600, 1000, 420) + 1000 - 1600, 1000 - 420);
+        // Never laid out with the preview (started hidden): the position is used as is
+        assert_eq!(preview_show_position(0, 1600, 420), 1180);
+        // Never negative, which would unset the position
+        assert!(preview_show_position(300, 1600, 420) > 0);
+    }
+}
+
+/// Divider position that brings the preview pane back `preview` wide in an inner paned now
+/// `width` wide. `hidden_at` is the paned's width when the preview was hidden, 0 if never:
+/// GtkPaned shifts a set position by how much its width changed since it last laid out both
+/// children (start side resizes, end doesn't), and that was at `hidden_at`.
+fn preview_show_position(hidden_at: i32, width: i32, preview: i32) -> i32 {
+    let base = if hidden_at > 0 { hidden_at } else { width };
+    (base - preview).max(1)
 }
 
 /// What "Show in folder" must change so its target passes the filter:
