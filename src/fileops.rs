@@ -228,9 +228,10 @@ fn terminal_candidates(
     alt_target: Option<&Path>,
 ) -> Vec<(String, Vec<String>)> {
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
-    // No directory flag here: it starts the terminal in the working directory of the process
+    // --dir= is one argument (the value may hold spaces or start with "-"); it maps it to the terminal's own
+    // directory option, or changes directory itself when the terminal has none
     if installed("xdg-terminal-exec") {
-        out.push(("xdg-terminal-exec".into(), vec![]));
+        out.push(("xdg-terminal-exec".into(), vec![format!("--dir={d}")]));
     }
     if installed("x-terminal-emulator") {
         let name = alt_target.and_then(|t| t.file_name()).and_then(|n| n.to_str());
@@ -283,8 +284,8 @@ mod tests {
         let names: Vec<&str> = c.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(names[..3], ["xdg-terminal-exec", "x-terminal-emulator", "ptyxis"]);
         assert_eq!(names.last(), Some(&"xterm"));
-        assert!(c[0].1.is_empty());
         // folder with spaces stays one argument; the alternative's target picks the flags
+        assert_eq!(c[0].1, ["--dir=/home/u/My Docs"]);
         assert_eq!(c[1].1, ["--working-directory=/home/u/My Docs"]);
         assert_eq!(c[2].1, ["--new-window", "--working-directory", "/home/u/My Docs"]);
 
@@ -306,6 +307,7 @@ mod tests {
                 assert!(i > 0 && args[i - 1].starts_with('-'), "{p}: {args:?}");
             }
         }
+        assert!(c.iter().any(|(p, a)| p == "xdg-terminal-exec" && a == &["--dir=-weird dir"]));
         assert!(c.iter().any(|(p, a)| p == "kitty" && a == &["--directory", "-weird dir"]));
         assert!(c.iter().any(|(p, a)| p == "gnome-terminal" && a == &["--working-directory=-weird dir"]));
     }
