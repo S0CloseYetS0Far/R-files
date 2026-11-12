@@ -40,16 +40,9 @@ fn free_target(target: &Path, label: &str, is_dir: bool, exists: &dyn Fn(&Path) 
         return target.to_path_buf();
     }
     let dir = target.parent().unwrap_or(Path::new("/"));
-    let name = target.file_name().unwrap_or_default();
-    let (stem, ext) = if is_dir {
-        (name.to_string_lossy().into_owned(), String::new())
-    } else {
-        let p = Path::new(name);
-        (
-            p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-            p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default(),
-        )
-    };
+    let full = target.file_name().unwrap_or_default().to_string_lossy();
+    // Same split as a pasted copy's name: "a.tar.gz" → "a (restored).tar.gz"
+    let (stem, ext) = if is_dir { (&*full, "") } else { crate::util::split_ext(&full) };
     for i in 1.. {
         let n = if i == 1 { format!("{stem} ({label}){ext}") } else { format!("{stem} ({label} {i}){ext}") };
         let cand = dir.join(n);
@@ -203,6 +196,8 @@ mod restore_tests {
         let p = Path::new("/home/u/my.photos");
         assert_eq!(restore_target(p, true, &ex), Path::new("/home/u/my.photos (restored)"));
         assert_eq!(restore_target(p, false, &ex), Path::new("/home/u/my (restored).photos"));
+        let ex = taken(&["/home/u/a.tar.gz"]);
+        assert_eq!(restore_target(Path::new("/home/u/a.tar.gz"), false, &ex), Path::new("/home/u/a (restored).tar.gz"));
         let ex = taken(&["/home/u/.bashrc"]);
         assert_eq!(restore_target(Path::new("/home/u/.bashrc"), false, &ex), Path::new("/home/u/.bashrc (restored)"));
     }
