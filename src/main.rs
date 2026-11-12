@@ -64,6 +64,7 @@ columnview.files > listview > row:hover { background-color: #101010; }
 columnview.files > listview > row:selected { background-color: rgba(53, 132, 228, 0.38); }
 columnview.files > header { background-color: #050505; }
 columnview.files > header > button { background: #050505; color: #8c8c8c; border-color: #1a1a1a; }
+.empty-view { color: #7a7a7a; font-size: 15px; }
 .statusbar { background: #080808; color: #808080; padding: 4px 12px; font-size: 12px; border-top: 1px solid #161616; }
 
 /* ---------- preview ---------- */

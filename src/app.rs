@@ -146,6 +146,10 @@ pub struct App {
     list: gtk::ColumnView,
     grid_scroll: gtk::ScrolledWindow,
     list_scroll: gtk::ScrolledWindow,
+    /// Icon + text over the file view when there is nothing to show
+    empty_box: gtk::Box,
+    empty_icon: gtk::Image,
+    empty_label: gtk::Label,
     preview: Rc<Preview>,
     previewed: RefCell<Option<String>>,
     sidebar: gtk::ListBox,
@@ -329,6 +333,27 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     view_stack.add_named(&list_scroll, Some("list"));
     view_stack.set_vexpand(true);
 
+    // Laid over the views rather than being a stack page, so the grid/list
+    // choice is untouched and clicks and drops reach the view underneath
+    // (its background menu and drop target).
+    let empty_icon = gtk::Image::new();
+    empty_icon.set_pixel_size(64);
+    let empty_label = gtk::Label::new(None);
+    empty_label.set_wrap(true);
+    empty_label.set_justify(gtk::Justification::Center);
+    empty_label.set_max_width_chars(50);
+    let empty_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    empty_box.add_css_class("empty-view");
+    empty_box.set_halign(gtk::Align::Center);
+    empty_box.set_valign(gtk::Align::Center);
+    empty_box.set_can_target(false);
+    empty_box.set_visible(false);
+    empty_box.append(&empty_icon);
+    empty_box.append(&empty_label);
+    let view_overlay = gtk::Overlay::new();
+    view_overlay.set_child(Some(&view_stack));
+    view_overlay.add_overlay(&empty_box);
+
     let status = gtk::Label::new(None);
     status.set_xalign(0.0);
     status.set_ellipsize(pango::EllipsizeMode::End);
@@ -336,7 +361,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
 
     let files_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     files_box.add_css_class("files-area");
-    files_box.append(&view_stack);
+    files_box.append(&view_overlay);
     files_box.append(&status);
 
     // ---------- sidebar ----------
@@ -414,6 +439,9 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         list,
         grid_scroll,
         list_scroll,
+        empty_box,
+        empty_icon,
+        empty_label,
         preview,
         previewed: RefCell::new(None),
         sidebar,
@@ -1139,6 +1167,37 @@ impl App {
             s.push_str(&format!("  ·  {} selected", sel.len()));
         }
         self.status.set_text(&s);
+        self.update_empty_view();
+    }
+
+    /// Shows or hides the "nothing here" message over the file view.
+    fn update_empty_view(&self) {
+        let loc = self.current_loc();
+        let place = match &loc {
+            Loc::Dir(f) if f.uri().trim_end_matches('/') == "trash:" => Place::Trash,
+            Loc::Dir(_) => Place::Dir,
+            Loc::Starred => Place::Starred,
+            Loc::Search { .. } => Place::Search,
+        };
+        let dir = matches!(loc, Loc::Dir(_));
+        let error = if dir { self.dir_list.error().map(|e| e.message().to_string()) } else { None };
+        let total = self.filter_model.model().map_or(0, |m| m.n_items());
+        let msg = empty_message(
+            place,
+            dir && self.dir_list.is_loading(),
+            error.as_deref(),
+            total,
+            self.filter_model.n_items(),
+            &self.query.borrow(),
+        );
+        match msg {
+            Some((icon, text)) => {
+                self.empty_icon.set_icon_name(Some(icon));
+                self.empty_label.set_text(&text);
+                self.empty_box.set_visible(true);
+            }
+            None => self.empty_box.set_visible(false),
+        }
     }
 
     // ================= tabs =================
@@ -2355,6 +2414,7 @@ impl App {
             } else {
                 a.status.set_text(&format!("Can't open folder: {}", err.message()));
             }
+            a.update_empty_view();
         });
         track(self.dir_list.upcast_ref(), id);
 
@@ -2521,6 +2581,50 @@ fn folder_name_problem(name: &str) -> Option<&'static str> {
     }
 }
 
+/// What kind of place the file view shows, for the empty-view message.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Place {
+    Dir,
+    Trash,
+    Starred,
+    Search,
+}
+
+/// The icon and text to show when the view has nothing in it, or None
+/// while it has items or is still loading. `total` counts the items before
+/// filtering, `shown` after it, `query` is the filter text.
+fn empty_message(
+    place: Place,
+    loading: bool,
+    error: Option<&str>,
+    total: u32,
+    shown: u32,
+    query: &str,
+) -> Option<(&'static str, String)> {
+    if shown > 0 || loading {
+        return None;
+    }
+    if let Some(e) = error {
+        // GIO says "Error opening directory “/x”: Permission denied"; the
+        // path is already in the path bar, so keep just the reason.
+        let e = e.rsplit_once(": ").map_or(e, |(_, why)| why);
+        return Some(("action-unavailable-symbolic", format!("Can't open this folder: {e}")));
+    }
+    if total > 0 {
+        return Some(if query.is_empty() {
+            ("view-conceal-symbolic", "Only hidden files here (Ctrl+H shows them)".to_string())
+        } else {
+            ("system-search-symbolic", format!("No files match “{query}”"))
+        });
+    }
+    Some(match place {
+        Place::Dir => ("folder-symbolic", "Folder is empty".to_string()),
+        Place::Trash => ("user-trash-symbolic", "Trash is empty".to_string()),
+        Place::Starred => ("starred-symbolic", "Star files to see them here".to_string()),
+        Place::Search => ("system-search-symbolic", format!("No results for “{query}”")),
+    })
+}
+
 /// Recursive name search, run on a worker thread. Stops once `cancel` is set or a limit is reached, and
 /// says which.
 fn search_walk(
@@ -2574,7 +2678,7 @@ fn search_walk(
 
 #[cfg(test)]
 mod tests {
-    use super::{folder_name_problem, folder_style_index, search_walk, SearchEnd};
+    use super::{empty_message, folder_name_problem, folder_style_index, search_walk, Place, SearchEnd};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
@@ -2646,6 +2750,30 @@ mod tests {
         assert_eq!(folder_style_index(""), 0);
         assert_eq!(folder_style_index("system"), 1);
         assert_eq!(folder_style_index("custom:/a/b.png"), 2);
+    }
+
+    #[test]
+    fn empty_view_messages() {
+        let text = |p, loading, err, total, shown, q| empty_message(p, loading, err, total, shown, q).map(|m| m.1);
+        // Nothing while loading or while anything is shown
+        assert_eq!(text(Place::Dir, true, None, 0, 0, ""), None);
+        assert_eq!(text(Place::Dir, false, None, 3, 3, ""), None);
+        assert_eq!(text(Place::Dir, false, None, 3, 1, "a"), None);
+        assert_eq!(text(Place::Dir, false, None, 0, 0, "").as_deref(), Some("Folder is empty"));
+        assert_eq!(text(Place::Trash, false, None, 0, 0, "").as_deref(), Some("Trash is empty"));
+        assert_eq!(text(Place::Starred, false, None, 0, 0, "").as_deref(), Some("Star files to see them here"));
+        assert_eq!(text(Place::Search, false, None, 0, 0, "rep").as_deref(), Some("No results for “rep”"));
+        assert_eq!(text(Place::Dir, false, None, 4, 0, "rep").as_deref(), Some("No files match “rep”"));
+        assert_eq!(text(Place::Search, false, None, 4, 0, "x").as_deref(), Some("No files match “x”"));
+        assert!(text(Place::Dir, false, None, 2, 0, "").unwrap().contains("hidden"));
+        assert_eq!(
+            text(Place::Dir, false, Some("Permission denied"), 0, 0, "").as_deref(),
+            Some("Can't open this folder: Permission denied")
+        );
+        assert_eq!(
+            text(Place::Dir, false, Some("Error opening directory “/a: b”: Permission denied"), 0, 0, "").as_deref(),
+            Some("Can't open this folder: Permission denied")
+        );
     }
 
     #[test]
