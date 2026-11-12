@@ -26,6 +26,29 @@ const TICK: Duration = Duration::from_millis(200);
 
 // ================= pure helpers =================
 
+/// Text of the "Link to" row.
+fn link_to_text(target: &str, broken: bool) -> String {
+    if broken { format!("{target} (broken)") } else { target.to_string() }
+}
+
+/// A followed query that still says "symlink" means the target is missing: GIO then reports the link itself.
+fn is_broken_link(info: &gio::FileInfo) -> bool {
+    info.is_symlink() && info.file_type() == gio::FileType::SymbolicLink
+}
+
+/// Query that follows symlinks (the bool is "broken link"). Where GIO fails instead of falling back to
+/// the link itself, query again without following.
+fn query_following(file: &gio::File) -> Result<(gio::FileInfo, bool), glib::Error> {
+    let c = None::<&gio::Cancellable>;
+    match file.query_info(PROPS_ATTRS, gio::FileQueryInfoFlags::NONE, c) {
+        Ok(i) => Ok((i.clone(), is_broken_link(&i))),
+        Err(e) => match file.query_info(PROPS_ATTRS, gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, c) {
+            Ok(i) if i.is_symlink() => Ok((i, true)),
+            _ => Err(e),
+        },
+    }
+}
+
 /// Owner, group, others: shift of their three bits in a mode.
 const SHIFTS: [u32; 3] = [6, 3, 0];
 /// Read, write, execute bits (before shifting).
@@ -544,13 +567,13 @@ pub fn show(parent: &impl IsA<gtk::Window>, files: Vec<gio::File>) {
 
     if files.len() == 1 {
         let file = &files[0];
-        match file.query_info(PROPS_ATTRS, gio::FileQueryInfoFlags::NONE, None::<&gio::Cancellable>) {
+        match query_following(file) {
             Err(e) => {
                 icon.set_icon_name(Some("dialog-error-symbolic"));
                 name.set_text(&file_title(file));
                 add_row(&grid, &mut row, "Error", e.message());
             }
-            Ok(info) => {
+            Ok((info, broken)) => {
                 set_icon(&icon, &info, false);
                 if let Some(p) = info.attribute_byte_string("thumbnail::path").filter(|p| !p.is_empty()) {
                     icon.set_from_gicon(&gio::FileIcon::new(&gio::File::for_path(p.as_str())));
@@ -564,7 +587,7 @@ pub fn show(parent: &impl IsA<gtk::Window>, files: Vec<gio::File>) {
                 add_row(&grid, &mut row, "Type", &ty);
                 if info.is_symlink() {
                     if let Some(t) = info.symlink_target() {
-                        add_row(&grid, &mut row, "Link to", &t.to_string_lossy());
+                        add_row(&grid, &mut row, "Link to", &link_to_text(&t.to_string_lossy(), broken));
                     }
                 }
                 if let Some(parent) = file.parent() {
@@ -582,7 +605,7 @@ pub fn show(parent: &impl IsA<gtk::Window>, files: Vec<gio::File>) {
                             contents.set_visible(false);
                         }
                     }
-                } else if !is_dir_like(&info) {
+                } else if !is_dir_like(&info) && !broken {
                     add_row(&grid, &mut row, "Size", &size_text(info.size().max(0) as u64));
                 }
                 if ct.starts_with("image/") {
@@ -605,9 +628,17 @@ pub fn show(parent: &impl IsA<gtk::Window>, files: Vec<gio::File>) {
                 if let Some(g) = info.attribute_string("owner::group").filter(|g| !g.is_empty()) {
                     add_row(&grid, &mut row, "Group", &g);
                 }
-                if info.has_attribute("unix::mode") {
+                // Permissions of a broken link are not editable: apply and read-back follow links.
+                if info.has_attribute("unix::mode") && !broken {
                     body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
                     let (section, p) = perms_section(file, &info, &owner);
+                    if info.is_symlink() {
+                        let note = gtk::Label::new(Some("These are the permissions of the link's target."));
+                        note.add_css_class("dim");
+                        note.add_css_class("small");
+                        note.set_xalign(0.0);
+                        section.insert_child_after(&note, section.first_child().as_ref());
+                    }
                     body.append(&section);
                     perms = Some(p);
                 }
@@ -727,6 +758,39 @@ mod tests {
         assert_eq!(size_text(1), "1 byte");
         assert_eq!(size_text(512), "512 bytes");
         assert!(size_text(1_234_567).ends_with("(1,234,567 bytes)"));
+    }
+
+    #[test]
+    fn link_to_row_text() {
+        assert_eq!(link_to_text("/a/b", false), "/a/b");
+        assert_eq!(link_to_text("gone", true), "gone (broken)");
+    }
+
+    #[test]
+    fn broken_symlink_queries() {
+        let root = std::env::temp_dir().join(format!("rfiles-props-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("real"), b"x").unwrap();
+        std::os::unix::fs::symlink("missing-target", root.join("broken")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("good")).unwrap();
+        let (c, nofollow) = (None::<&gio::Cancellable>, gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS);
+        let broken = gio::File::for_path(root.join("broken"));
+        let f = broken.query_info(PROPS_ATTRS, gio::FileQueryInfoFlags::NONE, c);
+        // Local files: a followed query on a broken link succeeds and describes the link itself.
+        assert!(f.as_ref().map_or(true, is_broken_link));
+        let good = gio::File::for_path(root.join("good"));
+        assert!(!is_broken_link(&good.query_info(PROPS_ATTRS, gio::FileQueryInfoFlags::NONE, c).unwrap()));
+        let i = broken.query_info(PROPS_ATTRS, nofollow, c).unwrap();
+        assert!(i.is_symlink());
+        assert_eq!(i.symlink_target().unwrap().to_string_lossy(), "missing-target");
+        let (i, is_broken) = query_following(&broken).unwrap();
+        assert!(is_broken && i.is_symlink());
+        let (i, is_broken) = query_following(&gio::File::for_path(root.join("good"))).unwrap();
+        assert!(!is_broken && i.is_symlink() && i.size() == 1);
+        // A missing plain path stays an error.
+        assert!(query_following(&gio::File::for_path(root.join("nope"))).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
