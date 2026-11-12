@@ -24,6 +24,19 @@ fn grid_columns_for_width(width: f64) -> u32 {
     ((width / GRID_MIN_TILE_PX).ceil() as u32).clamp(4, 64)
 }
 
+const CUSTOM_STYLE: u32 = 2;
+
+/// Drop-down index for a "folder_icon" setting.
+fn folder_style_index(setting: &str) -> u32 {
+    if setting == "system" {
+        1
+    } else if setting.starts_with("custom:") {
+        CUSTOM_STYLE
+    } else {
+        0
+    }
+}
+
 const ICON_SIZES: [(i32, &str); 3] = [(40, "Small"), (56, "Medium"), (72, "Large")];
 
 #[derive(Clone)]
@@ -1502,13 +1515,11 @@ impl App {
         h1.add_css_class("heading");
         let style = gtk::DropDown::from_strings(&["Light blue", "System theme", "Custom image…"]);
         let cur = self.config.borrow().folder_icon.clone();
-        style.set_selected(if cur == "system" {
-            1
-        } else if cur.starts_with("custom:") {
-            2
-        } else {
-            0
-        });
+        style.set_selected(folder_style_index(&cur));
+        // Re-picks the image, since selecting "Custom image…" again does nothing once it is selected
+        let choose = gtk::Button::with_label("Choose image…");
+        choose.set_halign(gtk::Align::Start);
+        choose.set_visible(style.selected() == CUSTOM_STYLE);
 
         let h2 = gtk::Label::new(Some("Icon size"));
         h2.set_xalign(0.0);
@@ -1525,6 +1536,7 @@ impl App {
 
         bx.append(&h1);
         bx.append(&style);
+        bx.append(&choose);
         bx.append(&h2);
         bx.append(&size);
         bx.append(&hint);
@@ -1534,8 +1546,13 @@ impl App {
 
         let a = Rc::downgrade(self);
         let busy = Rc::new(Cell::new(false));
+        let choose_w = choose.downgrade();
         style.connect_selected_notify(move |dd| {
             let Some(a) = a.upgrade() else { return };
+            // Also runs for the cancel path below, which is what hides the button again
+            if let Some(b) = choose_w.upgrade() {
+                b.set_visible(dd.selected() == CUSTOM_STYLE);
+            }
             if busy.get() {
                 return;
             }
@@ -1550,12 +1567,22 @@ impl App {
                         None => {
                             // Cancelled: put the dropdown back
                             busy2.set(true);
-                            dd2.set_selected(if prev == "system" { 1 } else if prev.starts_with("custom:") { 2 } else { 0 });
+                            dd2.set_selected(folder_style_index(&prev));
                             busy2.set(false);
                         }
                     });
                 }
             }
+        });
+        let a = Rc::downgrade(self);
+        choose.connect_clicked(move |_| {
+            let Some(a) = a.upgrade() else { return };
+            let a2 = a.clone();
+            a.pick_image("Choose a folder icon", move |res| {
+                if let Some(p) = res.and_then(|f| f.path()) {
+                    a2.set_folder_icon(format!("custom:{}", p.display()));
+                }
+            });
         });
         let a = Rc::downgrade(self);
         size.connect_selected_notify(move |dd| {
@@ -2403,7 +2430,15 @@ fn search_walk(root: &Path, q: &str, hidden: bool) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::folder_name_problem;
+    use super::{folder_name_problem, folder_style_index};
+
+    #[test]
+    fn folder_style_indexes() {
+        assert_eq!(folder_style_index("blue"), 0);
+        assert_eq!(folder_style_index(""), 0);
+        assert_eq!(folder_style_index("system"), 1);
+        assert_eq!(folder_style_index("custom:/a/b.png"), 2);
+    }
 
     #[test]
     fn folder_names() {
