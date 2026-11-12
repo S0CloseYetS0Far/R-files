@@ -67,52 +67,58 @@ pub fn is_dir_like(info: &gio::FileInfo) -> bool {
     )
 }
 
-/// "file2" sorts before "file10", case-insensitive.
+/// "file2" sorts before "file10", case-insensitive. Equal only for equal strings:
+/// names that differ only in case or leading zeros fall back to byte order.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let mut ai = a.chars().peekable();
-    let mut bi = b.chars().peekable();
+    let (mut i, mut j) = (0, 0);
     loop {
-        match (ai.peek().copied(), bi.peek().copied()) {
-            (None, None) => return Ordering::Equal,
+        let (x, y) = match (a[i..].chars().next(), b[j..].chars().next()) {
+            (None, None) => return a.cmp(b),
             (None, _) => return Ordering::Less,
             (_, None) => return Ordering::Greater,
-            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
-                let mut na = String::new();
-                while let Some(&c) = ai.peek() {
-                    if !c.is_ascii_digit() {
-                        break;
-                    }
-                    na.push(c);
-                    ai.next();
-                }
-                let mut nb = String::new();
-                while let Some(&c) = bi.peek() {
-                    if !c.is_ascii_digit() {
-                        break;
-                    }
-                    nb.push(c);
-                    bi.next();
-                }
-                let ta = na.trim_start_matches('0');
-                let tb = nb.trim_start_matches('0');
-                let o = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
-                if o != Ordering::Equal {
-                    return o;
-                }
+            (Some(x), Some(y)) => (x, y),
+        };
+        if x.is_ascii_digit() && y.is_ascii_digit() {
+            // Compare runs of digits by value, on slices: no copies.
+            let ea = i + a[i..].bytes().take_while(u8::is_ascii_digit).count();
+            let eb = j + b[j..].bytes().take_while(u8::is_ascii_digit).count();
+            let ta = a[i..ea].trim_start_matches('0');
+            let tb = b[j..eb].trim_start_matches('0');
+            let o = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+            if o != Ordering::Equal {
+                return o;
             }
-            (Some(x), Some(y)) => {
-                let o = x.to_lowercase().cmp(y.to_lowercase());
-                if o != Ordering::Equal {
-                    return o;
-                }
-                ai.next();
-                bi.next();
+            (i, j) = (ea, eb);
+        } else {
+            let o = x.to_lowercase().cmp(y.to_lowercase());
+            if o != Ordering::Equal {
+                return o;
             }
+            i += x.len_utf8();
+            j += y.len_utf8();
         }
     }
 }
 
-/// Folders first, then natural name order.
+/// The locale's file-name collation key (accents, other scripts, "file2" before "file10"),
+/// built once per item and kept on the FileInfo, so a big sort does not rebuild it on every
+/// comparison. A rename or reload gives a new FileInfo (GtkDirectoryList, `infos_store`),
+/// so a cached key never outlives the name it was made from.
+fn name_key(info: &gio::FileInfo) -> std::ptr::NonNull<glib::FilenameCollationKey> {
+    static QUARK: std::sync::OnceLock<glib::Quark> = std::sync::OnceLock::new();
+    let q = *QUARK.get_or_init(|| glib::Quark::from_str("rfiles-name-key"));
+    // SAFETY: only this function uses this quark, and it always stores this type.
+    unsafe {
+        if let Some(k) = info.qdata::<glib::FilenameCollationKey>(q) {
+            return k;
+        }
+        info.set_qdata(q, glib::FilenameCollationKey::from(info.display_name()));
+        info.qdata(q).expect("key was just set")
+    }
+}
+
+/// Folders first, then the locale's file-name order. Names the collation ranks
+/// the same fall back to the raw names, so the order is total.
 pub fn sort_infos(a: &glib::Object, b: &glib::Object) -> gtk::Ordering {
     let (Some(a), Some(b)) = (
         a.downcast_ref::<gio::FileInfo>(),
@@ -124,7 +130,9 @@ pub fn sort_infos(a: &glib::Object, b: &glib::Object) -> gtk::Ordering {
     if ad != bd {
         return if ad { gtk::Ordering::Smaller } else { gtk::Ordering::Larger };
     }
-    natural_cmp(&a.display_name(), &b.display_name()).into()
+    // SAFETY: nothing replaces the keys while `a` and `b` are borrowed here.
+    let o = unsafe { name_key(a).as_ref().cmp(name_key(b).as_ref()) };
+    o.then_with(|| a.display_name().cmp(&b.display_name())).then_with(|| a.name().cmp(&b.name())).into()
 }
 
 /// Uses an existing system thumbnail when there is one (cheap, already on
@@ -258,4 +266,91 @@ pub fn infos_store(files: impl Iterator<Item = gio::File>) -> gio::ListStore {
         }
     }
     store
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The app gets the user's locale from gtk_init; tests have to ask for one. Returns false
+    /// when no English UTF-8 locale is installed, so locale-dependent checks can be skipped.
+    fn english_locale() -> bool {
+        extern "C" {
+            fn setlocale(category: i32, locale: *const std::ffi::c_char) -> *mut std::ffi::c_char;
+        }
+        const LC_ALL: i32 = 6; // glibc
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| {
+            ["en_US.UTF-8", "en_US.utf8", "en_GB.UTF-8", "en_GB.utf8"].iter().any(|l| {
+                let l = std::ffi::CString::new(*l).unwrap();
+                // SAFETY: a valid C string, and setlocale copies what it needs.
+                !unsafe { setlocale(LC_ALL, l.as_ptr()) }.is_null()
+            })
+        })
+    }
+
+    fn info(name: &str, dir: bool) -> glib::Object {
+        let i = gio::FileInfo::new();
+        i.set_name(name);
+        i.set_display_name(name);
+        i.set_file_type(if dir { gio::FileType::Directory } else { gio::FileType::Regular });
+        i.upcast()
+    }
+
+    /// Sorts the names with `sort_infos`; names ending in "/" are folders.
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut v: Vec<glib::Object> =
+            names.iter().map(|n| info(n.trim_end_matches('/'), n.ends_with('/'))).collect();
+        v.sort_by(|a, b| sort_infos(a, b).into());
+        v.iter().map(|o| o.downcast_ref::<gio::FileInfo>().unwrap().display_name().to_string()).collect()
+    }
+
+    #[test]
+    fn natural_cmp_numbers_case_and_ties() {
+        assert_eq!(natural_cmp("file2", "file10"), Ordering::Less);
+        assert_eq!(natural_cmp("file10", "file2"), Ordering::Greater);
+        assert_eq!(natural_cmp("File2", "file10"), Ordering::Less);
+        assert_eq!(natural_cmp("abc", "abcd"), Ordering::Less);
+        assert_eq!(natural_cmp("x", "x"), Ordering::Equal);
+        // Different names are never Equal.
+        assert_ne!(natural_cmp("a01", "a1"), Ordering::Equal);
+        assert_eq!(natural_cmp("a01", "a1"), natural_cmp("a1", "a01").reverse());
+        assert_ne!(natural_cmp("Abc", "abc"), Ordering::Equal);
+        assert_eq!(natural_cmp("Abc", "abc"), natural_cmp("abc", "Abc").reverse());
+        let mut parts = vec!["slide10.xml", "slide2.xml", "slide1.xml"];
+        parts.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(parts, ["slide1.xml", "slide2.xml", "slide10.xml"]);
+    }
+
+    #[test]
+    fn sort_folders_first_and_numbers() {
+        english_locale();
+        assert_eq!(sorted(&["file10", "b/", "file2", "a/", "file1"]), ["a", "b", "file1", "file2", "file10"]);
+        assert_eq!(sorted(&["zz", "dir10/", "dir9/"]), ["dir9", "dir10", "zz"]);
+    }
+
+    #[test]
+    fn sort_accents_and_case_follow_the_locale() {
+        if !english_locale() {
+            eprintln!("no English UTF-8 locale installed; skipping locale order checks");
+            return;
+        }
+        assert_eq!(sorted(&["zebra", "école", "apple"]), ["apple", "école", "zebra"]);
+        assert_eq!(sorted(&["Zoo", "Ångström", "Bar"]), ["Ångström", "Bar", "Zoo"]);
+        assert_eq!(sorted(&["cherry", "Banana", "apple"]), ["apple", "Banana", "cherry"]);
+    }
+
+    #[test]
+    fn sort_is_total() {
+        english_locale();
+        let names = ["a01", "a1", "Apple", "apple", "APPLE", "é", "e\u{301}"];
+        for x in names {
+            for y in names {
+                let (a, b) = (info(x, false), info(y, false));
+                let o: Ordering = sort_infos(&a, &b).into();
+                assert_eq!(o == Ordering::Equal, x == y, "{x:?} vs {y:?}");
+                assert_eq!(o, Ordering::from(sort_infos(&b, &a)).reverse(), "{x:?} vs {y:?}");
+            }
+        }
+    }
 }
