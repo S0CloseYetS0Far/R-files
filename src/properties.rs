@@ -110,7 +110,7 @@ fn set_exec(mode: u32, on: bool) -> u32 {
 }
 
 /// 1234567 -> "1,234,567"
-fn group_digits(n: u64) -> String {
+pub(crate) fn group_digits(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
