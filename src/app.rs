@@ -294,8 +294,132 @@ mod view_restore_tests {
 }
 
 /// Where a sidebar row goes.
-struct SideTarget {
-    loc: Loc,
+enum SideTarget {
+    Place(Loc),
+    /// A volume that isn't mounted: activating the row mounts it, then opens it
+    Volume(gio::Volume),
+}
+
+/// What the Devices section needs to know about a volume; plain data so the choice is testable.
+struct VolFacts {
+    name: String,
+}
+
+/// What the Devices section needs to know about a mount.
+struct MountFacts {
+    /// Index into the volumes list of the volume this mount belongs to, if it's listed
+    volume: Option<usize>,
+    shadowed: bool,
+}
+
+/// One Devices row: a volume (mounted or not) or a mount that has no listed volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DevRow {
+    Volume(usize),
+    Mount(usize),
+}
+
+/// Rows for the Devices section, each drive once: every named volume, then the mounts
+/// no shown volume covers (network shares, MTP phones…), leaving out shadowed ones.
+fn device_rows(vols: &[VolFacts], mounts: &[MountFacts]) -> Vec<DevRow> {
+    let shown: Vec<bool> = vols.iter().map(|v| !v.name.trim().is_empty()).collect();
+    let mut rows: Vec<DevRow> = (0..vols.len()).filter(|&i| shown[i]).map(DevRow::Volume).collect();
+    rows.extend(
+        mounts
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.shadowed && !m.volume.is_some_and(|v| shown.get(v).copied().unwrap_or(false)))
+            .map(|(i, _)| DevRow::Mount(i)),
+    );
+    rows
+}
+
+/// Tooltip of a mounted row's eject button, or None when it gets no button.
+fn eject_tooltip(can_eject: bool, can_unmount: bool) -> Option<&'static str> {
+    if can_eject {
+        Some("Eject")
+    } else if can_unmount {
+        Some("Unmount")
+    } else {
+        None
+    }
+}
+
+/// Status bar text once an eject or unmount of `name` has finished.
+fn eject_message(name: &str, eject: bool, err: Option<&str>) -> String {
+    match (err, eject) {
+        (None, true) => format!("You can now remove “{name}”"),
+        (None, false) => format!("Unmounted “{name}”"),
+        (Some(e), true) => format!("Couldn't eject “{name}”: {e}"),
+        (Some(e), false) => format!("Couldn't unmount “{name}”: {e}"),
+    }
+}
+
+/// Whether `loc` shows a folder on the mount whose root is `root`.
+fn loc_on_mount(loc: &Loc, root: &gio::File) -> bool {
+    let f = match loc {
+        Loc::Dir(f) | Loc::Search { root: f, .. } => f,
+        Loc::Starred => return false,
+    };
+    f.equal(root) || f.has_prefix(root)
+}
+
+#[cfg(test)]
+mod devices_tests {
+    use super::{device_rows, eject_message, eject_tooltip, loc_on_mount, DevRow, Loc, MountFacts, VolFacts};
+    use gtk::gio;
+    use gtk::prelude::*;
+
+    fn vol(name: &str) -> VolFacts {
+        VolFacts { name: name.into() }
+    }
+
+    #[test]
+    fn volumes_and_their_mounts_show_once() {
+        let vols = [vol("USB stick"), vol("Data")];
+        // Mount 0 is the USB stick's, mount 1 a network share with no volume
+        let mounts = [MountFacts { volume: Some(0), shadowed: false }, MountFacts { volume: None, shadowed: false }];
+        assert_eq!(device_rows(&vols, &mounts), vec![DevRow::Volume(0), DevRow::Volume(1), DevRow::Mount(1)]);
+    }
+
+    #[test]
+    fn nameless_volumes_and_shadowed_mounts_are_left_out() {
+        let vols = [vol(""), vol("  "), vol("Backup")];
+        let mounts = [
+            MountFacts { volume: None, shadowed: true },
+            // Its volume is hidden, so the mount shows on its own
+            MountFacts { volume: Some(0), shadowed: false },
+            MountFacts { volume: Some(2), shadowed: false },
+        ];
+        assert_eq!(device_rows(&vols, &mounts), vec![DevRow::Volume(2), DevRow::Mount(1)]);
+        assert!(device_rows(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn eject_button_and_tooltip() {
+        assert_eq!(eject_tooltip(true, true), Some("Eject"));
+        assert_eq!(eject_tooltip(true, false), Some("Eject"));
+        assert_eq!(eject_tooltip(false, true), Some("Unmount"));
+        assert_eq!(eject_tooltip(false, false), None);
+    }
+
+    #[test]
+    fn eject_messages() {
+        assert_eq!(eject_message("Stick", true, None), "You can now remove “Stick”");
+        assert_eq!(eject_message("Data", false, None), "Unmounted “Data”");
+        assert_eq!(eject_message("Stick", true, Some("busy")), "Couldn't eject “Stick”: busy");
+        assert_eq!(eject_message("Data", false, Some("busy")), "Couldn't unmount “Data”: busy");
+    }
+
+    #[test]
+    fn tabs_on_a_mount() {
+        let root = gio::File::for_path("/media/me/STICK");
+        assert!(loc_on_mount(&Loc::Dir(root.clone()), &root));
+        assert!(loc_on_mount(&Loc::Dir(root.child("a/b")), &root));
+        assert!(!loc_on_mount(&Loc::Dir(gio::File::for_path("/media/me/STICK2")), &root));
+        assert!(!loc_on_mount(&Loc::Dir(gio::File::for_path("/media")), &root));
+        assert!(!loc_on_mount(&Loc::Starred, &root));
+    }
 }
 
 pub struct App {
@@ -1853,11 +1977,30 @@ impl App {
 
         self.side_header("Devices");
         self.side_row("drive-harddisk-symbolic", "Computer", Loc::Dir(gio::File::for_path("/")), None, None);
-        for m in self.volumes.mounts() {
-            if m.is_shadowed() {
-                continue;
+        let vols = self.volumes.volumes();
+        let mounts = self.volumes.mounts();
+        let vol_facts: Vec<VolFacts> = vols.iter().map(|v| VolFacts { name: v.name().to_string() }).collect();
+        let mount_facts: Vec<MountFacts> = mounts
+            .iter()
+            .map(|m| MountFacts {
+                // Match by object, or by root in case the monitor hands out different wrappers
+                volume: m.volume().and_then(|mv| vols.iter().position(|v| *v == mv)).or_else(|| {
+                    vols.iter().position(|v| v.get_mount().is_some_and(|vm| vm.root().equal(&m.root())))
+                }),
+                shadowed: m.is_shadowed(),
+            })
+            .collect();
+        for row in device_rows(&vol_facts, &mount_facts) {
+            let (mount, vol) = match row {
+                DevRow::Volume(i) => (vols[i].get_mount(), Some(&vols[i])),
+                DevRow::Mount(i) => (Some(mounts[i].clone()), None),
+            };
+            if let Some(m) = mount {
+                self.side_row_gicon(&m.symbolic_icon(), &m.name(), SideTarget::Place(Loc::Dir(m.root())), None, None);
+                self.add_eject_button(&m);
+            } else if let Some(v) = vol {
+                self.side_row_gicon(&v.symbolic_icon(), &v.name(), SideTarget::Volume(v.clone()), None, None);
             }
-            self.side_row_gicon(&m.symbolic_icon(), &m.name(), Loc::Dir(m.root()), None, None);
         }
         self.side_row("network-workgroup-symbolic", "Network", Loc::Dir(gio::File::for_uri("network:///")), None, None);
 
@@ -1869,14 +2012,14 @@ impl App {
 
     fn side_row(self: &Rc<Self>, icon: &str, name: &str, loc: Loc, pin: Option<String>, drag_key: Option<String>) {
         let gicon: gio::Icon = gio::ThemedIcon::new(icon).upcast();
-        self.side_row_gicon(&gicon, name, loc, pin, drag_key);
+        self.side_row_gicon(&gicon, name, SideTarget::Place(loc), pin, drag_key);
     }
 
     fn side_row_gicon(
         self: &Rc<Self>,
         icon: &gio::Icon,
         name: &str,
-        loc: Loc,
+        target: SideTarget,
         pin: Option<String>,
         drag_key: Option<String>,
     ) {
@@ -1891,13 +2034,17 @@ impl App {
         bx.append(&lbl);
         let row = gtk::ListBoxRow::new();
         row.set_child(Some(&bx));
-        if let Loc::Dir(f) = &loc {
-            row.set_tooltip_text(Some(&display_path(f)));
-            crate::dnd::attach_folder_row(self, &row, f);
+        match &target {
+            SideTarget::Place(Loc::Dir(f)) => {
+                row.set_tooltip_text(Some(&display_path(f)));
+                crate::dnd::attach_folder_row(self, &row, f);
+            }
+            SideTarget::Volume(_) => row.set_tooltip_text(Some("Not mounted: click to mount")),
+            SideTarget::Place(_) => {}
         }
         let idx = {
             let mut t = self.sidebar_targets.borrow_mut();
-            t.push(Some(SideTarget { loc }));
+            t.push(Some(target));
             t.len() - 1
         };
 
@@ -2073,18 +2220,144 @@ impl App {
     }
 
     fn sidebar_loc(&self, idx: usize) -> Option<Loc> {
-        self.sidebar_targets
-            .borrow()
-            .get(idx)
-            .and_then(|t| t.as_ref().map(|t| t.loc.clone()))
+        match self.sidebar_targets.borrow().get(idx) {
+            Some(Some(SideTarget::Place(loc))) => Some(loc.clone()),
+            _ => None,
+        }
+    }
+
+    /// The unmounted volume at sidebar row `idx`, if that row is one.
+    fn sidebar_volume(&self, idx: usize) -> Option<gio::Volume> {
+        match self.sidebar_targets.borrow().get(idx) {
+            Some(Some(SideTarget::Volume(v))) => Some(v.clone()),
+            _ => None,
+        }
     }
 
     fn open_sidebar_in_tab(self: &Rc<Self>, idx: usize) {
         if self.refuse_missing_pin(idx) {
             return;
         }
-        if let Some(loc) = self.sidebar_loc(idx) {
+        if let Some(v) = self.sidebar_volume(idx) {
+            self.mount_volume(v, true);
+        } else if let Some(loc) = self.sidebar_loc(idx) {
             self.new_tab(loc);
+        }
+    }
+
+    /// Mounts `vol` (asking for a password if it needs one), then opens it here or in a new tab.
+    fn mount_volume(self: &Rc<Self>, vol: gio::Volume, new_tab: bool) {
+        let name = vol.name().to_string();
+        self.status.set_text("Mounting…");
+        let op = gtk::MountOperation::new(Some(&self.window));
+        let a = Rc::downgrade(self);
+        let v = vol.clone();
+        vol.mount(gio::MountMountFlags::NONE, Some(&op), None::<&gio::Cancellable>, move |r| {
+            let Some(a) = a.upgrade() else { return };
+            match r {
+                Ok(()) => match v.get_mount() {
+                    Some(m) => {
+                        let loc = Loc::Dir(m.root());
+                        if new_tab {
+                            a.new_tab(loc);
+                        } else {
+                            a.navigate(loc);
+                        }
+                    }
+                    None => a.status.set_text(&format!("Mounted “{name}”, but can't find where")),
+                },
+                // The user cancelled the password prompt
+                Err(e) if e.matches(gio::IOErrorEnum::FailedHandled) => a.update_status(),
+                Err(e) => a.status.set_text(&format!("Couldn't mount “{name}”: {}", e.message())),
+            }
+        });
+    }
+
+    /// Puts an eject (or unmount) button at the end of the sidebar row just added for `mount`.
+    fn add_eject_button(self: &Rc<Self>, mount: &gio::Mount) {
+        let Some(tip) = eject_tooltip(mount.can_eject(), mount.can_unmount()) else { return };
+        let Some(bx) = self.sidebar.last_child().and_downcast::<gtk::ListBoxRow>().and_then(|r| r.child()) else {
+            return;
+        };
+        let Ok(bx) = bx.downcast::<gtk::Box>() else { return };
+        let btn = gtk::Button::from_icon_name("media-eject-symbolic");
+        btn.add_css_class("flat");
+        btn.add_css_class("sidebar-eject");
+        btn.set_focus_on_click(false);
+        btn.set_tooltip_text(Some(tip));
+        btn.set_hexpand(true);
+        btn.set_halign(gtk::Align::End);
+        btn.set_valign(gtk::Align::Center);
+        let a = Rc::downgrade(self);
+        let m = mount.downgrade();
+        // The button claims its click, so the row isn't activated as well
+        btn.connect_clicked(move |_| {
+            if let (Some(a), Some(m)) = (a.upgrade(), m.upgrade()) {
+                a.eject_mount(m);
+            }
+        });
+        bx.append(&btn);
+    }
+
+    /// Ejects or unmounts `mount`, first moving this window's tabs off it so we don't keep it busy.
+    fn eject_mount(self: &Rc<Self>, mount: gio::Mount) {
+        let name = mount.name().to_string();
+        self.leave_mount(&mount.root());
+        let eject = mount.can_eject();
+        self.status.set_text(&format!("{} “{name}”…", if eject { "Ejecting" } else { "Unmounting" }));
+        let op = gtk::MountOperation::new(Some(&self.window));
+        // "Writing data, don't unplug" notes while the cache is flushed. Read as values: the message may be NULL.
+        let a = Rc::downgrade(self);
+        op.connect_local("show-unmount-progress", false, move |args| {
+            let a = a.upgrade()?;
+            let msg = args.get(1).and_then(|v| v.get::<Option<String>>().ok()).flatten()?;
+            let time_left = args.get(2).and_then(|v| v.get::<i64>().ok()).unwrap_or(0);
+            let bytes_left = args.get(3).and_then(|v| v.get::<i64>().ok()).unwrap_or(0);
+            // Zero and zero means done; the finish callback reports that
+            if time_left != 0 || bytes_left != 0 {
+                a.status.set_text(&msg.lines().collect::<Vec<_>>().join(": "));
+            }
+            None
+        });
+        let a = Rc::downgrade(self);
+        let done = move |r: Result<(), glib::Error>| {
+            let Some(a) = a.upgrade() else { return };
+            match r {
+                // The user dismissed the "still in use" dialog
+                Err(e) if e.matches(gio::IOErrorEnum::FailedHandled) => a.update_status(),
+                Err(e) => a.status.set_text(&eject_message(&name, eject, Some(e.message()))),
+                Ok(()) => a.status.set_text(&eject_message(&name, eject, None)),
+            }
+        };
+        let flags = gio::MountUnmountFlags::NONE;
+        if eject {
+            mount.eject_with_operation(flags, Some(&op), None::<&gio::Cancellable>, done);
+        } else {
+            mount.unmount_with_operation(flags, Some(&op), None::<&gio::Cancellable>, done);
+        }
+    }
+
+    /// Sends every tab of this window that shows a folder under `root` to Home.
+    fn leave_mount(self: &Rc<Self>, root: &gio::File) {
+        let current = self.current.get();
+        let mut leave_current = false;
+        for (i, t) in self.tabs.borrow_mut().iter_mut().enumerate() {
+            if !loc_on_mount(&t.loc, root) {
+                continue;
+            }
+            if i == current {
+                leave_current = true;
+                continue;
+            }
+            let old = std::mem::replace(&mut t.loc, Loc::Dir(home()));
+            t.back.push((old, t.view.take()));
+            t.fwd.clear();
+            t.label.set_text(&t.loc.title());
+            t.icon.set_icon_name(Some(t.loc.icon()));
+            t.widget.set_tooltip_text(Some(&display_path(&home())));
+        }
+        if leave_current {
+            self.navigate(Loc::Dir(home()));
         }
     }
 
@@ -2094,7 +2367,7 @@ impl App {
             .sidebar_targets
             .borrow()
             .iter()
-            .position(|t| t.as_ref().map(|t| t.loc.key() == key).unwrap_or(false));
+            .position(|t| matches!(t, Some(SideTarget::Place(l)) if l.key() == key));
         match idx.and_then(|i| self.sidebar.row_at_index(i as i32)) {
             Some(row) => self.sidebar.select_row(Some(&row)),
             None => self.sidebar.unselect_all(),
@@ -3123,11 +3396,24 @@ impl App {
                 a.highlight_sidebar(&a.current_loc());
                 return;
             }
-            if let Some(loc) = a.sidebar_loc(row.index() as usize) {
+            if let Some(v) = a.sidebar_volume(row.index() as usize) {
+                // Keep the current place selected until the volume is mounted and opened
+                a.highlight_sidebar(&a.current_loc());
+                a.mount_volume(v, false);
+            } else if let Some(loc) = a.sidebar_loc(row.index() as usize) {
                 a.navigate(loc);
             }
         });
-        for sig in ["mount-added", "mount-removed", "mount-changed"] {
+        for sig in [
+            "mount-added",
+            "mount-removed",
+            "mount-changed",
+            "volume-added",
+            "volume-removed",
+            "volume-changed",
+            "drive-connected",
+            "drive-disconnected",
+        ] {
             let a = Rc::downgrade(self);
             let id = self.volumes.connect_local(sig, false, move |_| {
                 let a = a.upgrade()?;
