@@ -103,11 +103,31 @@ fn copy_recursive(src: &Path, dst: &Path, done: &AtomicU64) -> io::Result<()> {
             copy_recursive(&e.path(), &dst.join(e.file_name()), done)?;
         }
         let _ = std::fs::set_permissions(dst, md.permissions());
+        // Last, so creating the children doesn't bump the folder's date again
+        keep_times(dst, &md);
     } else {
         std::fs::copy(src, dst)?;
+        keep_times(dst, &md);
         done.fetch_add(md.len(), Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Gives the copy the original's modified and accessed dates, like `cp -a`. Best effort: some drives
+/// (FAT, network shares) can't store them exactly, and that shouldn't fail the copy. Symlinks keep
+/// the time they were made, since std has no way to set a link's own times.
+fn keep_times(dst: &Path, md: &std::fs::Metadata) {
+    let mut times = std::fs::FileTimes::new();
+    if let Ok(t) = md.modified() {
+        times = times.set_modified(t);
+    }
+    if let Ok(t) = md.accessed() {
+        times = times.set_accessed(t);
+    }
+    // Read-only open works for folders and for copies of read-only files; the owner may set times
+    if let Ok(f) = std::fs::File::open(dst) {
+        let _ = f.set_times(times);
+    }
 }
 
 pub struct Outcome {
@@ -192,4 +212,54 @@ pub fn open_terminal(dir: &Path) -> Result<(), String> {
         }
     }
     Err("No terminal app found".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn mtime(p: &Path) -> SystemTime {
+        p.symlink_metadata().unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn copy_keeps_modified_dates() {
+        let base = std::env::temp_dir().join(format!("rfiles-fileops-test-{}", std::process::id()));
+        let (src, dest) = (base.join("src"), base.join("dest"));
+        let sub = src.join("photos");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let file = sub.join("a.jpg");
+        std::fs::write(&file, b"jpeg").unwrap();
+        let ro = src.join("readonly.txt");
+        std::fs::write(&ro, b"text").unwrap();
+
+        // 2001-09-09, with sub-second part to check it isn't rounded away
+        let old = SystemTime::UNIX_EPOCH + Duration::new(1_000_000_000, 123_456_789);
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(900_000_000);
+        let set = |p: &Path, t| std::fs::File::open(p).unwrap().set_modified(t).unwrap();
+        set(&file, old);
+        set(&ro, old);
+        set(&sub, older);
+        set(&src, older);
+        let mut perms = ro.metadata().unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&ro, perms).unwrap();
+
+        let out = transfer(vec![src.clone()], dest.clone(), false, Arc::new(AtomicU64::new(0)));
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let copy = dest.join("src");
+        assert_eq!(mtime(&copy.join("photos/a.jpg")), old);
+        assert_eq!(mtime(&copy.join("readonly.txt")), old);
+        assert_eq!(mtime(&copy.join("photos")), older);
+        assert_eq!(mtime(&copy), older);
+
+        // A single file copied next to itself keeps its date too
+        let out = transfer(vec![file.clone()], sub.clone(), false, Arc::new(AtomicU64::new(0)));
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(mtime(&sub.join("a (copy).jpg")), old);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
