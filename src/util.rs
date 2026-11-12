@@ -354,3 +354,43 @@ mod tests {
         }
     }
 }
+
+/// Splits "photo.jpg" into ("photo", ".jpg"). Hidden files without another
+/// dot (".bashrc") have no extension; ".tar.*" is kept as one extension.
+pub fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => {
+            let stem = &name[..i];
+            if let Some(j) = stem.len().checked_sub(4) {
+                if j > 0 && stem.is_char_boundary(j) && stem[j..].eq_ignore_ascii_case(".tar") {
+                    return (&name[..j], &name[j..]);
+                }
+            }
+            (stem, &name[i..])
+        }
+        _ => (name, ""),
+    }
+}
+
+/// How many characters of `name` the rename box pre-selects: the stem for a file (as `split_ext` sees it), the
+/// whole name for a folder. Counted in characters because GTK entry positions are.
+pub fn select_len(name: &str, is_dir: bool) -> usize {
+    if is_dir { name.chars().count() } else { split_ext(name).0.chars().count() }
+}
+
+#[cfg(test)]
+mod select_len_tests {
+    use super::select_len;
+
+    #[test]
+    fn counts_characters() {
+        assert_eq!(select_len("photo.jpg", false), 5);
+        assert_eq!(select_len("fotó-é.jpg", false), 6);
+        assert_eq!(select_len("archive.tar.gz", false), 7);
+        assert_eq!(select_len(".bashrc", false), 7);
+        assert_eq!(select_len("noext", false), 5);
+        assert_eq!(select_len("my.folder.d", true), 11);
+        assert_eq!(select_len("Ünï", true), 3);
+    }
+}
+

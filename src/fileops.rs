@@ -65,22 +65,16 @@ pub async fn read_clipboard(clipboard: &gdk::Clipboard) -> Option<(bool, Vec<gio
     }
 }
 
-/// Picks a free name in `dir`: "photo.jpg" → "photo (copy).jpg" → "photo (copy 2).jpg"
+/// Picks a free name in `dir`: "photo.jpg" → "photo (copy).jpg" → "photo (copy 2).jpg";
+/// "a.tar.gz" → "a (copy).tar.gz". Folders get the marker at the end.
 fn free_name(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
     let first = dir.join(name);
     if first.symlink_metadata().is_err() {
         return first;
     }
-    let p = Path::new(name);
-    let is_dir = first.is_dir();
-    let (stem, ext) = if is_dir {
-        (name.to_string_lossy().into_owned(), String::new())
-    } else {
-        (
-            p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-            p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default(),
-        )
-    };
+    // Non-UTF-8 names go through lossy conversion, as before: invalid bytes become U+FFFD in the copy's name.
+    let full = name.to_string_lossy();
+    let (stem, ext) = if first.is_dir() { (&*full, "") } else { crate::util::split_ext(&full) };
     for i in 1.. {
         let n = if i == 1 { format!("{stem} (copy){ext}") } else { format!("{stem} (copy {i}){ext}") };
         let cand = dir.join(n);
@@ -89,6 +83,42 @@ fn free_name(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
         }
     }
     unreachable!()
+}
+
+#[cfg(test)]
+mod free_name_tests {
+    use super::free_name;
+    use std::ffi::OsStr;
+
+    fn touch(d: &std::path::Path, n: &str) {
+        std::fs::write(d.join(n), b"").unwrap();
+    }
+
+    fn name(d: &std::path::Path, n: &str) -> String {
+        free_name(d, OsStr::new(n)).file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn picks_names() {
+        let d = std::env::temp_dir().join(format!("rfiles-free-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(name(&d, "new.txt"), "new.txt");
+        for n in ["a.txt", "archive.tar.gz", "noext", ".bashrc"] {
+            touch(&d, n);
+        }
+        std::fs::create_dir(d.join("my.folder.d")).unwrap();
+        assert_eq!(name(&d, "a.txt"), "a (copy).txt");
+        assert_eq!(name(&d, "archive.tar.gz"), "archive (copy).tar.gz");
+        assert_eq!(name(&d, "noext"), "noext (copy)");
+        assert_eq!(name(&d, ".bashrc"), ".bashrc (copy)");
+        assert_eq!(name(&d, "my.folder.d"), "my.folder.d (copy)");
+        touch(&d, "archive (copy).tar.gz");
+        assert_eq!(name(&d, "archive.tar.gz"), "archive (copy 2).tar.gz");
+        touch(&d, "archive (copy 2).tar.gz");
+        assert_eq!(name(&d, "archive.tar.gz"), "archive (copy 3).tar.gz");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 /// Copies `src` to `dst`. Pipes, sockets and devices are left out and counted in `skipped`: reading a
