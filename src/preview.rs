@@ -5,16 +5,22 @@
 use crate::docs;
 use crate::util::*;
 use gtk::prelude::*;
-use gtk::{gdk, gdk_pixbuf, gio, glib, pango};
+use gtk::{cairo, gdk, gdk_pixbuf, gio, glib, pango};
 use std::cell::{Cell, RefCell};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 const TEXT_LIMIT: usize = 256 * 1024;
 const IMAGE_MAX: i32 = 2048;
 /// Touchpad scroll distance, in pixels, that turns one PDF page.
 const PDF_SCROLL_PX: f64 = 100.0;
+/// Largest side, in device pixels, a PDF page is rendered at, so a huge pane can't take hundreds of MB.
+const PDF_MAX_PX: f64 = 4096.0;
+/// How long the pane size must stay put before the page is rendered again at the new size.
+const PDF_SETTLE: Duration = Duration::from_millis(150);
 
 pub struct Preview {
     pub root: gtk::Box,
@@ -167,7 +173,7 @@ impl Preview {
         } else if ct.starts_with("audio/") {
             self.media_preview(&file, false, info);
         } else if ct == "application/pdf" || ext == "pdf" {
-            self.pdf_preview(&file, info);
+            self.pdf_preview(&file, info, g);
         } else if docs::is_office(&ext) {
             self.async_text(info, g, false, move || docs::extract_text(&path));
         } else if ct == "application/zip" || ext == "zip" {
@@ -384,35 +390,81 @@ impl Preview {
     }
 
     // ---------- PDF ----------
-    fn pdf_preview(&self, file: &gio::File, info: &gio::FileInfo) {
-        let doc = match poppler::Document::from_file(&file.uri(), None) {
-            Ok(d) => d,
-            Err(e) => {
-                self.icon_placeholder(info, &format!("Can't open PDF: {}", e.message()));
+    fn pdf_preview(self: &Rc<Self>, file: &gio::File, info: &gio::FileInfo, g: u64) {
+        let spinner = gtk::Spinner::new();
+        spinner.start();
+        spinner.set_vexpand(true);
+        self.body.append(&spinner);
+        // poppler::Document isn't Send, so one thread opens it and keeps it for this preview's page renders.
+        // A plain thread rather than the GIO pool, since it lives as long as the preview.
+        let (tx, rx) = mpsc::channel();
+        let (otx, orx) = mpsc::channel();
+        let uri = file.uri().to_string();
+        let spawned = std::thread::Builder::new()
+            .name("pdf-preview".into())
+            .spawn(move || pdf_worker(&uri, otx, rx));
+        let p = self.clone();
+        let info = info.clone();
+        glib::spawn_future_local(async move {
+            let res = match spawned {
+                Ok(_) => gio::spawn_blocking(move || orx.recv()).await.ok().and_then(|r| r.ok()),
+                Err(e) => Some(Err(e.to_string())),
+            };
+            // Returning drops `tx`, which ends the worker
+            if p.gen.get() != g {
                 return;
             }
-        };
-        let n = doc.n_pages().max(1);
-        let page = Rc::new(Cell::new(0));
+            p.body.remove(&spinner);
+            match res {
+                Some(Ok(n)) => p.pdf_view(n, tx),
+                Some(Err(msg)) => p.icon_placeholder(&info, &format!("Can't open PDF: {msg}")),
+                None => p.icon_placeholder(&info, "Can't open PDF"),
+            }
+        });
+    }
 
+    fn pdf_view(&self, n: i32, tx: mpsc::Sender<PdfReq>) {
         let area = gtk::DrawingArea::new();
         area.set_vexpand(true);
         area.set_hexpand(true);
-        let (d, pg) = (doc.clone(), page.clone());
-        area.set_draw_func(move |_, cr, w, h| {
-            let Some(p) = d.page(pg.get()) else { return };
-            let (pw, ph) = p.size();
-            if pw <= 0.0 || ph <= 0.0 {
-                return;
-            }
-            let s = (w as f64 / pw).min(h as f64 / ph);
-            cr.translate((w as f64 - pw * s) / 2.0, (h as f64 - ph * s) / 2.0);
-            cr.scale(s, s);
-            cr.set_source_rgb(1.0, 1.0, 1.0);
-            cr.rectangle(0.0, 0.0, pw, ph);
-            let _ = cr.fill();
-            p.render(cr);
+        let spinner = gtk::Spinner::new();
+        spinner.set_halign(gtk::Align::Center);
+        spinner.set_valign(gtk::Align::Center);
+        spinner.set_size_request(32, 32);
+        spinner.set_visible(false);
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&area));
+        overlay.add_overlay(&spinner);
+
+        // The widget closures own this (and so the worker's sender); it holds the widgets weakly
+        let v = Rc::new(PdfView {
+            tx,
+            page: Cell::new(0),
+            shown: RefCell::new(None),
+            flight: RefCell::new(Latest::default()),
+            settle: RefCell::new(None),
+            area: area.downgrade(),
+            spinner: spinner.downgrade(),
         });
+        // Only paints the cached page: rendering happens on the worker
+        let v1 = v.clone();
+        area.set_draw_func(move |_, cr, w, h| {
+            let shown = v1.shown.borrow();
+            let Some((key, surf)) = shown.as_ref() else { return };
+            let sf = key.scale.max(1) as f64;
+            let (lw, lh) = (surf.width() as f64 / sf, surf.height() as f64 / sf);
+            // 1 when the page was rendered for this size; otherwise stretched until the re-render lands
+            let s = (w as f64 / lw).min(h as f64 / lh);
+            cr.translate(((w as f64 - lw * s) / 2.0).round(), ((h as f64 - lh * s) / 2.0).round());
+            cr.scale(s, s);
+            if cr.set_source_surface(surf, 0.0, 0.0).is_ok() {
+                let _ = cr.paint();
+            }
+        });
+        let v2 = v.clone();
+        area.connect_resize(move |_, _, _| v2.schedule());
+        let v3 = v.clone();
+        area.connect_scale_factor_notify(move |_| v3.schedule());
 
         let prev = gtk::Button::from_icon_name("go-previous-symbolic");
         let next = gtk::Button::from_icon_name("go-next-symbolic");
@@ -424,14 +476,13 @@ impl Preview {
         nav.append(&next);
 
         let go: Rc<dyn Fn(i32)> = {
-            let (page, label, area) = (page.clone(), label.clone(), area.downgrade());
+            let label = label.clone();
             Rc::new(move |delta: i32| {
-                let Some(area) = area.upgrade() else { return };
-                let np = (page.get() + delta).clamp(0, n - 1);
-                if np != page.get() {
-                    page.set(np);
+                let np = (v.page.get() + delta).clamp(0, n - 1);
+                if np != v.page.get() {
+                    v.page.set(np);
                     label.set_text(&format!("{} / {n}", np + 1));
-                    area.queue_draw();
+                    v.update();
                 }
             })
         };
@@ -455,7 +506,7 @@ impl Preview {
         });
         area.add_controller(scroll);
 
-        self.body.append(&area);
+        self.body.append(&overlay);
         self.body.append(&nav);
     }
 
@@ -540,6 +591,206 @@ fn scroll_pages(acc: f64, dy: f64, step: f64) -> (i32, f64) {
     (pages as i32, acc - pages * step)
 }
 
+/// A page and the area (logical size and scale factor) it is rendered for.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+struct PdfKey {
+    page: i32,
+    w: i32,
+    h: i32,
+    scale: i32,
+}
+
+struct PdfReq {
+    key: PdfKey,
+    reply: mpsc::Sender<Option<PdfPage>>,
+}
+
+/// A rendered page as cairo RGB24 bytes; a cairo surface can't cross threads.
+struct PdfPage {
+    data: Vec<u8>,
+    w: i32,
+    h: i32,
+    stride: i32,
+}
+
+/// Keeps at most one render in flight and, meanwhile, only the newest request.
+#[derive(Default)]
+struct Latest<T> {
+    flying: Option<T>,
+    pending: Option<T>,
+}
+
+impl<T: Clone + PartialEq> Latest<T> {
+    /// Asks for `t` (with `have` already shown) and returns what to send now, if anything.
+    fn want(&mut self, t: T, have: Option<T>) -> Option<T> {
+        if have.as_ref() == Some(&t) || self.flying.as_ref() == Some(&t) {
+            self.pending = None;
+            return None;
+        }
+        if self.flying.is_some() {
+            self.pending = Some(t);
+            return None;
+        }
+        self.flying = Some(t.clone());
+        Some(t)
+    }
+
+    /// The flying request is answered; returns the next one to send, if any.
+    fn done(&mut self) -> Option<T> {
+        self.flying = self.pending.take();
+        self.flying.clone()
+    }
+
+    fn busy(&self) -> bool {
+        self.flying.is_some()
+    }
+}
+
+/// State of one PDF preview, owned by its widgets' closures. Dropping it drops the sender and ends the worker.
+struct PdfView {
+    tx: mpsc::Sender<PdfReq>,
+    page: Cell<i32>,
+    shown: RefCell<Option<(PdfKey, cairo::ImageSurface)>>,
+    flight: RefCell<Latest<PdfKey>>,
+    settle: RefCell<Option<glib::SourceId>>,
+    area: glib::WeakRef<gtk::DrawingArea>,
+    spinner: glib::WeakRef<gtk::Spinner>,
+}
+
+impl PdfView {
+    /// What should be on screen now; None until the area has a size.
+    fn wanted(&self) -> Option<PdfKey> {
+        let area = self.area.upgrade()?;
+        let (w, h) = (area.width(), area.height());
+        (w > 0 && h > 0).then(|| PdfKey { page: self.page.get(), w, h, scale: area.scale_factor() })
+    }
+
+    /// After a resize: render right away the first time, otherwise once the size stops changing.
+    fn schedule(self: &Rc<Self>) {
+        if let Some(id) = self.settle.take() {
+            id.remove();
+        }
+        if self.shown.borrow().is_none() {
+            self.update();
+            return;
+        }
+        let v = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(PDF_SETTLE, move || {
+            if let Some(v) = v.upgrade() {
+                v.settle.take();
+                v.update();
+            }
+        });
+        *self.settle.borrow_mut() = Some(id);
+    }
+
+    fn update(self: &Rc<Self>) {
+        let Some(key) = self.wanted() else { return };
+        let have = self.shown.borrow().as_ref().map(|(k, _)| *k);
+        let send = self.flight.borrow_mut().want(key, have);
+        if let Some(k) = send {
+            self.send(k);
+        }
+        self.sync_spinner();
+    }
+
+    fn send(self: &Rc<Self>, key: PdfKey) {
+        let (reply, rx) = mpsc::channel();
+        // Only fails if the worker is gone, and then the reply below comes back empty
+        let _ = self.tx.send(PdfReq { key, reply });
+        let v = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let res = gio::spawn_blocking(move || rx.recv().ok().flatten()).await.ok().flatten();
+            if let Some(v) = v.upgrade() {
+                v.got(key, res);
+            }
+        });
+    }
+
+    fn got(self: &Rc<Self>, key: PdfKey, res: Option<PdfPage>) {
+        // A late answer for a page turned away from is dropped
+        if key.page == self.page.get() {
+            let surf = res.and_then(|pg| {
+                let s = cairo::ImageSurface::create_for_data(pg.data, cairo::Format::Rgb24, pg.w, pg.h, pg.stride);
+                let s = s.ok()?;
+                s.set_device_scale(key.scale.max(1) as f64, key.scale.max(1) as f64);
+                Some(s)
+            });
+            // A page that fails to render is left blank rather than showing the one before
+            *self.shown.borrow_mut() = surf.map(|s| (key, s));
+            if let Some(a) = self.area.upgrade() {
+                a.queue_draw();
+            }
+        }
+        let next = self.flight.borrow_mut().done();
+        if let Some(k) = next {
+            self.send(k);
+        }
+        self.sync_spinner();
+    }
+
+    fn sync_spinner(&self) {
+        let Some(sp) = self.spinner.upgrade() else { return };
+        // While resizing, the old render is still the right page, so only page turns and the first render spin
+        let have = self.shown.borrow().as_ref().map(|(k, _)| k.page);
+        let busy = self.flight.borrow().busy() && have != Some(self.page.get());
+        sp.set_visible(busy);
+        sp.set_spinning(busy);
+    }
+}
+
+/// Owns the document for one preview: opens it, reports the page count, then renders pages until the preview
+/// drops its sender.
+fn pdf_worker(uri: &str, opened: mpsc::Sender<Result<i32, String>>, rx: mpsc::Receiver<PdfReq>) {
+    let doc = match poppler::Document::from_file(uri, None) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = opened.send(Err(e.message().to_string()));
+            return;
+        }
+    };
+    if opened.send(Ok(doc.n_pages().max(1))).is_err() {
+        return;
+    }
+    while let Ok(req) = rx.recv() {
+        let _ = req.reply.send(render_pdf_page(&doc, req.key));
+    }
+}
+
+fn render_pdf_page(doc: &poppler::Document, key: PdfKey) -> Option<PdfPage> {
+    // Poppler logs a critical for an out-of-range index
+    if !(0..doc.n_pages()).contains(&key.page) {
+        return None;
+    }
+    let page = doc.page(key.page)?;
+    let (pw, ph) = page.size();
+    let (w, h, s) = pdf_fit(pw, ph, key.w, key.h, key.scale)?;
+    let mut surf = cairo::ImageSurface::create(cairo::Format::Rgb24, w, h).ok()?;
+    {
+        let cr = cairo::Context::new(&surf).ok()?;
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.paint().ok()?;
+        cr.scale(s, s);
+        page.render(&cr);
+    }
+    surf.flush();
+    let stride = surf.stride();
+    let data = surf.data().ok()?.to_vec();
+    Some(PdfPage { data, w, h, stride })
+}
+
+/// Device-pixel size of a `pw` x `ph` point page fitted into a `w` x `h` area at `scale`, plus the points to
+/// pixels factor. Capped at PDF_MAX_PX a side.
+fn pdf_fit(pw: f64, ph: f64, w: i32, h: i32, scale: i32) -> Option<(i32, i32, f64)> {
+    if !(pw > 0.0 && ph > 0.0) || w <= 0 || h <= 0 {
+        return None;
+    }
+    let (aw, ah) = ((w * scale.max(1)) as f64, (h * scale.max(1)) as f64);
+    let s = (aw / pw).min(ah / ph).min(PDF_MAX_PX / pw.max(ph));
+    let px = |v: f64, max: f64| ((v * s).round() as i32).clamp(1, max.min(PDF_MAX_PX) as i32);
+    Some((px(pw, aw), px(ph, ah), s))
+}
+
 fn text_view(text: &str, mono: bool) -> gtk::ScrolledWindow {
     let tv = gtk::TextView::new();
     tv.set_editable(false);
@@ -620,5 +871,121 @@ mod tests {
         assert_eq!((p, rest), (0, -5.0));
         let (p, rest) = scroll_pages(-0.5, 1.0, 1.0);
         assert_eq!((p, rest), (1, 0.0));
+    }
+
+    #[test]
+    fn pdf_page_fits_area_in_device_pixels() {
+        // A4 portrait into a wide area: height decides
+        let (w, h, s) = pdf_fit(595.0, 842.0, 800, 421, 1).unwrap();
+        assert_eq!(h, 421);
+        assert!(w < 800 && (w - 298).abs() <= 1);
+        assert!((s - 0.5).abs() < 0.001);
+        // Scale factor 2 renders twice the pixels
+        assert_eq!(pdf_fit(200.0, 100.0, 100, 100, 2).unwrap(), (200, 100, 1.0));
+        // Never more than PDF_MAX_PX a side
+        let (w, h, _) = pdf_fit(100.0, 100.0, 5000, 5000, 2).unwrap();
+        assert_eq!((w, h), (4096, 4096));
+        assert_eq!(pdf_fit(0.0, 100.0, 10, 10, 1), None);
+        assert_eq!(pdf_fit(f64::NAN, 100.0, 10, 10, 1), None);
+        assert_eq!(pdf_fit(100.0, 100.0, 0, 10, 1), None);
+        // Absurd page sizes still give at least one pixel
+        let (w, h, _) = pdf_fit(1e9, 1.0, 10, 10, 1).unwrap();
+        assert_eq!((w, h), (10, 1));
+    }
+
+    #[test]
+    fn only_latest_pdf_request_is_sent() {
+        let mut l = Latest::default();
+        assert_eq!(l.want(1, None), Some(1));
+        assert!(l.busy());
+        // Quick turns while 1 renders: only the last one goes next
+        assert_eq!(l.want(2, None), None);
+        assert_eq!(l.want(3, None), None);
+        assert_eq!(l.done(), Some(3));
+        assert_eq!(l.done(), None);
+        assert!(!l.busy());
+    }
+
+    #[test]
+    fn pdf_request_for_what_is_shown_or_flying_is_skipped() {
+        let mut l = Latest::default();
+        assert_eq!(l.want(1, Some(1)), None);
+        assert!(!l.busy());
+        assert_eq!(l.want(2, Some(1)), Some(2));
+        assert_eq!(l.want(2, Some(1)), None);
+        // Back to the shown page while 2 renders: nothing more to do after it
+        assert_eq!(l.want(3, Some(1)), None);
+        assert_eq!(l.want(1, Some(1)), None);
+        assert_eq!(l.done(), None);
+    }
+
+    /// A two-page PDF with valid cross references, 200 x 100 points a page.
+    fn tiny_pdf() -> Vec<u8> {
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>",
+        ];
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offs = vec![];
+        for (i, o) in objs.iter().enumerate() {
+            offs.push(out.len());
+            out.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1));
+        for o in offs {
+            out.push_str(&format!("{o:010} 00000 n \n"));
+        }
+        out.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1));
+        out.into_bytes()
+    }
+
+    /// Runs the worker on `path` on its own thread; the returned receiver fires when the thread ends.
+    fn start_worker(path: &Path) -> (mpsc::Receiver<Result<i32, String>>, mpsc::Sender<PdfReq>, mpsc::Receiver<()>) {
+        let uri = gio::File::for_path(path).uri().to_string();
+        let (otx, orx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let (etx, erx) = mpsc::channel();
+        std::thread::spawn(move || {
+            pdf_worker(&uri, otx, rx);
+            let _ = etx.send(());
+        });
+        (orx, tx, erx)
+    }
+
+    #[test]
+    fn pdf_worker_renders_pages_and_stops_with_the_preview() {
+        let base = std::env::temp_dir().join(format!("rfiles-preview-pdf-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let t = std::time::Duration::from_secs(10);
+
+        let good = base.join("a.pdf");
+        std::fs::write(&good, tiny_pdf()).unwrap();
+        let (opened, tx, ended) = start_worker(&good);
+        assert_eq!(opened.recv_timeout(t).unwrap(), Ok(2));
+        let ask = |page| {
+            let (reply, rx) = mpsc::channel();
+            tx.send(PdfReq { key: PdfKey { page, w: 100, h: 100, scale: 2 }, reply }).unwrap();
+            rx.recv_timeout(t).unwrap()
+        };
+        let pg = ask(1).unwrap();
+        assert_eq!((pg.w, pg.h), (200, 100));
+        assert!(pg.data.len() >= (pg.stride * pg.h) as usize);
+        // Blank page on white: RGB24 is a native-endian 0x00RRGGBB word
+        let px = u32::from_ne_bytes(pg.data[..4].try_into().unwrap());
+        assert_eq!(px & 0xFF_FFFF, 0xFF_FFFF);
+        assert!(ask(5).is_none());
+        // Dropping the sender, as clearing the preview does, ends the thread
+        drop(tx);
+        ended.recv_timeout(t).expect("worker kept running");
+
+        let bad = base.join("broken.pdf");
+        std::fs::write(&bad, b"%PDF-1.4 not really").unwrap();
+        let (opened, _tx, ended) = start_worker(&bad);
+        assert!(opened.recv_timeout(t).unwrap().is_err());
+        ended.recv_timeout(t).expect("worker kept running");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
