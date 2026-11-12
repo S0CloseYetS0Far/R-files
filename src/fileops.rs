@@ -91,7 +91,9 @@ fn free_name(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
     unreachable!()
 }
 
-fn copy_recursive(src: &Path, dst: &Path, done: &AtomicU64) -> io::Result<()> {
+/// Copies `src` to `dst`. Pipes, sockets and devices are left out and counted in `skipped`: reading a
+/// pipe blocks until something writes to it, and a device like /dev/zero never ends.
+fn copy_recursive(src: &Path, dst: &Path, done: &AtomicU64, skipped: &mut usize) -> io::Result<()> {
     let md = src.symlink_metadata()?;
     let ft = md.file_type();
     if ft.is_symlink() {
@@ -100,17 +102,33 @@ fn copy_recursive(src: &Path, dst: &Path, done: &AtomicU64) -> io::Result<()> {
         std::fs::create_dir(dst)?;
         for e in std::fs::read_dir(src)? {
             let e = e?;
-            copy_recursive(&e.path(), &dst.join(e.file_name()), done)?;
+            copy_recursive(&e.path(), &dst.join(e.file_name()), done, skipped)?;
         }
         let _ = std::fs::set_permissions(dst, md.permissions());
         // Last, so creating the children doesn't bump the folder's date again
         keep_times(dst, &md);
-    } else {
+    } else if ft.is_file() {
         std::fs::copy(src, dst)?;
         keep_times(dst, &md);
         done.fetch_add(md.len(), Ordering::Relaxed);
+    } else {
+        *skipped += 1;
     }
     Ok(())
+}
+
+/// The error line for an item that was copied without some special files.
+fn skipped_msg(label: &str, skipped: usize, top_level: bool, cut: bool) -> String {
+    if top_level {
+        return format!("{label}: is a pipe, socket or device, not copied");
+    }
+    let what = if skipped == 1 {
+        "1 pipe, socket or device".to_string()
+    } else {
+        format!("{skipped} pipes, sockets or devices")
+    };
+    let kept = if cut { "; the original was kept" } else { "" };
+    format!("{label}: copied without {what}{kept}")
 }
 
 /// Gives the copy the original's modified and accessed dates, like `cp -a`. Best effort: some drives
@@ -149,13 +167,17 @@ pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: Arc<A
             continue; // moving into the same folder: nothing to do
         }
         let target = free_name(&dest, name);
+        let mut skipped = 0;
         let res = if cut {
             match std::fs::rename(&src, &target) {
                 Ok(()) => Ok(()),
-                // Different drive: copy, then remove the original
+                // Different drive: copy, then remove the original. If something was left out, the
+                // original is kept so nothing is lost.
                 Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-                    copy_recursive(&src, &target, &progress).and_then(|_| {
-                        if src.symlink_metadata()?.is_dir() {
+                    copy_recursive(&src, &target, &progress, &mut skipped).and_then(|_| {
+                        if skipped > 0 {
+                            Ok(())
+                        } else if src.symlink_metadata()?.is_dir() {
                             std::fs::remove_dir_all(&src)
                         } else {
                             std::fs::remove_file(&src)
@@ -165,10 +187,15 @@ pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: Arc<A
                 Err(e) => Err(e),
             }
         } else {
-            copy_recursive(&src, &target, &progress)
+            copy_recursive(&src, &target, &progress, &mut skipped)
         };
         match res {
-            Ok(()) => out.done += 1,
+            Ok(()) if skipped == 0 => out.done += 1,
+            Ok(()) => {
+                // Nothing at the target means the item itself was the special file
+                let top_level = target.symlink_metadata().is_err();
+                out.errors.push(skipped_msg(&label, skipped, top_level, cut));
+            }
             Err(e) => out.errors.push(format!("{label}: {e}")),
         }
     }
@@ -261,5 +288,57 @@ mod tests {
         assert_eq!(mtime(&sub.join("a (copy).jpg")), old);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Runs `transfer` on a thread so a blocked copy fails the test instead of hanging it.
+    fn transfer_with_timeout(sources: Vec<PathBuf>, dest: PathBuf, cut: bool) -> Outcome {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(transfer(sources, dest, cut, Arc::new(AtomicU64::new(0))));
+        });
+        rx.recv_timeout(Duration::from_secs(10)).expect("transfer blocked")
+    }
+
+    fn mkfifo(p: &Path) {
+        let ok = std::process::Command::new("mkfifo").arg(p).status().unwrap().success();
+        assert!(ok, "mkfifo failed");
+    }
+
+    #[test]
+    fn copy_skips_pipes_and_sockets() {
+        let base = std::env::temp_dir().join(format!("rfiles-fileops-special-{}", std::process::id()));
+        let (src, dest) = (base.join("src"), base.join("dest"));
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"b").unwrap();
+        mkfifo(&src.join("pipe"));
+        let _sock = std::os::unix::net::UnixListener::bind(src.join("sub/sock")).unwrap();
+
+        // A folder holding special files: the rest is copied, the special ones are reported
+        let out = transfer_with_timeout(vec![src.clone()], dest.clone(), false);
+        assert_eq!(out.done, 0);
+        assert_eq!(out.errors, ["src: copied without 2 pipes, sockets or devices"]);
+        let copy = dest.join("src");
+        assert_eq!(std::fs::read(copy.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(copy.join("sub/b.txt")).unwrap(), b"b");
+        assert!(copy.join("pipe").symlink_metadata().is_err());
+        assert!(copy.join("sub/sock").symlink_metadata().is_err());
+
+        // A pipe on its own is not copied, and the other items still are
+        let out = transfer_with_timeout(vec![src.join("pipe"), src.join("a.txt")], dest.clone(), false);
+        assert_eq!(out.done, 1);
+        assert_eq!(out.errors, ["pipe: is a pipe, socket or device, not copied"]);
+        assert!(dest.join("pipe").symlink_metadata().is_err());
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"a");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn skipped_message_says_the_original_was_kept_on_move() {
+        let kept = "x: copied without 1 pipe, socket or device; the original was kept";
+        assert_eq!(skipped_msg("x", 1, false, true), kept);
+        assert_eq!(skipped_msg("x", 3, false, false), "x: copied without 3 pipes, sockets or devices");
     }
 }
