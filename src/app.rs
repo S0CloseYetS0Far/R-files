@@ -1160,8 +1160,31 @@ impl App {
 
     // ================= opening =================
     fn open_position(self: &Rc<Self>, pos: u32) {
+        // Enter with several items selected opens all of them, not just the focused one
+        if self.selection.is_selected(pos) && self.selection.selection().size() > 1 {
+            self.open_selected();
+            return;
+        }
         if let Some(info) = self.selection.item(pos).and_downcast::<gio::FileInfo>() {
             self.open_info(&info);
+        }
+    }
+
+    /// Opens every selected item: files in their default app, the first folder here, other folders in new tabs.
+    fn open_selected(self: &Rc<Self>) {
+        let infos = self.selected_infos();
+        let plan = plan_open(&infos.iter().map(is_dir_like).collect::<Vec<_>>());
+        for &i in &plan.files {
+            self.launch(&item_file(&infos[i]), false);
+        }
+        if let Some(i) = plan.first_dir {
+            self.navigate(Loc::Dir(item_file(&infos[i])));
+        }
+        for &i in &plan.other_dirs {
+            self.new_tab(Loc::Dir(item_file(&infos[i])));
+        }
+        if plan.skipped > 0 {
+            self.status.set_text(&format!("Opened the first {MAX_OPEN} of {} items", MAX_OPEN + plan.skipped));
         }
     }
 
@@ -2196,7 +2219,23 @@ impl App {
         bx.append(&h2);
         bx.append(&size);
         bx.append(&hint);
+        bx.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         let pop = gtk::Popover::new();
+        for (label, action) in [("Keyboard shortcuts", "win.shortcuts"), ("About RFiles", "win.about")] {
+            let b = gtk::Button::with_label(label);
+            b.add_css_class("flat");
+            if let Some(l) = b.child().and_downcast::<gtk::Label>() {
+                l.set_xalign(0.0);
+            }
+            b.set_action_name(Some(action));
+            let pw = pop.downgrade();
+            b.connect_clicked(move |_| {
+                if let Some(p) = pw.upgrade() {
+                    p.popdown();
+                }
+            });
+            bx.append(&b);
+        }
         pop.set_child(Some(&bx));
         self.settings_btn.set_popover(Some(&pop));
 
@@ -2805,11 +2844,32 @@ impl App {
                 });
             }
         }));
-        add("open", Box::new(|a| {
-            if let Some(i) = a.selected_info() {
-                a.open_info(&i);
+        add("open", Box::new(|a| match a.selected_infos().len() {
+            0 => {}
+            1 => {
+                if let Some(i) = a.selected_info() {
+                    a.open_info(&i);
+                }
+            }
+            _ => a.open_selected(),
+        }));
+        let gw = gapp.downgrade();
+        add("new-window", Box::new(move |a| {
+            if let Some(g) = gw.upgrade() {
+                build(&g, a.current_dir().unwrap_or_else(home));
             }
         }));
+        let gw = gapp.downgrade();
+        add("quit", Box::new(move |_| {
+            let Some(g) = gw.upgrade() else { return };
+            // close(), not quit() alone: only close-request saves each window's layout
+            for w in g.windows() {
+                w.close();
+            }
+            g.quit();
+        }));
+        add("shortcuts", Box::new(|a| show_shortcuts(&a.window)));
+        add("about", Box::new(|a| show_about(&a.window)));
         add("open-tab", Box::new(|a| {
             if let Some(i) = a.selected_info() {
                 a.new_tab(Loc::Dir(item_file(&i)));
@@ -2974,6 +3034,9 @@ impl App {
 
         let accels: &[(&str, &[&str])] = &[
             ("win.new-tab", &["<Control>t"]),
+            ("win.new-window", &["<Control>n"]),
+            ("win.quit", &["<Control>q"]),
+            ("win.shortcuts", &["<Control>question", "<Control><Shift>slash", "F1"]),
             ("win.close-tab", &["<Control>w"]),
             ("win.next-tab", &["<Control>Page_Down", "<Control>Tab"]),
             ("win.prev-tab", &["<Control>Page_Up", "<Control><Shift>Tab"]),
@@ -3156,6 +3219,143 @@ impl App {
             glib::Propagation::Proceed
         });
     }
+}
+
+/// Most items "Open" handles at once, so a stray Ctrl+A then Enter can't launch hundreds of apps.
+const MAX_OPEN: usize = 20;
+
+/// Which of several selected items go where, as indexes into the selection.
+#[derive(Debug, PartialEq, Eq)]
+struct OpenPlan {
+    /// Default app
+    files: Vec<usize>,
+    /// Opens in the current tab
+    first_dir: Option<usize>,
+    /// Open in new tabs
+    other_dirs: Vec<usize>,
+    /// Selected items beyond the cap, left alone
+    skipped: usize,
+}
+
+fn plan_open(is_dir: &[bool]) -> OpenPlan {
+    let skipped = is_dir.len().saturating_sub(MAX_OPEN);
+    let mut plan = OpenPlan { files: vec![], first_dir: None, other_dirs: vec![], skipped };
+    for (i, &d) in is_dir.iter().take(MAX_OPEN).enumerate() {
+        match (d, plan.first_dir) {
+            (false, _) => plan.files.push(i),
+            (true, None) => plan.first_dir = Some(i),
+            (true, Some(_)) => plan.other_dirs.push(i),
+        }
+    }
+    plan
+}
+
+#[cfg(test)]
+mod open_plan_tests {
+    use super::{plan_open, MAX_OPEN};
+
+    #[test]
+    fn files_go_to_apps_and_folders_to_tabs() {
+        let p = plan_open(&[false, true, false, true, true]);
+        assert_eq!(p.files, vec![0, 2]);
+        assert_eq!(p.first_dir, Some(1));
+        assert_eq!(p.other_dirs, vec![3, 4]);
+        assert_eq!(p.skipped, 0);
+    }
+
+    #[test]
+    fn only_files_leave_the_tab_alone() {
+        let p = plan_open(&[false, false]);
+        assert_eq!((p.files, p.first_dir, p.other_dirs), (vec![0, 1], None, vec![]));
+    }
+
+    #[test]
+    fn capped_at_twenty() {
+        let p = plan_open(&vec![false; MAX_OPEN + 5]);
+        assert_eq!(p.files.len(), MAX_OPEN);
+        assert_eq!(p.skipped, 5);
+        assert_eq!(plan_open(&vec![true; MAX_OPEN]).skipped, 0);
+        assert_eq!(plan_open(&[]).skipped, 0);
+    }
+}
+
+/// Every shortcut, shown in the shortcuts window. Keep in step with the README table.
+const SHORTCUTS: &[(&str, &str)] = &[
+    ("New tab / close tab", "Ctrl+T / Ctrl+W"),
+    ("New window", "Ctrl+N"),
+    ("Quit", "Ctrl+Q"),
+    ("Switch tabs", "Ctrl+PageDown / Ctrl+PageUp"),
+    ("Preview / open", "Click / double-click or Enter"),
+    ("Copy / cut / paste", "Ctrl+C / Ctrl+X / Ctrl+V"),
+    ("Select several", "Ctrl+click, Shift+click, drag a box, Ctrl+A"),
+    ("Rename / move to trash", "F2 (several selected = batch rename) / Delete"),
+    ("Properties", "Alt+Enter or Ctrl+I"),
+    ("Drag to copy / move", "Hold Ctrl to copy, Shift to move"),
+    ("New folder", "Ctrl+Shift+N"),
+    ("Pin / unpin this folder", "Ctrl+D"),
+    ("Open in terminal", "Ctrl+Alt+T"),
+    ("Search / path bar", "Ctrl+F / Ctrl+L"),
+    ("Back / forward / up", "Alt+Left / Alt+Right / Alt+Up"),
+    ("Hidden files", "Ctrl+H"),
+    ("Grid / list view", "Ctrl+1 / Ctrl+2"),
+    ("This list", "Ctrl+? or F1"),
+];
+
+fn show_shortcuts(parent: &gtk::ApplicationWindow) {
+    let grid = gtk::Grid::builder()
+        .row_spacing(8)
+        .column_spacing(24)
+        .margin_top(16)
+        .margin_bottom(16)
+        .margin_start(20)
+        .margin_end(20)
+        .build();
+    for (row, (what, keys)) in SHORTCUTS.iter().enumerate() {
+        let l = gtk::Label::new(Some(what));
+        l.set_xalign(0.0);
+        let k = gtk::Label::new(Some(keys));
+        k.set_xalign(0.0);
+        k.add_css_class("dim");
+        grid.attach(&l, 0, row as i32, 1, 1);
+        grid.attach(&k, 1, row as i32, 1, 1);
+    }
+    let scroll = gtk::ScrolledWindow::builder().child(&grid).build();
+    let win = gtk::Window::builder()
+        .title("Keyboard shortcuts")
+        .transient_for(parent)
+        .modal(true)
+        .destroy_with_parent(true)
+        .default_width(560)
+        .default_height(520)
+        .child(&scroll)
+        .build();
+    // Esc closes it
+    let k = gtk::EventControllerKey::new();
+    let ww = win.downgrade();
+    k.connect_key_pressed(move |_, key, _, _| {
+        if key != gdk::Key::Escape {
+            return glib::Propagation::Proceed;
+        }
+        if let Some(w) = ww.upgrade() {
+            w.close();
+        }
+        glib::Propagation::Stop
+    });
+    win.add_controller(k);
+    win.present();
+}
+
+fn show_about(parent: &gtk::ApplicationWindow) {
+    gtk::AboutDialog::builder()
+        .transient_for(parent)
+        .modal(true)
+        .destroy_with_parent(true)
+        .program_name("RFiles")
+        .version(env!("CARGO_PKG_VERSION"))
+        .comments("A black, tabbed file explorer with live preview.")
+        .website("https://github.com/S0CloseYetS0Far/R-files")
+        .build()
+        .present();
 }
 
 /// What "Show in folder" must change so its target passes the filter:

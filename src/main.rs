@@ -147,7 +147,44 @@ pub fn open_location(gapp: &gtk::Application, file: &gio::File, startup_id: Opti
     }
 }
 
+/// `rfiles --version` / `-V`: the line to print, if that is what was asked for.
+fn version_request(args: &[String]) -> Option<String> {
+    args.iter()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+        .then(|| format!("rfiles {}", env!("CARGO_PKG_VERSION")))
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::version_request;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn version_flags_print_name_and_version() {
+        let want = Some(format!("rfiles {}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(version_request(&v(&["rfiles", "--version"])), want);
+        assert_eq!(version_request(&v(&["rfiles", "-V"])), want);
+    }
+
+    #[test]
+    fn other_arguments_are_not_a_version_request() {
+        assert_eq!(version_request(&v(&["rfiles"])), None);
+        assert_eq!(version_request(&v(&["rfiles", "--dbus-service"])), None);
+        assert_eq!(version_request(&v(&["--version"])), None);
+        assert_eq!(version_request(&v(&["rfiles", "/tmp"])), None);
+    }
+}
+
 fn main() -> glib::ExitCode {
+    // `--version`: answer before GTK, the D-Bus service or any forwarding to a running RFiles
+    if let Some(line) = version_request(&std::env::args().collect::<Vec<_>>()) {
+        println!("{line}");
+        return glib::ExitCode::SUCCESS;
+    }
     // Before anything else: see gpu.rs
     gpu::keep_sleeping_cards_asleep();
 
@@ -167,6 +204,15 @@ fn main() -> glib::ExitCode {
         .application_id("io.github.rfiles.Files")
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
+    // Listed in `--help`; the flag itself is answered at the top of main
+    app.add_main_option(
+        "version",
+        glib::Char::from(b'V'),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Print the version and exit",
+        None,
+    );
 
     app.connect_startup(move |a| {
         if let Some(s) = gtk::Settings::default() {

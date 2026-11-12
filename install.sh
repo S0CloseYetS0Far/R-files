@@ -119,7 +119,8 @@ echo "==> Installing"
 mkdir -p "$BIN_DIR" "$APP_DIR" "$(dirname "$ICON_FILE")"
 install -m755 target/release/rfiles "$BIN_DIR/rfiles"
 install -m644 data/io.github.rfiles.Files.svg "$ICON_FILE"
-sed "s|^Exec=.*|Exec=$BIN_DIR/rfiles %U|" rfiles.desktop > "$APP_DIR/rfiles.desktop"
+# Two Exec lines: the main entry (with %U) and the "New Window" action (without)
+sed -e "s|^Exec=rfiles %U\$|Exec=$BIN_DIR/rfiles %U|" -e "s|^Exec=rfiles\$|Exec=$BIN_DIR/rfiles|" rfiles.desktop > "$APP_DIR/rfiles.desktop"
 update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
 
 echo
