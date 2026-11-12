@@ -2351,7 +2351,11 @@ fn delete_recursive(f: &gio::File) -> Result<(), glib::Error> {
 /// Why `name` can't be a new folder's name, if it can't. `child()` would read "a/b" or ".." as a path and
 /// create the folder somewhere else, so these are refused before it is called.
 fn folder_name_problem(name: &str) -> Option<&'static str> {
-    if name.contains(['/', '\0']) || name == "." || name == ".." {
+    if name == "." || name == ".." {
+        // Same wording as batch rename
+        Some("“.” and “..” are not allowed")
+    } else if name.contains(['/', '\0']) {
+        // A NUL can't come from a GTK entry; refused anyway since it would cut the name short
         Some("The name can't contain “/”")
     } else {
         None
@@ -2399,8 +2403,11 @@ mod tests {
         for ok in ["New Folder", "a.b", "...", ".hidden", "x~"] {
             assert_eq!(folder_name_problem(ok), None, "{ok}");
         }
-        for bad in ["a/b", "../x", "/", ".", "..", "x/", "a\0b"] {
-            assert!(folder_name_problem(bad).is_some(), "{bad:?}");
+        for bad in ["a/b", "../x", "/", "x/", "./", "a\0b"] {
+            assert_eq!(folder_name_problem(bad), Some("The name can't contain “/”"), "{bad:?}");
+        }
+        for bad in [".", ".."] {
+            assert_eq!(folder_name_problem(bad), Some("“.” and “..” are not allowed"), "{bad:?}");
         }
     }
 
