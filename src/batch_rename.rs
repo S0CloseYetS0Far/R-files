@@ -4,7 +4,7 @@
 //! The planning and ordering logic is pure (no GTK, no IO) and unit tested;
 //! the dialog only feeds it names and shows the result.
 
-use crate::util::{is_dir_like, item_file};
+use crate::util::{is_dir_like, item_file, split_ext};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::cell::{Cell, RefCell};
@@ -61,23 +61,6 @@ pub struct Item {
     pub name: String,
     pub is_dir: bool,
     pub dir: usize,
-}
-
-/// Splits "photo.jpg" into ("photo", ".jpg"). Hidden files without another
-/// dot (".bashrc") have no extension; ".tar.*" is kept as one extension.
-fn split_ext(name: &str) -> (&str, &str) {
-    match name.rfind('.') {
-        Some(i) if i > 0 => {
-            let stem = &name[..i];
-            if let Some(j) = stem.len().checked_sub(4) {
-                if j > 0 && stem.is_char_boundary(j) && stem[j..].eq_ignore_ascii_case(".tar") {
-                    return (&name[..j], &name[j..]);
-                }
-            }
-            (stem, &name[i..])
-        }
-        _ => (name, ""),
-    }
 }
 
 /// Length in bytes of the prefix of `s` that equals `needle` (already

@@ -1877,7 +1877,7 @@ impl App {
     }
 
     // ================= other file operations =================
-    fn prompt(self: &Rc<Self>, title: &str, initial: &str, ok: &str, f: impl Fn(String) -> Result<(), String> + 'static) {
+    fn prompt(self: &Rc<Self>, title: &str, initial: &str, select: usize, ok: &str, f: impl Fn(String) -> Result<(), String> + 'static) {
         let win = gtk::Window::builder()
             .transient_for(&self.window)
             .modal(true)
@@ -1943,12 +1943,8 @@ impl App {
             }
         });
         win.present();
-        let stem = Path::new(initial)
-            .file_stem()
-            .map(|s| s.to_string_lossy().chars().count())
-            .unwrap_or(0);
         entry.grab_focus();
-        entry.select_region(0, stem as i32);
+        entry.select_region(0, select as i32);
     }
 
     fn delete_selected(self: &Rc<Self>) {
@@ -2291,7 +2287,8 @@ impl App {
             let Some(info) = infos.pop() else { return };
             let file = item_file(&info);
             let name = info.display_name().to_string();
-            a.prompt("Rename", &name, "Rename", move |new| {
+            let sel = crate::util::select_len(&name, is_dir_like(&info));
+            a.prompt("Rename", &name, sel, "Rename", move |new| {
                 file.set_display_name(&new, None::<&gio::Cancellable>)
                     .map(|_| ())
                     .map_err(|e| e.message().to_string())
@@ -2308,7 +2305,7 @@ impl App {
         }));
         add("new-folder", Box::new(|a| {
             let Some(dir) = a.current_dir().filter(|d| !is_trash(d)) else { return };
-            a.prompt("New Folder", "New Folder", "Create", move |name| {
+            a.prompt("New Folder", "New Folder", "New Folder".len(), "Create", move |name| {
                 if let Some(p) = folder_name_problem(&name) {
                     return Err(p.to_string());
                 }
