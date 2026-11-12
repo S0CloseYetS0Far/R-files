@@ -38,22 +38,69 @@ const XML: &str = r#"<node>
 /// folder with the item selected. Several items in the same folder share
 /// one window (the first one is selected).
 fn targets(method: &str, uris: &[String]) -> Vec<String> {
+    let items: Vec<(String, bool)> = uris
+        .iter()
+        .filter(|u| !u.is_empty())
+        .map(|u| (u.clone(), method == "ShowFolders"))
+        .collect();
+    distinct_windows(&items).into_iter().map(|i| items[i].0.clone()).collect()
+}
+
+/// Which of `items` (uri, is it opened as a folder) get a window: the indexes
+/// of the first item for each distinct folder, in order. A folder is its own
+/// window; a file belongs to its parent folder, so files in one folder
+/// share a window (the first one is selected).
+pub fn distinct_windows(items: &[(String, bool)]) -> Vec<usize> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for uri in uris.iter().filter(|u| !u.is_empty()) {
-        let key = if method == "ShowFolders" {
-            uri.trim_end_matches('/').to_string()
+    for (i, (uri, is_folder)) in items.iter().enumerate() {
+        let trimmed = uri.trim_end_matches('/');
+        let key = if *is_folder {
+            trimmed.to_string()
         } else {
-            match uri.trim_end_matches('/').rsplit_once('/') {
+            match trimmed.rsplit_once('/') {
                 Some((parent, _)) => parent.to_string(),
                 None => uri.clone(),
             }
         };
         if seen.insert(key) {
-            out.push(uri.clone());
+            out.push(i);
         }
     }
     out
+}
+
+#[cfg(test)]
+mod distinct_windows_tests {
+    use super::distinct_windows;
+
+    fn it(a: &[(&str, bool)]) -> Vec<(String, bool)> {
+        a.iter().map(|(s, f)| (s.to_string(), *f)).collect()
+    }
+
+    #[test]
+    fn keeps_order_and_shares_folder_windows() {
+        let items = it(&[("file:///b/z", true), ("file:///a/x.txt", false), ("file:///a/y.txt", false)]);
+        assert_eq!(distinct_windows(&items), vec![0, 1]);
+    }
+
+    #[test]
+    fn folder_and_file_inside_it_are_separate() {
+        // The file opens /a (selected); the folder /a/sub is its own window
+        let items = it(&[("file:///a/x.txt", false), ("file:///a/sub", true), ("file:///a", true)]);
+        assert_eq!(distinct_windows(&items), vec![0, 1]);
+    }
+
+    #[test]
+    fn duplicates_and_trailing_slashes() {
+        let items = it(&[("file:///a", true), ("file:///a/", true), ("file:///b/f/", false), ("file:///b/g", false)]);
+        assert_eq!(distinct_windows(&items), vec![0, 2]);
+    }
+
+    #[test]
+    fn empty_input() {
+        assert!(distinct_windows(&[]).is_empty());
+    }
 }
 
 thread_local! {
@@ -157,12 +204,17 @@ pub fn attach(app: &gtk::Application) {
 /// Requests that arrived but can't be handled here (another RFiles is
 /// already running): hands them to it as normal "open" requests.
 pub fn forward_queued(app: &gtk::Application) {
-    let files: Vec<gio::File> = QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()))
-        .into_iter()
-        .map(|(uri, _)| gio::File::for_uri(&uri))
-        .collect();
-    if !files.is_empty() {
-        app.open(&files, "");
+    // One `open` per startup id, so each keeps its own id for focus
+    let mut groups: Vec<(String, Vec<gio::File>)> = Vec::new();
+    for (uri, id) in QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut())) {
+        let file = gio::File::for_uri(&uri);
+        match groups.iter_mut().find(|(g, _)| *g == id) {
+            Some((_, files)) => files.push(file),
+            None => groups.push((id, vec![file])),
+        }
+    }
+    for (id, files) in groups {
+        app.open(&files, &id);
     }
 }
 
