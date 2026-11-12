@@ -114,8 +114,9 @@ Keep GNOME Files installed; Ubuntu uses it in a few places. To switch back:
 | Action | How |
 |---|---|
 | New tab / close tab | **+** or Ctrl+T / × or Ctrl+W (middle-click works too) |
+| New window / quit | Ctrl+N / Ctrl+Q (quit closes every window) |
 | Switch tabs | Ctrl+PageDown / Ctrl+PageUp |
-| Preview / open | single-click / double-click or Enter |
+| Preview / open | single-click / double-click or Enter (several selected: opens all, up to 20; the first folder here, other folders in new tabs) |
 | Copy / cut / paste | Ctrl+C / Ctrl+X / Ctrl+V |
 | Select several | Ctrl+click, Shift+click, drag a box, Ctrl+A |
 | Rename / move to trash | F2 (several selected = batch rename) / Delete |
@@ -128,10 +129,12 @@ Keep GNOME Files installed; Ubuntu uses it in a few places. To switch back:
 | Back / forward / up | Alt+Left / Alt+Right / Alt+Up |
 | Hidden files | Ctrl+H |
 | Grid / list view | Ctrl+1 / Ctrl+2 |
+| Keyboard shortcuts list | Ctrl+? or F1 (also in the gear menu, with About) |
 
 Right-click anything for more (star, change icon, open with, etc.).
 Right-click a sidebar item to move it up or down or open it in a new tab.
 The gear button at the right of the path bar sets the folder icon style and icon size.
+`rfiles --version` prints the version; the desktop entry also has a *New Window* action.
 
 Settings, pins and stars are stored in `~/.config/rfiles/`.
 
