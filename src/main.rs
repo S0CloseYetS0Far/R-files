@@ -54,6 +54,7 @@ button.pinned { color: #4a9eff; background-color: rgba(53, 132, 228, 0.18); }
 .sidebar list row:selected { background-color: #444444; color: #ffffff; }
 .sidebar-header { font-size: 11px; font-weight: bold; color: #8c8c8c; margin-top: 12px; }
 .sidebar-hint { font-size: 11px; color: #6e6e6e; }
+.sidebar list row.pin-missing { color: #6e6e6e; }
 
 /* ---------- files (pitch black) ---------- */
 .files, .files viewport, gridview.files, columnview.files, columnview.files listview,

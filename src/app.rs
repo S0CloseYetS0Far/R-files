@@ -1445,6 +1445,7 @@ impl App {
                 let files: Vec<_> = self.config.borrow().starred.iter().map(|u| gio::File::for_uri(u)).collect();
                 let store = infos_store(files.into_iter());
                 self.filter_model.set_model(Some(&store));
+                self.drop_dead_stars();
                 self.path_entry.set_text("Starred");
                 self.up_btn.set_sensitive(false);
                 String::new()
@@ -1789,6 +1790,11 @@ impl App {
     }
 
     fn rebuild_sidebar(self: &Rc<Self>) {
+        // Pins known to be missing stay dimmed until the new check answers, so they don't flicker
+        let was_missing: Vec<String> = (0..self.sidebar_targets.borrow().len())
+            .filter(|&i| self.sidebar.row_at_index(i as i32).is_some_and(|r| r.has_css_class("pin-missing")))
+            .filter_map(|i| self.sidebar_loc(i).map(|l| l.key()))
+            .collect();
         while let Some(c) = self.sidebar.first_child() {
             self.sidebar.remove(&c);
         }
@@ -1805,11 +1811,22 @@ impl App {
             self.side_hint("Right-click a folder → Pin to Sidebar");
             crate::dnd::attach_pin_target(self, &self.sidebar);
         }
+        let mut check = Vec::new();
         for uri in pins {
             let f = gio::File::for_uri(&uri);
             let key = format!("pin:{uri}");
-            self.side_row("folder-symbolic", &file_title(&f), Loc::Dir(f), Some(uri), Some(key));
+            let title = file_title(&f);
+            let loc = Loc::Dir(f);
+            let missing = was_missing.contains(&loc.key());
+            self.side_row("folder-symbolic", &title, loc, Some(uri.clone()), Some(key));
+            if let Some(row) = self.sidebar.last_child().and_downcast::<gtk::ListBoxRow>() {
+                if missing {
+                    row.add_css_class("pin-missing");
+                }
+                check.push((uri, row.downgrade()));
+            }
         }
+        self.mark_missing_pins(check);
 
         self.side_header("Devices");
         self.side_row("drive-harddisk-symbolic", "Computer", Loc::Dir(gio::File::for_path("/")), None, None);
@@ -2040,6 +2057,9 @@ impl App {
     }
 
     fn open_sidebar_in_tab(self: &Rc<Self>, idx: usize) {
+        if self.refuse_missing_pin(idx) {
+            return;
+        }
         if let Some(loc) = self.sidebar_loc(idx) {
             self.new_tab(loc);
         }
@@ -2069,6 +2089,73 @@ impl App {
         }
         self.rebuild_sidebar();
         self.update_pin_button();
+    }
+
+    /// Keeps pins and stars on items RFiles renamed: `renames` are (old URI, new URI).
+    pub(crate) fn note_renames(self: &Rc<Self>, renames: &[(String, String)]) {
+        let changed = {
+            let mut c = self.config.borrow_mut();
+            let changed = c.apply_renames(renames);
+            if changed {
+                c.save();
+            }
+            changed
+        };
+        if changed {
+            self.rebuild_sidebar();
+            self.update_pin_button();
+        }
+    }
+
+    /// Dims pinned folders that aren't there, once a check off the UI thread says so.
+    fn mark_missing_pins(&self, rows: Vec<(String, glib::WeakRef<gtk::ListBoxRow>)>) {
+        if rows.is_empty() {
+            return;
+        }
+        let uris: Vec<String> = rows.iter().map(|(u, _)| u.clone()).collect();
+        glib::spawn_future_local(async move {
+            let Ok(missing) =
+                gio::spawn_blocking(move || uris.iter().map(|u| crate::config::pin_is_missing(u)).collect::<Vec<_>>())
+                    .await
+            else {
+                return;
+            };
+            // Rows of a sidebar rebuilt meanwhile are gone and don't upgrade
+            for ((uri, row), missing) in rows.into_iter().zip(missing) {
+                let Some(row) = row.upgrade() else { continue };
+                let path = display_path(&gio::File::for_uri(&uri));
+                if missing {
+                    row.add_css_class("pin-missing");
+                    row.set_tooltip_text(Some(&format!("Missing: {path}")));
+                } else {
+                    row.remove_css_class("pin-missing");
+                    row.set_tooltip_text(Some(&path));
+                }
+            }
+        });
+    }
+
+    /// Shows why a missing pinned folder can't be opened; returns whether row `idx` is one.
+    fn refuse_missing_pin(self: &Rc<Self>, idx: usize) -> bool {
+        let Some(row) = self.sidebar.row_at_index(idx as i32) else { return false };
+        if !row.has_css_class("pin-missing") {
+            return false;
+        }
+        let name = match self.sidebar_loc(idx) {
+            Some(Loc::Dir(f)) => file_title(&f),
+            _ => String::new(),
+        };
+        self.status.set_text(&format!(
+            "“{name}” is missing: moved, renamed or deleted, or its drive is not connected. Right-click to unpin."
+        ));
+        // Look again, so a folder that is back opens on the next click
+        let a = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(a) = a.upgrade() {
+                a.rebuild_sidebar();
+            }
+        });
+        true
     }
 
     // ================= settings (icons) =================
@@ -2536,6 +2623,32 @@ impl App {
         }
     }
 
+    /// Forgets starred files that are gone for good, so the saved list doesn't keep dead
+    /// entries forever. The view already leaves them out; this only cleans the config.
+    fn drop_dead_stars(self: &Rc<Self>) {
+        let uris = self.config.borrow().starred.clone();
+        if uris.is_empty() {
+            return;
+        }
+        let a = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(dead) = gio::spawn_blocking(move || {
+                uris.into_iter().filter(|u| crate::config::star_is_dead(u)).collect::<Vec<_>>()
+            })
+            .await
+            else {
+                return;
+            };
+            let Some(a) = a.upgrade() else { return };
+            if dead.is_empty() {
+                return;
+            }
+            let mut c = a.config.borrow_mut();
+            c.starred.retain(|u| !dead.contains(u));
+            c.save();
+        });
+    }
+
     /// The preview pane's width can only be applied once the window has a
     /// real size, so wait for the first frame, then place the divider.
     fn restore_layout(self: &Rc<Self>, preview_width: i32) {
@@ -2772,8 +2885,13 @@ impl App {
                 return;
             }
             let mut infos = a.selected_infos();
+            let w = Rc::downgrade(a);
             if infos.len() > 1 {
-                crate::batch_rename::open(&a.window, &infos);
+                crate::batch_rename::open(&a.window, &infos, move |renames| {
+                    if let Some(a) = w.upgrade() {
+                        a.note_renames(renames);
+                    }
+                });
                 return;
             }
             let Some(info) = infos.pop() else { return };
@@ -2781,9 +2899,13 @@ impl App {
             let name = info.display_name().to_string();
             let sel = crate::util::select_len(&name, is_dir_like(&info));
             a.prompt("Rename", &name, sel, "Rename", move |new| {
-                file.set_display_name(&new, None::<&gio::Cancellable>)
-                    .map(|_| ())
-                    .map_err(|e| e.message().to_string())
+                let renamed = file
+                    .set_display_name(&new, None::<&gio::Cancellable>)
+                    .map_err(|e| e.message().to_string())?;
+                if let Some(a) = w.upgrade() {
+                    a.note_renames(&[(file.uri().to_string(), renamed.uri().to_string())]);
+                }
+                Ok(())
             });
         }));
         // Properties of the selection, or of the current folder when
@@ -2933,6 +3055,11 @@ impl App {
         let a = Rc::downgrade(self);
         self.sidebar.connect_row_activated(move |_, row| {
             let Some(a) = a.upgrade() else { return };
+            if a.refuse_missing_pin(row.index() as usize) {
+                // Keep the current place selected, not the dead row
+                a.highlight_sidebar(&a.current_loc());
+                return;
+            }
             if let Some(loc) = a.sidebar_loc(row.index() as usize) {
                 a.navigate(loc);
             }
