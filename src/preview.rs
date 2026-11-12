@@ -154,6 +154,11 @@ impl Preview {
             self.icon_placeholder(info, "No preview for remote files");
             return;
         };
+        // Pipes, sockets and devices: opening a pipe blocks until something writes to it
+        if info.file_type() == gio::FileType::Special {
+            self.icon_placeholder(info, "No preview for special files");
+            return;
+        }
 
         if ct.starts_with("image/") {
             self.image_preview(path, g, info.clone());
@@ -497,6 +502,10 @@ fn load_scaled(path: &Path) -> Option<Pixels> {
 
 /// Reads the start of a file and returns it if it looks like text.
 fn read_text(path: &Path) -> Result<String, String> {
+    // Only regular files: a pipe would block the reader thread, and a device may never end
+    if !std::fs::metadata(path).map_err(|e| e.to_string())?.is_file() {
+        return Err("not a regular file".into());
+    }
     let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(16 * 1024);
     f.by_ref()
@@ -553,6 +562,35 @@ fn text_view(text: &str, mono: bool) -> gtk::ScrolledWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn special_files_are_not_read_as_text() {
+        let base = std::env::temp_dir().join(format!("rfiles-preview-special-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let pipe = base.join("pipe");
+        assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&pipe, &link).unwrap();
+
+        // On a thread, so a blocked read fails the test instead of hanging it
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (p, l) = (pipe.clone(), link.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((read_text(&p).is_err(), read_text(&l).is_err()));
+        });
+        let res = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("read_text blocked");
+        assert_eq!(res, (true, true));
+
+        // `show` relies on GIO calling a pipe (also through a link) a special file
+        for p in [&pipe, &link] {
+            let t = gio::File::for_path(p).query_file_type(gio::FileQueryInfoFlags::NONE, None::<&gio::Cancellable>);
+            assert_eq!(t, gio::FileType::Special);
+        }
+
+        std::fs::write(base.join("a.txt"), b"hello").unwrap();
+        assert_eq!(read_text(&base.join("a.txt")).unwrap(), "hello");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn wheel_notch_turns_one_page() {
