@@ -23,6 +23,9 @@ pub struct Config {
     /// What the file views are sorted by, and whether reversed
     pub sort: SortKey,
     pub sort_desc: bool,
+    /// Whether the sidebar and the preview pane are shown
+    pub show_sidebar: bool,
+    pub show_preview: bool,
 }
 
 fn dir() -> PathBuf {
@@ -57,6 +60,8 @@ impl Config {
             places_order: Vec::new(),
             sort: SortKey::Name,
             sort_desc: false,
+            show_sidebar: true,
+            show_preview: true,
         };
         for line in read_lines("settings") {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -74,6 +79,9 @@ impl Config {
                     continue;
                 }
                 _ => {}
+            }
+            if read_pane_setting(&mut c.show_sidebar, &mut c.show_preview, k.trim(), v) {
+                continue;
             }
             let n = v.trim().parse::<i32>().ok();
             match (k.trim(), n) {
@@ -101,7 +109,7 @@ impl Config {
         let _ = std::fs::write(
             d.join("settings"),
             format!(
-                "width={}\nheight={}\nmaximized={}\nsidebar={}\npreview={}\nfiles={}\nlist_view={}\nshow_hidden={}\nfolder_icon={}\nicon_size={}\nplaces={}\nsort={}\nsort_desc={}\n",
+                "width={}\nheight={}\nmaximized={}\nsidebar={}\npreview={}\nfiles={}\nlist_view={}\nshow_hidden={}\nfolder_icon={}\nicon_size={}\nplaces={}\nsort={}\nsort_desc={}\n{}",
                 self.width,
                 self.height,
                 self.maximized as i32,
@@ -114,9 +122,61 @@ impl Config {
                 self.icon_size,
                 self.places_order.join(","),
                 self.sort.as_str(),
-                self.sort_desc as i32
+                self.sort_desc as i32,
+                pane_settings(self.show_sidebar, self.show_preview)
             ),
         );
+    }
+}
+
+/// The `show_sidebar=` / `show_preview=` lines of the settings file.
+fn pane_settings(sidebar: bool, preview: bool) -> String {
+    format!("show_sidebar={}\nshow_preview={}\n", sidebar as i32, preview as i32)
+}
+
+/// Reads one of the keys `pane_settings` writes; false for any other key. A value that
+/// is not a number leaves the setting as it was.
+fn read_pane_setting(sidebar: &mut bool, preview: &mut bool, key: &str, value: &str) -> bool {
+    let target = match key {
+        "show_sidebar" => sidebar,
+        "show_preview" => preview,
+        _ => return false,
+    };
+    if let Ok(n) = value.trim().parse::<i32>() {
+        *target = n != 0;
+    }
+    true
+}
+
+#[cfg(test)]
+mod pane_setting_tests {
+    use super::*;
+
+    fn parse(text: &str) -> (bool, bool) {
+        let (mut s, mut p) = (true, true);
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                read_pane_setting(&mut s, &mut p, k.trim(), v);
+            }
+        }
+        (s, p)
+    }
+
+    #[test]
+    fn round_trip() {
+        for flags in [(true, true), (false, true), (true, false), (false, false)] {
+            assert_eq!(parse(&pane_settings(flags.0, flags.1)), flags);
+        }
+    }
+
+    #[test]
+    fn defaults_and_bad_values() {
+        assert_eq!(parse("width=900\nsort=name\n"), (true, true));
+        assert_eq!(parse("show_sidebar=x\nshow_preview=\n"), (true, true));
+        assert_eq!(parse(" show_sidebar = 0 \nshow_preview=0"), (false, false));
+        let (mut s, mut p) = (true, true);
+        assert!(!read_pane_setting(&mut s, &mut p, "preview", "0"));
+        assert!((s, p) == (true, true));
     }
 }
 
