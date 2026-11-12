@@ -136,6 +136,8 @@ Settings, pins and stars are stored in `~/.config/rfiles/`.
 
 ## Build manually
 
+Needs Rust 1.92 or newer (Ubuntu's `cargo` package is older; use [rustup](https://rustup.rs)).
+
 ```bash
 sudo apt install libgtk-4-dev libpoppler-glib-dev build-essential pkg-config
 cargo build --release

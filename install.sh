@@ -56,13 +56,59 @@ echo "==> Installing build dependencies (needs your password)"
 sudo apt-get update -qq
 sudo apt-get install -y libgtk-4-dev libpoppler-glib-dev build-essential pkg-config curl
 
-if ! command -v cargo >/dev/null 2>&1; then
-    if [[ -x "$HOME/.cargo/bin/cargo" ]]; then
-        export PATH="$HOME/.cargo/bin:$PATH"
-    else
+# Puts rustup's cargo (in ~/.cargo/bin) first on PATH, installing rustup if needed.
+use_rustup_cargo() {
+    if [[ ! -x "$HOME/.cargo/bin/cargo" ]]; then
         echo "==> Installing Rust (rustup)"
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        export PATH="$HOME/.cargo/bin:$PATH"
+        # Skips the installer's warning about a distribution Rust in /usr/bin.
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | RUSTUP_INIT_SKIP_PATH_CHECK=yes sh -s -- -y
+    fi
+    export PATH="$HOME/.cargo/bin:$PATH"
+}
+
+# version_at_least HAVE NEED: succeeds when version HAVE >= NEED.
+# Compares major.minor.patch numerically; missing parts count as 0 and
+# suffixes such as "-nightly" are ignored.
+version_at_least() {
+    local -a have need
+    IFS=. read -r -a have <<< "${1%%[!0-9.]*}"
+    IFS=. read -r -a need <<< "${2%%[!0-9.]*}"
+    local i a b
+    for i in 0 1 2; do
+        a=$((10#${have[i]:-0})) b=$((10#${need[i]:-0}))
+        if ((a > b)); then return 0; fi
+        if ((a < b)); then return 1; fi
+    done
+    return 0
+}
+
+# The installed Rust version, e.g. "1.75.0" (empty if it can't be read).
+rust_version() {
+    local out
+    out="$(rustc --version 2>/dev/null || cargo --version 2>/dev/null || true)"
+    if [[ "$out" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+if ! command -v cargo >/dev/null 2>&1; then
+    use_rustup_cargo
+fi
+
+# The minimum Rust version lives in Cargo.toml (rust-version = "...").
+MIN_RUST="$(sed -n 's/^rust-version *= *"\([0-9.]*\)".*/\1/p' Cargo.toml)"
+HAVE_RUST="$(rust_version)"
+if [[ -n "$MIN_RUST" && -n "$HAVE_RUST" ]] && ! version_at_least "$HAVE_RUST" "$MIN_RUST"; then
+    if ! command -v rustup >/dev/null 2>&1; then
+        echo "==> RFiles needs Rust $MIN_RUST or newer, but the cargo found is Rust $HAVE_RUST (likely the distribution package)."
+        echo "    Using a current Rust from rustup in ~/.cargo instead; the system package is left alone."
+        use_rustup_cargo
+        HAVE_RUST="$(rust_version)"
+    fi
+    if [[ -n "$HAVE_RUST" ]] && ! version_at_least "$HAVE_RUST" "$MIN_RUST"; then
+        echo "RFiles needs Rust $MIN_RUST or newer, but this computer has Rust $HAVE_RUST."
+        echo "Update it with \"rustup update stable\", then run ./install.sh again."
+        exit 1
     fi
 fi
 
