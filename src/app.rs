@@ -1057,7 +1057,9 @@ impl App {
                     }
                     return glib::Propagation::Stop;
                 }
+                let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
                 let action = match key {
+                    gdk::Key::Delete if shift && !ctrl && !alt => "delete-permanently",
                     gdk::Key::Delete if !ctrl && !alt => "trash",
                     gdk::Key::F2 => "rename",
                     gdk::Key::BackSpace if !ctrl && !alt => "back",
@@ -1405,7 +1407,11 @@ impl App {
         if trash {
             m.push(mi("Delete Permanently", "win.trash", "Delete"));
         } else {
+            if self.in_recent() {
+                m.push(mi("Remove from Recent", "win.forget-recent", ""));
+            }
             m.push(mi("Move to Trash", "win.trash", "Delete"));
+            m.push(mi("Delete Permanently…", "win.delete-permanently", "Shift+Delete"));
         }
         m.push(None);
         m.push(mi("Properties", "win.properties", "Alt+Enter"));
@@ -2998,57 +3004,48 @@ impl App {
         entry.select_region(0, select as i32);
     }
 
-    fn delete_selected(self: &Rc<Self>) {
-        let infos = self.selected_infos();
-        if infos.is_empty() {
-            return;
-        }
-        let files: Vec<gio::File> = infos
+    fn in_recent(&self) -> bool {
+        self.current_dir().is_some_and(|d| d.uri().starts_with("recent:"))
+    }
+
+    /// Moves the selection to the trash, or deletes it permanently after asking (always so in the trash).
+    fn delete_selected(self: &Rc<Self>, permanent: bool) {
+        let recent = self.in_recent();
+        let items: Vec<(gio::File, String)> = self
+            .selected_infos()
             .iter()
             .map(|i| {
-                i.attribute_object("standard::file")
-                    .and_downcast::<gio::File>()
-                    .unwrap_or_else(|| item_file(i))
+                // In Recent the real file, not its recent:/// entry. Elsewhere the item itself: in the trash
+                // that is the trash:/// item, so GIO also drops its trash record.
+                let f = if recent {
+                    item_file(i)
+                } else {
+                    i.attribute_object("standard::file").and_downcast::<gio::File>().unwrap_or_else(|| item_file(i))
+                };
+                (f, i.display_name().to_string())
             })
             .collect();
-        if self.in_trash() {
-            let what = if infos.len() == 1 {
-                format!("“{}”", infos[0].display_name())
-            } else {
-                format!("{} items", infos.len())
-            };
-            let dlg = gtk::AlertDialog::builder()
-                .message(format!("Permanently delete {what}?"))
-                .detail("This can't be undone.")
-                .buttons(["Cancel", "Delete"])
-                .cancel_button(0)
-                .default_button(0)
-                .build();
-            let a = self.clone();
-            dlg.choose(Some(&self.window), None::<&gio::Cancellable>, move |r| {
-                if r == Ok(1) {
-                    for f in &files {
-                        if let Err(e) = delete_recursive(f) {
-                            a.status.set_text(&format!("Couldn't delete: {}", e.message()));
-                        }
-                    }
-                }
-            });
+        if permanent || self.in_trash() {
+            crate::trash::confirm_delete(self, items);
         } else {
-            let mut failed = None;
-            for f in &files {
-                if let Err(e) = f.trash(None::<&gio::Cancellable>) {
-                    failed = Some(e.message().to_string());
-                }
-            }
-            match failed {
-                Some(e) => self.status.set_text(&format!("Couldn't move to trash: {e}")),
-                None => self.status.set_text(&format!("Moved {} item(s) to the trash", files.len())),
-            }
-            if !matches!(self.current_loc(), Loc::Dir(_)) {
-                self.reload();
-            }
+            crate::trash::move_to_trash(self, items);
         }
+    }
+
+    /// Removes the selected entries from Recent, leaving the files alone.
+    fn forget_recent_selected(self: &Rc<Self>) {
+        if !self.in_recent() {
+            return;
+        }
+        let items: Vec<(gio::File, String)> = self
+            .selected_infos()
+            .iter()
+            .filter_map(|i| {
+                let f = i.attribute_object("standard::file").and_downcast::<gio::File>()?;
+                Some((f, i.display_name().to_string()))
+            })
+            .collect();
+        crate::trash::forget_recent(self, items);
     }
 
     /// Moves the selected trash items back to where they were deleted from.
@@ -3083,29 +3080,6 @@ impl App {
                 Ok(o) => a.status.set_text(&crate::trash::restore_message(&o)),
                 Err(_) => a.status.set_text("Restore failed"),
             }
-        });
-    }
-
-    fn empty_trash(self: &Rc<Self>) {
-        let dlg = gtk::AlertDialog::builder()
-            .message("Empty the trash?")
-            .detail("Everything in the trash will be permanently deleted.")
-            .buttons(["Cancel", "Empty Trash"])
-            .cancel_button(0)
-            .default_button(0)
-            .build();
-        let a = self.clone();
-        dlg.choose(Some(&self.window), None::<&gio::Cancellable>, move |r| {
-            if r != Ok(1) {
-                return;
-            }
-            let trash = gio::File::for_uri("trash:///");
-            if let Ok(en) = trash.enumerate_children("standard::name", gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, None::<&gio::Cancellable>) {
-                while let Ok(Some(info)) = en.next_file(None::<&gio::Cancellable>) {
-                    let _ = trash.child(info.name()).delete(None::<&gio::Cancellable>);
-                }
-            }
-            a.reload();
         });
     }
 
@@ -3406,8 +3380,10 @@ impl App {
             }
             crate::archive::extract_here(&a.status, paths);
         }));
-        add("trash", Box::new(|a| a.delete_selected()));
-        add("empty-trash", Box::new(|a| a.empty_trash()));
+        add("trash", Box::new(|a| a.delete_selected(false)));
+        add("delete-permanently", Box::new(|a| a.delete_selected(true)));
+        add("forget-recent", Box::new(|a| a.forget_recent_selected()));
+        add("empty-trash", Box::new(crate::trash::empty_trash));
         add("restore", Box::new(|a| a.restore_selected()));
         add("rename", Box::new(|a| {
             if a.in_trash() {
@@ -3866,18 +3842,6 @@ mod reveal_tests {
         assert_eq!(reveal_changes(false, false, "note", "Notes.txt"), (false, false));
         assert_eq!(reveal_changes(false, true, "zzz", "file~"), (true, true));
     }
-}
-
-fn delete_recursive(f: &gio::File) -> Result<(), glib::Error> {
-    if f.query_file_type(gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, None::<&gio::Cancellable>)
-        == gio::FileType::Directory
-    {
-        let en = f.enumerate_children("standard::name", gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, None::<&gio::Cancellable>)?;
-        while let Some(info) = en.next_file(None::<&gio::Cancellable>)? {
-            delete_recursive(&f.child(info.name()))?;
-        }
-    }
-    f.delete(None::<&gio::Cancellable>)
 }
 
 /// Why `name` can't be a new folder's name, if it can't. `child()` would read "a/b" or ".." as a path and
