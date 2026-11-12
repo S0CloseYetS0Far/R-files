@@ -3747,6 +3747,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Copy / cut / paste", "Ctrl+C / Ctrl+X / Ctrl+V"),
     ("Select several", "Ctrl+click, Shift+click, drag a box, Ctrl+A"),
     ("Rename / move to trash", "F2 (several selected = batch rename) / Delete"),
+    ("Delete permanently", "Shift+Delete (asks first)"),
     ("Properties", "Alt+Enter or Ctrl+I"),
     ("Drag to copy / move", "Hold Ctrl to copy, Shift to move"),
     ("New folder", "Ctrl+Shift+N"),
