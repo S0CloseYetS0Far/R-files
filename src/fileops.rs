@@ -202,40 +202,70 @@ pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: Arc<A
     out
 }
 
+/// Directory flags for a terminal we know by file name. Servers like gnome-terminal, ptyxis and kgx hand the
+/// window to an already-running process, so the client's working directory alone would be lost.
+fn terminal_dir_args(name: &str, d: &str) -> Option<Vec<String>> {
+    // Debian ships e.g. gnome-terminal.wrapper behind the alternative
+    let name = name.strip_suffix(".wrapper").unwrap_or(name);
+    Some(match name {
+        "ptyxis" => vec!["--new-window".into(), "--working-directory".into(), d.into()],
+        "gnome-terminal" | "kgx" | "xfce4-terminal" | "foot" => vec![format!("--working-directory={d}")],
+        "konsole" => vec!["--workdir".into(), d.into()],
+        "tilix" => vec!["-w".into(), d.into()],
+        "kitty" => vec!["--directory".into(), d.into()],
+        "alacritty" => vec!["--working-directory".into(), d.into()],
+        "wezterm" => vec!["start".into(), "--cwd".into(), d.into()],
+        _ => return None,
+    })
+}
+
+/// Ordered (program, args) to try for opening a terminal in `d` (an absolute path): the user's choice first
+/// (`xdg-terminal-exec`, then `x-terminal-emulator`), then the known list. `installed` says whether a program
+/// is in PATH; `alt_target` is what `x-terminal-emulator` resolves to.
+fn terminal_candidates(
+    d: &str,
+    installed: &dyn Fn(&str) -> bool,
+    alt_target: Option<&Path>,
+) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    // No directory flag here: it starts the terminal in the working directory of the process
+    if installed("xdg-terminal-exec") {
+        out.push(("xdg-terminal-exec".into(), vec![]));
+    }
+    if installed("x-terminal-emulator") {
+        let name = alt_target.and_then(|t| t.file_name()).and_then(|n| n.to_str());
+        let known = name.and_then(|n| terminal_dir_args(n, d));
+        out.push(("x-terminal-emulator".into(), known.unwrap_or_default()));
+    }
+    for name in [
+        "ptyxis", "gnome-terminal", "kgx", "konsole", "xfce4-terminal", "tilix", "kitty", "alacritty", "wezterm",
+        "foot",
+    ] {
+        if installed(name) {
+            out.push((name.into(), terminal_dir_args(name, d).unwrap_or_default()));
+        }
+    }
+    if installed("xterm") {
+        out.push(("xterm".into(), vec![]));
+    }
+    out
+}
+
 /// Opens the user's terminal in `dir`.
 pub fn open_terminal(dir: &Path) -> Result<(), String> {
+    // Absolute, so the flags still point at the folder and a leading "-" can't look like an option
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     let d = dir.to_string_lossy().into_owned();
-    // (program, args) — the working directory is also set on the process,
-    // which is enough for terminals not listed here.
-    let candidates: Vec<(&str, Vec<String>)> = vec![
-        ("ptyxis", vec!["--new-window".into(), "--working-directory".into(), d.clone()]),
-        ("gnome-terminal", vec![format!("--working-directory={d}")]),
-        ("kgx", vec![format!("--working-directory={d}")]),
-        ("konsole", vec!["--workdir".into(), d.clone()]),
-        ("xfce4-terminal", vec![format!("--working-directory={d}")]),
-        ("tilix", vec!["-w".into(), d.clone()]),
-        ("kitty", vec!["--directory".into(), d.clone()]),
-        ("alacritty", vec!["--working-directory".into(), d.clone()]),
-        ("wezterm", vec!["start".into(), "--cwd".into(), d.clone()]),
-        ("foot", vec![format!("--working-directory={d}")]),
-        ("x-terminal-emulator", vec![]),
-        ("xterm", vec![]),
-    ];
-    for (prog, args) in candidates {
-        if glib::find_program_in_path(prog).is_none() {
-            continue;
-        }
-        let mut cmd = std::process::Command::new(prog);
-        cmd.args(&args).current_dir(dir);
-        match cmd.spawn() {
-            Ok(mut child) => {
-                // Reap it when it exits so it doesn't linger as a zombie
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return Ok(());
-            }
-            Err(_) => continue,
+    let alt = glib::find_program_in_path("x-terminal-emulator").and_then(|p| std::fs::canonicalize(p).ok());
+    let installed = |prog: &str| glib::find_program_in_path(prog).is_some();
+    // The working directory is also set on the process, which is enough for terminals not listed here.
+    for (prog, args) in terminal_candidates(&d, &installed, alt.as_deref()) {
+        let mut cmd = std::process::Command::new(&prog);
+        cmd.args(&args).current_dir(&dir);
+        if let Ok(child) = cmd.spawn() {
+            // GLib reaps it when it exits (no zombie, no parked thread per terminal)
+            glib::child_watch_add(glib::Pid(child.id() as i32), |_, _| {});
+            return Ok(());
         }
     }
     Err("No terminal app found".into())
@@ -245,6 +275,40 @@ pub fn open_terminal(dir: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn terminal_order_and_flags() {
+        let all = |_: &str| true;
+        let c = terminal_candidates("/home/u/My Docs", &all, Some(Path::new("/usr/bin/gnome-terminal.wrapper")));
+        let names: Vec<&str> = c.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names[..3], ["xdg-terminal-exec", "x-terminal-emulator", "ptyxis"]);
+        assert_eq!(names.last(), Some(&"xterm"));
+        assert!(c[0].1.is_empty());
+        // folder with spaces stays one argument; the alternative's target picks the flags
+        assert_eq!(c[1].1, ["--working-directory=/home/u/My Docs"]);
+        assert_eq!(c[2].1, ["--new-window", "--working-directory", "/home/u/My Docs"]);
+
+        let only = |n: &str| n == "x-terminal-emulator";
+        let c = terminal_candidates("/x", &only, Some(Path::new("/usr/bin/ptyxis")));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].1, ["--new-window", "--working-directory", "/x"]);
+        // unknown target: no flags, the working directory has to do
+        let c = terminal_candidates("/x", &only, Some(Path::new("/opt/odd-term")));
+        assert!(c[0].1.is_empty());
+        assert!(terminal_candidates("/x", &|_| false, None).is_empty());
+    }
+
+    #[test]
+    fn terminal_dash_folder_is_a_value() {
+        let c = terminal_candidates("-weird dir", &|_| true, None);
+        for (p, args) in &c {
+            if let Some(i) = args.iter().position(|a| a == "-weird dir") {
+                assert!(i > 0 && args[i - 1].starts_with('-'), "{p}: {args:?}");
+            }
+        }
+        assert!(c.iter().any(|(p, a)| p == "kitty" && a == &["--directory", "-weird dir"]));
+        assert!(c.iter().any(|(p, a)| p == "gnome-terminal" && a == &["--working-directory=-weird dir"]));
+    }
 
     fn mtime(p: &Path) -> SystemTime {
         p.symlink_metadata().unwrap().modified().unwrap()
