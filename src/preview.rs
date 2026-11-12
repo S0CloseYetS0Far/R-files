@@ -13,6 +13,8 @@ use std::rc::Rc;
 
 const TEXT_LIMIT: usize = 256 * 1024;
 const IMAGE_MAX: i32 = 2048;
+/// Touchpad scroll distance, in pixels, that turns one PDF page.
+const PDF_SCROLL_PX: f64 = 100.0;
 
 pub struct Preview {
     pub root: gtk::Box,
@@ -432,12 +434,17 @@ impl Preview {
         prev.connect_clicked(move |_| g1(-1));
         let g2 = go.clone();
         next.connect_clicked(move |_| g2(1));
+        // A touchpad sends many small deltas per swipe, so add them up and turn a page only per full step
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
-        scroll.connect_scroll(move |_, _, dy| {
-            if dy > 0.0 {
-                go(1)
-            } else if dy < 0.0 {
-                go(-1)
+        let acc = Rc::new(Cell::new(0.0));
+        let a = acc.clone();
+        scroll.connect_scroll_begin(move |_| a.set(0.0));
+        scroll.connect_scroll(move |c, _, dy| {
+            let step = if c.unit() == gdk::ScrollUnit::Surface { PDF_SCROLL_PX } else { 1.0 };
+            let (pages, rest) = scroll_pages(acc.get(), dy, step);
+            acc.set(rest);
+            if pages != 0 {
+                go(pages)
             }
             glib::Propagation::Stop
         });
@@ -516,6 +523,14 @@ fn read_text(path: &Path) -> Result<String, String> {
     Ok(s)
 }
 
+/// Adds a scroll delta to the running total and returns (whole pages to turn, what is left over).
+/// Turning back the other way drops what was gathered in the old direction.
+fn scroll_pages(acc: f64, dy: f64, step: f64) -> (i32, f64) {
+    let acc = if acc * dy < 0.0 { dy } else { acc + dy };
+    let pages = (acc / step).trunc();
+    (pages as i32, acc - pages * step)
+}
+
 fn text_view(text: &str, mono: bool) -> gtk::ScrolledWindow {
     let tv = gtk::TextView::new();
     tv.set_editable(false);
@@ -533,4 +548,39 @@ fn text_view(text: &str, mono: bool) -> gtk::ScrolledWindow {
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&tv)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_notch_turns_one_page() {
+        assert_eq!(scroll_pages(0.0, 1.0, 1.0), (1, 0.0));
+        assert_eq!(scroll_pages(0.0, -1.0, 1.0), (-1, 0.0));
+        assert_eq!(scroll_pages(0.0, 0.0, 1.0), (0, 0.0));
+    }
+
+    #[test]
+    fn small_deltas_add_up_to_one_page() {
+        let mut acc = 0.0;
+        let mut turned = 0;
+        for _ in 0..25 {
+            let (p, rest) = scroll_pages(acc, 4.0, PDF_SCROLL_PX);
+            turned += p;
+            acc = rest;
+        }
+        assert_eq!(turned, 1);
+        assert_eq!(acc, 0.0);
+        let (p, rest) = scroll_pages(0.0, 250.0, PDF_SCROLL_PX);
+        assert_eq!((p, rest), (2, 50.0));
+    }
+
+    #[test]
+    fn direction_change_drops_leftover() {
+        let (p, rest) = scroll_pages(90.0, -5.0, PDF_SCROLL_PX);
+        assert_eq!((p, rest), (0, -5.0));
+        let (p, rest) = scroll_pages(-0.5, 1.0, 1.0);
+        assert_eq!((p, rest), (1, 0.0));
+    }
 }
