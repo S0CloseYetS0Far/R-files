@@ -600,9 +600,95 @@ thread_local! {
     static OPEN: RefCell<Vec<Rc<App>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Screen-reader name for an icon-only button: the tooltip without its shortcut, "Back (Alt+Left)" -> "Back".
+fn accessible_name(tip: &str) -> &str {
+    tip.split(" (").next().unwrap_or(tip)
+}
+
+#[cfg(test)]
+mod accessible_name_tests {
+    use super::accessible_name;
+
+    #[test]
+    fn strips_the_shortcut() {
+        assert_eq!(accessible_name("Back (Alt+Left)"), "Back");
+        assert_eq!(accessible_name("List view (Ctrl+2) / grid view (Ctrl+1)"), "List view");
+        assert_eq!(accessible_name("Pin this folder"), "Pin this folder");
+    }
+}
+
+/// Arrow and Home/End keys on a focused tab.
+#[derive(Clone, Copy)]
+enum TabNav {
+    Left,
+    Right,
+    Home,
+    End,
+}
+
+/// Which tab gets focus after `key` on tab `focused` of `n`. Stops at the first tab; Right on the last tab
+/// returns `n`, meaning the + button.
+fn tab_focus_target(n: usize, focused: usize, key: TabNav) -> usize {
+    match key {
+        TabNav::Left => focused.saturating_sub(1),
+        TabNav::Right => (focused + 1).min(n),
+        TabNav::Home => 0,
+        TabNav::End => n.saturating_sub(1),
+    }
+}
+
+/// The current tab after closing tab `i` of `n` while `cur` was current (`n` is the count before closing).
+fn current_after_close(n: usize, cur: usize, i: usize) -> usize {
+    if i < cur {
+        cur - 1
+    } else if i == cur {
+        i.min(n - 2)
+    } else {
+        cur
+    }
+}
+
+#[cfg(test)]
+mod tab_focus_tests {
+    use super::*;
+
+    #[test]
+    fn arrows_stop_at_the_ends() {
+        assert_eq!(tab_focus_target(3, 1, TabNav::Left), 0);
+        assert_eq!(tab_focus_target(3, 0, TabNav::Left), 0);
+        assert_eq!(tab_focus_target(3, 1, TabNav::Right), 2);
+        assert_eq!(tab_focus_target(3, 2, TabNav::Right), 3); // the + button
+        assert_eq!(tab_focus_target(1, 0, TabNav::Right), 1);
+    }
+
+    #[test]
+    fn home_and_end() {
+        assert_eq!(tab_focus_target(4, 2, TabNav::Home), 0);
+        assert_eq!(tab_focus_target(4, 1, TabNav::End), 3);
+        assert_eq!(tab_focus_target(1, 0, TabNav::End), 0);
+    }
+
+    #[test]
+    fn current_after_closing() {
+        // closing the current tab: the one that slid into its place, or the new last one
+        assert_eq!(current_after_close(4, 1, 1), 1);
+        assert_eq!(current_after_close(4, 3, 3), 2);
+        assert_eq!(current_after_close(2, 0, 0), 0);
+        // closing an earlier tab shifts the current one down, a later one leaves it
+        assert_eq!(current_after_close(4, 2, 0), 1);
+        assert_eq!(current_after_close(4, 1, 3), 1);
+    }
+}
+
+fn set_tab_title(widget: &gtk::Box, label: &gtk::Label, title: &str) {
+    label.set_text(title);
+    widget.update_property(&[gtk::accessible::Property::Label(title)]);
+}
+
 fn icon_button(icon: &str, tip: &str) -> gtk::Button {
     let b = gtk::Button::from_icon_name(icon);
     b.set_tooltip_text(Some(tip));
+    b.update_property(&[gtk::accessible::Property::Label(accessible_name(tip))]);
     b.add_css_class("flat");
     b
 }
@@ -611,6 +697,7 @@ fn icon_toggle(icon: &str, tip: &str) -> gtk::ToggleButton {
     let b = gtk::ToggleButton::new();
     b.set_icon_name(icon);
     b.set_tooltip_text(Some(tip));
+    b.update_property(&[gtk::accessible::Property::Label(accessible_name(tip))]);
     b.add_css_class("flat");
     b
 }
@@ -650,9 +737,10 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     plus.add_css_class("flat");
     plus.add_css_class("new-tab");
     plus.set_tooltip_text(Some("New tab (Ctrl+T)"));
+    plus.update_property(&[gtk::accessible::Property::Label("New tab")]);
     plus.set_valign(gtk::Align::Center);
     plus.set_action_name(Some("win.new-tab"));
-    let tab_strip = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let tab_strip = gtk::Box::builder().spacing(4).accessible_role(gtk::AccessibleRole::TabList).build();
     tab_strip.append(&plus);
     let tab_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::External)
@@ -1763,7 +1851,7 @@ impl App {
         let (loc, can_back, can_fwd) = {
             let tabs = self.tabs.borrow();
             let t = &tabs[self.current.get()];
-            t.label.set_text(&t.loc.title());
+            set_tab_title(&t.widget, &t.label, &t.loc.title());
             t.icon.set_icon_name(Some(t.loc.icon()));
             t.widget.set_tooltip_text(Some(&match &t.loc {
                 Loc::Dir(f) => display_path(f),
@@ -1989,7 +2077,13 @@ impl App {
 
     // ================= tabs =================
     pub fn new_tab(self: &Rc<Self>, loc: Loc) {
-        let bx = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        // Focusable so the keyboard and screen readers can reach it; every tab is in the Tab order (no roving focus)
+        let bx = gtk::Box::builder()
+            .spacing(6)
+            .accessible_role(gtk::AccessibleRole::Tab)
+            .focusable(true)
+            .focus_on_click(false)
+            .build();
         bx.add_css_class("tab");
         let icon = gtk::Image::from_icon_name("folder-symbolic");
         let label = gtk::Label::builder()
@@ -2003,6 +2097,9 @@ impl App {
         close.add_css_class("tab-close");
         close.set_focus_on_click(false);
         close.set_tooltip_text(Some("Close tab (Ctrl+W)"));
+        close.update_property(&[gtk::accessible::Property::Label("Close tab")]);
+        // The keyboard closes a tab with Delete on the tab itself
+        close.set_focusable(false);
         bx.append(&icon);
         bx.append(&label);
         bx.append(&close);
@@ -2022,6 +2119,15 @@ impl App {
             }
         });
         bx.add_controller(g);
+        let keys = gtk::EventControllerKey::new();
+        let a = Rc::downgrade(self);
+        let w = bx.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            let (Some(a), Some(w)) = (a.upgrade(), w.upgrade()) else { return glib::Propagation::Proceed };
+            let Some(i) = a.tab_index(&w) else { return glib::Propagation::Proceed };
+            a.tab_key(i, key)
+        });
+        bx.add_controller(keys);
         let a = Rc::downgrade(self);
         let w = bx.downgrade();
         close.connect_clicked(move |_| {
@@ -2043,6 +2149,33 @@ impl App {
         self.show_tab(idx);
         let adj = self.tab_scroll.hadjustment();
         glib::idle_add_local_once(move || adj.set_value(adj.upper()));
+    }
+
+    /// Keys on a focused tab; returns Stop for the ones it handles.
+    fn tab_key(self: &Rc<Self>, i: usize, key: gdk::Key) -> glib::Propagation {
+        let nav = match key {
+            gdk::Key::Left | gdk::Key::KP_Left => Some(TabNav::Left),
+            gdk::Key::Right | gdk::Key::KP_Right => Some(TabNav::Right),
+            gdk::Key::Home | gdk::Key::KP_Home => Some(TabNav::Home),
+            gdk::Key::End | gdk::Key::KP_End => Some(TabNav::End),
+            _ => None,
+        };
+        if let Some(nav) = nav {
+            let n = self.tabs.borrow().len();
+            let to = tab_focus_target(n, i, nav);
+            if to >= n {
+                self.plus.grab_focus();
+            } else if let Some(t) = self.tabs.borrow().get(to) {
+                t.widget.grab_focus();
+            }
+            return glib::Propagation::Stop;
+        }
+        match key {
+            gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space => self.switch_to(i),
+            gdk::Key::Delete | gdk::Key::KP_Delete => self.close_tab(i),
+            _ => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
     }
 
     fn tab_index(&self, w: &gtk::Box) -> Option<usize> {
@@ -2071,6 +2204,7 @@ impl App {
                 } else {
                     t.widget.remove_css_class("active");
                 }
+                t.widget.update_state(&[gtk::accessible::State::Selected(Some(j == i))]);
                 t.close.set_visible(many);
             }
         }
@@ -2081,24 +2215,24 @@ impl App {
     fn close_tab(self: &Rc<Self>, i: usize) {
         // Before the indexes shift; harmless when the closed tab is the current one
         self.save_view();
-        let new_cur = {
+        let (new_cur, had_focus) = {
             let mut tabs = self.tabs.borrow_mut();
             let n = tabs.len();
             if n <= 1 || i >= n {
                 return;
             }
             let t = tabs.remove(i);
+            let had_focus = t.widget.has_focus();
             self.tab_strip.remove(&t.widget);
-            let cur = self.current.get();
-            if i < cur {
-                cur - 1
-            } else if i == cur {
-                i.min(n - 2)
-            } else {
-                cur
-            }
+            (current_after_close(n, self.current.get(), i), had_focus)
         };
         self.show_tab(new_cur);
+        // Keep keyboard focus in the strip, on the tab that became current
+        if had_focus {
+            if let Some(t) = self.tabs.borrow().get(new_cur) {
+                t.widget.grab_focus();
+            }
+        }
     }
 
     fn cycle_tab(self: &Rc<Self>, delta: i32) {
@@ -2578,7 +2712,7 @@ impl App {
             let old = std::mem::replace(&mut t.loc, Loc::Dir(home()));
             t.back.push((old, t.view.take()));
             t.fwd.clear();
-            t.label.set_text(&t.loc.title());
+            set_tab_title(&t.widget, &t.label, &t.loc.title());
             t.icon.set_icon_name(Some(t.loc.icon()));
             t.widget.set_tooltip_text(Some(&display_path(&home())));
         }
@@ -3857,6 +3991,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("New window", "Ctrl+N"),
     ("Quit", "Ctrl+Q"),
     ("Switch tabs", "Ctrl+PageDown / Ctrl+PageUp"),
+    ("Tab keys (tab focused)", "Left / Right / Home / End move, Enter or Space opens, Delete closes"),
     ("Preview / open", "Click / double-click or Enter"),
     ("Copy / cut / paste", "Ctrl+C / Ctrl+X / Ctrl+V"),
     ("Select several", "Ctrl+click, Shift+click, drag a box, Ctrl+A"),
