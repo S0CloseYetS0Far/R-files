@@ -22,6 +22,9 @@ const PDF_MAX_PX: f64 = 4096.0;
 /// How long the pane size must stay put before the page is rendered again at the new size.
 const PDF_SETTLE: Duration = Duration::from_millis(150);
 
+/// Called with the previewed file when its Open button is pressed.
+pub type OpenHandler = Rc<dyn Fn(&gio::FileInfo)>;
+
 pub struct Preview {
     pub root: gtk::Box,
     body: gtk::Box,
@@ -31,7 +34,7 @@ pub struct Preview {
     gen: Cell<u64>,
     media: RefCell<Option<gtk::Video>>,
     current: RefCell<Option<gio::FileInfo>>,
-    pub on_open: RefCell<Option<Rc<dyn Fn(&gio::FileInfo)>>>,
+    pub on_open: RefCell<Option<OpenHandler>>,
 }
 
 impl Preview {

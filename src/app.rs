@@ -3454,7 +3454,8 @@ impl App {
 
     // ================= actions & signals =================
     fn setup_actions(self: &Rc<Self>, gapp: &gtk::Application) {
-        let add = |name: &str, f: Box<dyn Fn(&Rc<App>)>| {
+        type Handler = Box<dyn Fn(&Rc<App>)>;
+        let add = |name: &str, f: Handler| {
             let act = gio::SimpleAction::new(name, None);
             let a = Rc::downgrade(self);
             act.connect_activate(move |_, _| {
