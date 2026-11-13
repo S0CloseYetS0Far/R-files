@@ -1,5 +1,7 @@
 # RFiles
 
+[![CI](https://github.com/S0CloseYetS0Far/R-files/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/S0CloseYetS0Far/R-files/actions/workflows/ci.yml)
+
 A fast, lightweight file manager for Ubuntu, written in Rust with GTK4.
 Pitch-black file area, browser-style tabs, and a big live preview pane:
 click once on any file or folder to see it on the right.
