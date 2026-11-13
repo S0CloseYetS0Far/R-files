@@ -128,7 +128,7 @@ Keep GNOME Files installed; Ubuntu uses it in a few places. To switch back:
 | New folder | Ctrl+Shift+N |
 | Pin / unpin this folder | pin button or Ctrl+D |
 | Open in terminal | Ctrl+Alt+T |
-| Search / path bar | Ctrl+F / Ctrl+L (`~` works) |
+| Search / path bar | Ctrl+F / Ctrl+L (`~` works; Tab completes folder names, Esc cancels) |
 | Back / forward / up | Alt+Left / Alt+Right / Alt+Up |
 | Hidden files | Ctrl+H |
 | Grid / list view | Ctrl+1 / Ctrl+2 |

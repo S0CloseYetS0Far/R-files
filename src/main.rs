@@ -7,6 +7,7 @@ mod dnd;
 mod docs;
 mod fileops;
 mod gpu;
+mod pathbar;
 mod preview;
 mod properties;
 mod thumbs;
