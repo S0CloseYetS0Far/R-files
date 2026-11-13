@@ -7,7 +7,7 @@ use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 const SEARCH_MAX_RESULTS: usize = 2000;
@@ -554,6 +554,8 @@ pub struct App {
     pin_btn: gtk::Button,
     search: gtk::SearchEntry,
     pub(crate) status: gtk::Label,
+    /// One progress row per running copy / move, above the status bar
+    pub(crate) transfers: gtk::Box,
     view_stack: gtk::Stack,
     grid: gtk::GridView,
     list: gtk::ColumnView,
@@ -890,7 +892,9 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
 
     let files_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     files_box.add_css_class("files-area");
+    let transfers = gtk::Box::new(gtk::Orientation::Vertical, 0);
     files_box.append(&view_overlay);
+    files_box.append(&transfers);
     files_box.append(&status);
 
     // ---------- sidebar ----------
@@ -967,6 +971,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         pin_btn,
         search,
         status,
+        transfers,
         view_stack,
         grid,
         list,
@@ -3041,54 +3046,12 @@ impl App {
                 a.status.set_text("Nothing to paste — copy or cut some files first");
                 return;
             };
-            let srcs: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
-            // Items with no local path (the trash) are copied through GIO; moving them out is Restore's job
-            let remote = srcs.len() < files.len();
-            if remote && cut {
-                a.status.set_text("Can only move local files");
-                return;
-            }
-            let n = files.len();
-            let verb = if cut { "Moving" } else { "Copying" };
-            a.status.set_text(&format!("{verb} {n} item(s)…"));
-            let progress = Arc::new(AtomicU64::new(0));
-            let (p2, a2) = (progress.clone(), a.clone());
-            let timer = glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
-                let done = p2.load(AtomicOrdering::Relaxed);
-                a2.status.set_text(&format!("{verb} {n} item(s)…  {}", glib::format_size(done)));
-                glib::ControlFlow::Continue
+            // Cleared after a complete move, so pasting again doesn't look for files that are gone
+            fileops::start_transfer(&a, files, dest_path, cut, move |o, cancelled| {
+                if cut && o.errors.is_empty() && !cancelled {
+                    let _ = cb.set_content(None::<&gdk::ContentProvider>);
+                }
             });
-            let out = gio::spawn_blocking(move || {
-                if remote {
-                    crate::trash::copy_into(files, dest_path, progress)
-                } else {
-                    fileops::transfer(srcs, dest_path, cut, progress)
-                }
-            })
-            .await;
-            timer.remove();
-            match out {
-                Ok(o) => {
-                    if cut && o.errors.is_empty() {
-                        let _ = cb.set_content(None::<&gdk::ContentProvider>);
-                    }
-                    let verb = if cut { "Moved" } else { "Pasted" };
-                    if o.errors.is_empty() {
-                        a.status.set_text(&format!("{verb} {} item(s)", o.done));
-                    } else {
-                        a.status.set_text(&format!(
-                            "{verb} {}, {} failed — {}",
-                            o.done,
-                            o.errors.len(),
-                            o.errors[0]
-                        ));
-                    }
-                }
-                Err(_) => a.status.set_text("Paste failed"),
-            }
-            if !matches!(a.current_loc(), Loc::Dir(_)) {
-                a.reload();
-            }
         });
     }
 

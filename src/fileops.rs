@@ -3,11 +3,13 @@
 //! The clipboard uses the same format as GNOME Files (Nautilus), so you can
 //! copy in one app and paste in the other.
 
+use crate::app::{App, Loc};
 use gtk::prelude::*;
-use gtk::{gdk, gio, glib};
-use std::io;
+use gtk::{gdk, gio, glib, pango};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 const GNOME_MIME: &str = "x-special/gnome-copied-files";
@@ -121,9 +123,101 @@ mod free_name_tests {
     }
 }
 
+/// Shared between a copy / move job's worker and its progress row.
+#[derive(Default)]
+pub struct CopyProgress {
+    /// Bytes copied so far
+    pub done: Arc<AtomicU64>,
+    /// Bytes to copy, once `counted` is set; 0 when unknown
+    pub total: AtomicU64,
+    pub counted: AtomicBool,
+    /// Set by the Cancel button
+    pub cancel: AtomicBool,
+    /// Set by the worker when it stopped early because of `cancel`
+    pub stopped: AtomicBool,
+    /// Tests: acts as if Cancel was pressed once this many bytes are done (0: never)
+    #[cfg(test)]
+    cancel_at: AtomicU64,
+}
+
+impl CopyProgress {
+    fn check(&self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let at = self.cancel_at.load(Ordering::Relaxed);
+            if at > 0 && self.done.load(Ordering::Relaxed) >= at {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Bytes of regular files under `p` (symlinks not followed). Unreadable parts count as 0; stops early on cancel.
+fn tree_size(p: &Path, progress: &CopyProgress) -> u64 {
+    let Ok(md) = p.symlink_metadata() else { return 0 };
+    if md.is_file() {
+        return md.len();
+    }
+    if !md.is_dir() {
+        return 0;
+    }
+    let Ok(rd) = std::fs::read_dir(p) else { return 0 };
+    let mut sum = 0;
+    for e in rd.flatten() {
+        if progress.check().is_err() {
+            break;
+        }
+        sum += tree_size(&e.path(), progress);
+    }
+    sum
+}
+
+/// Read / write size per step: big enough to be fast, small enough that progress moves and Cancel is quick.
+const CHUNK: u64 = 4 << 20;
+
+/// Copies one regular file in `chunk`-byte steps, adding to `progress.done` and checking for cancel between steps.
+/// Never overwrites: the copy is created with `create_new`. On any failure, cancel included, the partly written
+/// copy is removed.
+fn copy_file_chunked(
+    src: &Path,
+    dst: &Path,
+    md: &std::fs::Metadata,
+    progress: &CopyProgress,
+    chunk: u64,
+) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut from = std::fs::File::open(src)?;
+    // Private until the copy is complete; the original's mode is set at the end, as `std::fs::copy` does
+    let mut to = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dst)?;
+    let res = (|| {
+        loop {
+            progress.check()?;
+            // `io::copy` between files uses copy_file_range where it can, so this stays fast
+            let n = io::copy(&mut (&mut from).take(chunk), &mut to)?;
+            progress.done.fetch_add(n, Ordering::Relaxed);
+            // A short step is the end of the file; stopping here means Cancel can't drop a finished copy
+            if n < chunk {
+                break;
+            }
+        }
+        to.set_permissions(md.permissions())
+    })();
+    drop(to);
+    if res.is_err() {
+        let _ = std::fs::remove_file(dst);
+    }
+    res
+}
+
 /// Copies `src` to `dst`. Pipes, sockets and devices are left out and counted in `skipped`: reading a
 /// pipe blocks until something writes to it, and a device like /dev/zero never ends.
-fn copy_recursive(src: &Path, dst: &Path, done: &AtomicU64, skipped: &mut usize) -> io::Result<()> {
+fn copy_recursive(src: &Path, dst: &Path, progress: &CopyProgress, skipped: &mut usize) -> io::Result<()> {
+    progress.check()?;
     let md = src.symlink_metadata()?;
     let ft = md.file_type();
     if ft.is_symlink() {
@@ -132,19 +226,98 @@ fn copy_recursive(src: &Path, dst: &Path, done: &AtomicU64, skipped: &mut usize)
         std::fs::create_dir(dst)?;
         for e in std::fs::read_dir(src)? {
             let e = e?;
-            copy_recursive(&e.path(), &dst.join(e.file_name()), done, skipped)?;
+            copy_recursive(&e.path(), &dst.join(e.file_name()), progress, skipped)?;
         }
         let _ = std::fs::set_permissions(dst, md.permissions());
         // Last, so creating the children doesn't bump the folder's date again
         keep_times(dst, &md);
     } else if ft.is_file() {
-        std::fs::copy(src, dst)?;
+        copy_file_chunked(src, dst, &md, progress, CHUNK)?;
         keep_times(dst, &md);
-        done.fetch_add(md.len(), Ordering::Relaxed);
     } else {
         *skipped += 1;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod chunked_copy_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, SystemTime};
+
+    fn base(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rfiles-chunked-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    #[test]
+    fn copy_equals_source_around_chunk_boundary() {
+        let d = base("sizes");
+        let c = 4096u64;
+        for len in [0, 1, c - 1, c, c + 1, 3 * c + 7] {
+            let (src, dst) = (d.join(format!("s{len}")), d.join(format!("d{len}")));
+            std::fs::write(&src, bytes(len as usize)).unwrap();
+            let p = CopyProgress::default();
+            copy_file_chunked(&src, &dst, &src.metadata().unwrap(), &p, c).unwrap();
+            assert_eq!(std::fs::read(&dst).unwrap(), bytes(len as usize), "size {len}");
+            assert_eq!(p.done.load(Ordering::Relaxed), len);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn keeps_permissions_times_and_symlinks() {
+        let d = base("meta");
+        let (src, dest) = (d.join("src"), d.join("dest"));
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let (f, ro) = (src.join("sub/script.sh"), src.join("ro.txt"));
+        std::fs::write(&f, bytes(CHUNK as usize + 1)).unwrap();
+        std::fs::write(&ro, b"ro").unwrap();
+        std::os::unix::fs::symlink("sub/script.sh", src.join("link")).unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::new(1_000_000_000, 5);
+        std::fs::File::open(&f).unwrap().set_modified(old).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(src.join("sub"), std::fs::Permissions::from_mode(0o711)).unwrap();
+
+        let out = transfer(vec![src.clone()], dest.clone(), false, &CopyProgress::default());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let copy = dest.join("src");
+        let mode = |p: &Path| p.symlink_metadata().unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&copy.join("sub/script.sh")), 0o750);
+        assert_eq!(mode(&copy.join("ro.txt")), 0o444);
+        assert_eq!(mode(&copy.join("sub")), 0o711);
+        assert_eq!(copy.join("sub/script.sh").metadata().unwrap().modified().unwrap(), old);
+        assert_eq!(std::fs::read(copy.join("sub/script.sh")).unwrap(), bytes(CHUNK as usize + 1));
+        assert!(copy.join("link").symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(copy.join("link")).unwrap(), Path::new("sub/script.sh"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn never_overwrites_an_existing_file() {
+        let d = base("exists");
+        let (src, dst) = (d.join("a.txt"), d.join("b.txt"));
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old").unwrap();
+        let err = copy_file_chunked(&src, &dst, &src.metadata().unwrap(), &CopyProgress::default(), CHUNK);
+        assert_eq!(err.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"old");
+        // Pasting next to the original picks a new name and leaves the original alone
+        let out = transfer(vec![src.clone()], d.clone(), false, &CopyProgress::default());
+        assert_eq!((out.done, out.errors.len()), (1, 0));
+        assert_eq!(std::fs::read(&src).unwrap(), b"new");
+        assert_eq!(std::fs::read(d.join("a (copy).txt")).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 /// The error line for an item that was copied without some special files.
@@ -183,10 +356,30 @@ pub struct Outcome {
     pub errors: Vec<String>,
 }
 
-/// Copies or moves `sources` into `dest`. Runs on a worker thread.
-pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: Arc<AtomicU64>) -> Outcome {
+/// Bytes that `transfer` will copy for `src`: none for a move on the same drive, which is a rename.
+fn bytes_to_copy(src: &Path, dest: &Path, cut: bool, progress: &CopyProgress) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    if cut {
+        let dev = |p: &Path| p.symlink_metadata().map(|m| m.dev()).ok();
+        if dev(src).is_some() && dev(src) == dev(dest) {
+            return 0;
+        }
+    }
+    tree_size(src, progress)
+}
+
+/// Copies or moves `sources` into `dest`. Runs on a worker thread. Counts the total first, then reports bytes in
+/// `progress`; on cancel it stops after removing the file being written and sets `progress.stopped`.
+pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: &CopyProgress) -> Outcome {
+    let total = sources.iter().map(|s| bytes_to_copy(s, &dest, cut, progress)).sum();
+    progress.total.store(total, Ordering::Relaxed);
+    progress.counted.store(true, Ordering::Relaxed);
     let mut out = Outcome { done: 0, errors: Vec::new() };
     for src in sources {
+        if progress.check().is_err() {
+            progress.stopped.store(true, Ordering::Relaxed);
+            break;
+        }
         let Some(name) = src.file_name() else { continue };
         let label = name.to_string_lossy().into_owned();
         if dest.starts_with(&src) {
@@ -202,9 +395,9 @@ pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: Arc<A
             match std::fs::rename(&src, &target) {
                 Ok(()) => Ok(()),
                 // Different drive: copy, then remove the original. If something was left out, the
-                // original is kept so nothing is lost.
+                // original is kept so nothing is lost; a cancelled copy fails here and keeps it too.
                 Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-                    copy_recursive(&src, &target, &progress, &mut skipped).and_then(|_| {
+                    copy_recursive(&src, &target, progress, &mut skipped).and_then(|_| {
                         if skipped > 0 {
                             Ok(())
                         } else if src.symlink_metadata()?.is_dir() {
@@ -217,7 +410,7 @@ pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: Arc<A
                 Err(e) => Err(e),
             }
         } else {
-            copy_recursive(&src, &target, &progress, &mut skipped)
+            copy_recursive(&src, &target, progress, &mut skipped)
         };
         match res {
             Ok(()) if skipped == 0 => out.done += 1,
@@ -226,10 +419,258 @@ pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: Arc<A
                 let top_level = target.symlink_metadata().is_err();
                 out.errors.push(skipped_msg(&label, skipped, top_level, cut));
             }
+            Err(_) if progress.cancel.load(Ordering::Relaxed) => {
+                progress.stopped.store(true, Ordering::Relaxed);
+                break;
+            }
             Err(e) => out.errors.push(format!("{label}: {e}")),
         }
     }
     out
+}
+
+fn items(n: usize) -> String {
+    if n == 1 { "1 item".into() } else { format!("{n} items") }
+}
+
+/// The progress row's text, e.g. "Copying 3 items… 42%  1.2 GB of 2.9 GB". `total` is None while counting.
+fn progress_text(cut: bool, n: usize, done: u64, total: Option<u64>) -> String {
+    let head = format!("{} {}…", if cut { "Moving" } else { "Copying" }, items(n));
+    match total {
+        None => head,
+        Some(0) if done == 0 => head,
+        Some(0) => format!("{head}  {}", glib::format_size(done)),
+        Some(t) => {
+            let pct = done.min(t) * 100 / t;
+            format!("{head} {pct}%  {} of {}", glib::format_size(done.min(t)), glib::format_size(t))
+        }
+    }
+}
+
+/// The status bar line once a job has ended.
+fn result_text(cut: bool, o: &Outcome, cancelled: bool) -> String {
+    let verb = if cut { "Moved" } else { "Copied" };
+    let mut s = if cancelled {
+        format!("Cancelled after {}", items(o.done))
+    } else if o.errors.is_empty() {
+        format!("{verb} {}", items(o.done))
+    } else {
+        format!("{verb} {}, {} failed — {}", o.done, o.errors.len(), o.errors[0])
+    };
+    if cancelled && !o.errors.is_empty() {
+        s += &format!(", {} failed — {}", o.errors.len(), o.errors[0]);
+    }
+    s
+}
+
+/// Copies or moves `files` into `dest` on a worker thread, with a progress row (text, bar, Cancel) above the
+/// status bar, then leaves the result in the status bar and calls `then` with it and whether it was cancelled.
+/// Used by paste and drag-and-drop.
+/// Items with no local path (the trash) are copied through GIO and can't be cancelled or moved.
+/// The window is held weakly and the application kept running until the job ends, so closing the window
+/// doesn't cut the copy short; it then just has no row to update.
+pub fn start_transfer(
+    app: &Rc<App>,
+    files: Vec<gio::File>,
+    dest: PathBuf,
+    cut: bool,
+    then: impl FnOnce(&Outcome, bool) + 'static,
+) {
+    let srcs: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
+    let remote = srcs.len() < files.len();
+    if remote && cut {
+        app.status.set_text("Can only move local files");
+        return;
+    }
+    let n = files.len();
+    let progress = Arc::new(CopyProgress::default());
+
+    let label = gtk::Label::new(Some(&progress_text(cut, n, 0, None)));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(pango::EllipsizeMode::End);
+    let bar = gtk::ProgressBar::new();
+    bar.set_valign(gtk::Align::Center);
+    bar.set_size_request(160, -1);
+    let cancel = gtk::Button::with_label("Cancel");
+    cancel.add_css_class("flat");
+    // The GIO copy out of the trash has no cancel point
+    cancel.set_sensitive(!remote);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.add_css_class("transfer-row");
+    row.append(&label);
+    row.append(&bar);
+    row.append(&cancel);
+    app.transfers.append(&row);
+
+    let p = progress.clone();
+    cancel.connect_clicked(move |b| {
+        p.cancel.store(true, Ordering::Relaxed);
+        b.set_sensitive(false);
+    });
+
+    // Ends itself when the job is done or the row is gone; never removed from outside
+    let finished = Arc::new(AtomicBool::new(false));
+    let (p, f, wl, wb) = (progress.clone(), finished.clone(), label.downgrade(), bar.downgrade());
+    glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+        let (Some(label), Some(bar)) = (wl.upgrade(), wb.upgrade()) else { return glib::ControlFlow::Break };
+        if f.load(Ordering::Relaxed) {
+            return glib::ControlFlow::Break;
+        }
+        let done = p.done.load(Ordering::Relaxed);
+        let total = p.counted.load(Ordering::Relaxed).then(|| p.total.load(Ordering::Relaxed));
+        label.set_text(&progress_text(cut, n, done, total));
+        match total {
+            Some(t) if t > 0 => bar.set_fraction(done.min(t) as f64 / t as f64),
+            _ => bar.pulse(),
+        }
+        glib::ControlFlow::Continue
+    });
+
+    let hold = app.window.application().map(|g| g.hold());
+    let weak = Rc::downgrade(app);
+    let wrow = row.downgrade();
+    glib::spawn_future_local(async move {
+        let p = progress.clone();
+        let out = gio::spawn_blocking(move || {
+            if remote {
+                p.counted.store(true, Ordering::Relaxed);
+                crate::trash::copy_into(files, dest, p.done.clone())
+            } else {
+                transfer(srcs, dest, cut, &p)
+            }
+        })
+        .await;
+        finished.store(true, Ordering::Relaxed);
+        drop(hold);
+        let cancelled = progress.stopped.load(Ordering::Relaxed);
+        if let Ok(o) = &out {
+            then(o, cancelled);
+        }
+        let Some(app) = weak.upgrade() else { return };
+        if let Some(row) = wrow.upgrade() {
+            app.transfers.remove(&row);
+        }
+        app.status.set_text(&match &out {
+            Ok(o) => result_text(cut, o, cancelled),
+            Err(_) => if cut { "Move failed" } else { "Copy failed" }.into(),
+        });
+        // Folder views update themselves; Starred / search results don't
+        if !matches!(app.current_loc(), Loc::Dir(_)) {
+            app.reload();
+        }
+    });
+}
+
+#[cfg(test)]
+mod transfer_cancel_tests {
+    use super::*;
+
+    fn base(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rfiles-cancel-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("dest")).unwrap();
+        d
+    }
+
+    #[test]
+    fn counts_the_total_first() {
+        let d = base("total");
+        let src = d.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a"), [0u8; 100]).unwrap();
+        std::fs::write(src.join("sub/b"), [0u8; 23]).unwrap();
+        std::fs::write(d.join("outside"), [0u8; 5000]).unwrap();
+        // Links aren't followed, so the file they point at doesn't count
+        std::os::unix::fs::symlink(d.join("outside"), src.join("link")).unwrap();
+        assert_eq!(tree_size(&src, &CopyProgress::default()), 123);
+
+        let p = CopyProgress::default();
+        let out = transfer(vec![src.clone(), d.join("outside")], d.join("dest"), false, &p);
+        assert_eq!((out.done, out.errors.len()), (2, 0));
+        assert!(p.counted.load(Ordering::Relaxed));
+        assert_eq!(p.total.load(Ordering::Relaxed), 5123);
+        assert_eq!(p.done.load(Ordering::Relaxed), 5123);
+        assert!(!p.stopped.load(Ordering::Relaxed));
+
+        // A move on the same drive is a rename: nothing to copy
+        let p = CopyProgress::default();
+        let out = transfer(vec![d.join("dest/outside")], d.clone(), true, &p);
+        assert_eq!(out.done, 1);
+        assert_eq!(p.total.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cancel_mid_file_removes_the_partial_copy() {
+        let d = base("mid");
+        let big = d.join("big.bin");
+        let data: Vec<u8> = (0..2 * CHUNK as usize + 5).map(|i| i as u8).collect();
+        std::fs::write(&big, &data).unwrap();
+        let p = CopyProgress { cancel_at: AtomicU64::new(1), ..Default::default() };
+        let out = transfer(vec![big.clone()], d.join("dest"), false, &p);
+        assert_eq!((out.done, out.errors.len()), (0, 0));
+        assert!(p.stopped.load(Ordering::Relaxed));
+        let done = p.done.load(Ordering::Relaxed);
+        assert!(done > 0 && done < data.len() as u64, "{done}");
+        assert!(d.join("dest/big.bin").symlink_metadata().is_err());
+        assert_eq!(std::fs::read(&big).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cancel_between_items_keeps_the_finished_ones() {
+        let d = base("between");
+        let (a, b) = (d.join("a.txt"), d.join("b.txt"));
+        std::fs::write(&a, b"0123456789").unwrap();
+        std::fs::write(&b, b"abcdefghij").unwrap();
+        let p = CopyProgress { cancel_at: AtomicU64::new(10), ..Default::default() };
+        let out = transfer(vec![a.clone(), b.clone()], d.join("dest"), false, &p);
+        assert_eq!((out.done, out.errors.len()), (1, 0));
+        assert!(p.stopped.load(Ordering::Relaxed));
+        assert_eq!(std::fs::read(d.join("dest/a.txt")).unwrap(), b"0123456789");
+        assert!(d.join("dest/b.txt").symlink_metadata().is_err());
+        assert!(a.exists() && b.exists());
+        assert_eq!(result_text(false, &out, true), "Cancelled after 1 item");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cancelled_move_keeps_the_sources() {
+        // Cancelled before the first item: nothing is renamed, copied or deleted
+        let d = base("move");
+        let src = d.join("folder");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f"), b"x").unwrap();
+        let p = CopyProgress::default();
+        p.cancel.store(true, Ordering::Relaxed);
+        let out = transfer(vec![src.clone()], d.join("dest"), true, &p);
+        assert_eq!(out.done, 0);
+        assert!(p.stopped.load(Ordering::Relaxed));
+        assert_eq!(std::fs::read(src.join("f")).unwrap(), b"x");
+        assert!(d.join("dest/folder").symlink_metadata().is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn row_and_result_texts() {
+        let gb = 1_000_000_000;
+        // glib puts a no-break space between number and unit
+        let progress_text = |cut, n, done, total| super::progress_text(cut, n, done, total).replace('\u{a0}', " ");
+        assert_eq!(progress_text(false, 3, 0, None), "Copying 3 items…");
+        assert_eq!(progress_text(true, 1, 0, Some(0)), "Moving 1 item…");
+        let text = "Copying 3 items… 41%  1.2 GB of 2.9 GB";
+        assert_eq!(progress_text(false, 3, 1_200_000_000, Some(2_900_000_000)), text);
+        // Never past 100%, even if files grew while being copied
+        assert_eq!(progress_text(false, 2, 3 * gb, Some(2 * gb)), "Copying 2 items… 100%  2.0 GB of 2.0 GB");
+        assert_eq!(progress_text(false, 2, 1_500_000, Some(0)), "Copying 2 items…  1.5 MB");
+        let o = Outcome { done: 2, errors: vec![] };
+        assert_eq!(result_text(true, &o, false), "Moved 2 items");
+        assert_eq!(result_text(false, &o, true), "Cancelled after 2 items");
+        let o = Outcome { done: 1, errors: vec!["x: denied".into()] };
+        assert_eq!(result_text(false, &o, false), "Copied 1, 1 failed — x: denied");
+        assert_eq!(result_text(false, &o, true), "Cancelled after 1 item, 1 failed — x: denied");
+    }
 }
 
 /// Directory flags for a terminal we know by file name. Servers like gnome-terminal, ptyxis and kgx hand the
@@ -370,7 +811,7 @@ mod tests {
         perms.set_readonly(true);
         std::fs::set_permissions(&ro, perms).unwrap();
 
-        let out = transfer(vec![src.clone()], dest.clone(), false, Arc::new(AtomicU64::new(0)));
+        let out = transfer(vec![src.clone()], dest.clone(), false, &CopyProgress::default());
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         let copy = dest.join("src");
         assert_eq!(mtime(&copy.join("photos/a.jpg")), old);
@@ -379,7 +820,7 @@ mod tests {
         assert_eq!(mtime(&copy), older);
 
         // A single file copied next to itself keeps its date too
-        let out = transfer(vec![file.clone()], sub.clone(), false, Arc::new(AtomicU64::new(0)));
+        let out = transfer(vec![file.clone()], sub.clone(), false, &CopyProgress::default());
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(mtime(&sub.join("a (copy).jpg")), old);
 
@@ -390,7 +831,7 @@ mod tests {
     fn transfer_with_timeout(sources: Vec<PathBuf>, dest: PathBuf, cut: bool) -> Outcome {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(transfer(sources, dest, cut, Arc::new(AtomicU64::new(0))));
+            let _ = tx.send(transfer(sources, dest, cut, &CopyProgress::default()));
         });
         rx.recv_timeout(Duration::from_secs(10)).expect("transfer blocked")
     }

@@ -72,6 +72,9 @@ columnview.files > header { background-color: #050505; }
 columnview.files > header > button { background: #050505; color: #8c8c8c; border-color: #1a1a1a; }
 .empty-view { color: #7a7a7a; font-size: 15px; }
 .statusbar { background: #080808; color: #808080; padding: 4px 12px; font-size: 12px; border-top: 1px solid #161616; }
+.transfer-row { background: #080808; color: #a8a8a8; padding: 0 4px 0 12px; font-size: 12px; }
+.transfer-row { border-top: 1px solid #161616; }
+.transfer-row button { min-height: 22px; padding: 0 8px; }
 
 /* ---------- preview ---------- */
 .preview { background-color: #050505; padding: 14px; border-left: 1px solid #1d1d1d; }
