@@ -7,7 +7,7 @@
 //!   folders (Trash = move to trash) and the "Pinned" header (pins folders).
 //! * Same drive → move, different drive → copy; Ctrl forces copy, Shift move.
 //!
-//! The copy / move itself runs on a worker thread via `fileops::transfer`.
+//! The copy / move itself runs on a worker thread via `fileops::start_transfer`.
 //! Handlers hold only weak references to the window and list items, so the
 //! recycled item widgets never keep anything alive.
 
@@ -20,8 +20,6 @@ use std::cell::RefCell;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// CSS class put on the widget under the pointer while it would accept a drop.
 const HOVER_CLASS: &str = "dnd-hover";
@@ -290,7 +288,8 @@ fn add_target(
                 if srcs.is_empty() {
                     return false;
                 }
-                run_transfer(&app, srcs, dir, cut);
+                let files = srcs.into_iter().map(gio::File::for_path).collect();
+                fileops::start_transfer(&app, files, dir, cut, |_, _| {});
             }
         }
         true
@@ -392,34 +391,6 @@ pub(crate) fn ignore_file_drags(reorder: &gtk::DropTarget) {
 }
 
 // ================= doing the work =================
-
-fn run_transfer(app: &Rc<App>, srcs: Vec<PathBuf>, dest: PathBuf, cut: bool) {
-    let n = srcs.len();
-    let verb = if cut { "Moving" } else { "Copying" };
-    app.status.set_text(&format!("{verb} {n} item(s)…"));
-    let progress = Arc::new(AtomicU64::new(0));
-    let p = progress.clone();
-    let status = app.status.clone();
-    let timer = glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
-        status.set_text(&format!("{verb} {n} item(s)…  {}", glib::format_size(p.load(Ordering::Relaxed))));
-        glib::ControlFlow::Continue
-    });
-    let app = app.clone();
-    glib::spawn_future_local(async move {
-        let out = gio::spawn_blocking(move || fileops::transfer(srcs, dest, cut, progress)).await;
-        timer.remove();
-        let verb = if cut { "Moved" } else { "Copied" };
-        app.status.set_text(&match out {
-            Ok(o) if o.errors.is_empty() => format!("{verb} {} item(s)", o.done),
-            Ok(o) => format!("{verb} {}, {} failed — {}", o.done, o.errors.len(), o.errors[0]),
-            Err(_) => "Drop failed".into(),
-        });
-        // Folder views update themselves; Starred / search results don't
-        if !matches!(app.current_loc(), Loc::Dir(_)) {
-            app.reload();
-        }
-    });
-}
 
 fn trash_files(app: &Rc<App>, paths: Vec<PathBuf>) {
     let items = paths
