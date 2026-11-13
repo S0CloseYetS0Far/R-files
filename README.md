@@ -117,6 +117,7 @@ Keep GNOME Files installed; Ubuntu uses it in a few places. To switch back:
 | New tab / close tab | **+** or Ctrl+T / × or Ctrl+W (middle-click works too) |
 | New window / quit | Ctrl+N / Ctrl+Q (quit closes every window) |
 | Switch tabs | Ctrl+PageDown / Ctrl+PageUp |
+| Tab keys (tab focused) | Left / Right / Home / End move between tabs, Enter or Space opens, Delete closes |
 | Preview / open | single-click / double-click or Enter (several selected: opens all, up to 20; the first folder here, other folders in new tabs) |
 | Copy / cut / paste | Ctrl+C / Ctrl+X / Ctrl+V |
 | Select several | Ctrl+click, Shift+click, drag a box, Ctrl+A |

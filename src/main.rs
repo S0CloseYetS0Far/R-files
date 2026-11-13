@@ -37,6 +37,7 @@ button.new-tab:hover { background: #262626; color: #ffffff; }
   min-height: 26px; border: 1px solid #222;
 }
 .tab:hover { background: #232323; color: #ddd; }
+.tab:focus-visible { outline: 2px solid #3584e4; outline-offset: 1px; }
 .tab.active { background: #2e2e2e; color: #ffffff; border-color: #3584e4; }
 button.tab-close { min-width: 22px; min-height: 22px; padding: 0; border-radius: 6px; }
 
