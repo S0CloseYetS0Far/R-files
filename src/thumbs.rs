@@ -479,9 +479,14 @@ fn helper_render(input: &Path, out: &Path, px: i32, mime: &str) -> bool {
 }
 
 /// Width and height of a helper's PNG when it is what `helper_render` writes: an 8-bit RGB or RGBA PNG of
-/// 1..=`px` pixels each way. Anything else is refused before the PNG decoder sees it.
+/// 1..=`px` pixels each way, complete up to IEND. Anything else is refused before the PNG decoder sees it.
 fn check_png(data: &[u8], px: i32) -> Option<(i32, i32)> {
     const SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    // Some libpng loaders accept a cut-off file and fill in the rest
+    const IEND: &[u8] = b"\0\0\0\0IEND\xae\x42\x60\x82";
+    if !data.ends_with(IEND) {
+        return None;
+    }
     // The first chunk must be a 13-byte IHDR
     let ihdr = data.strip_prefix(SIG)?.get(..8 + 13)?;
     if ihdr[..8] != [0, 0, 0, 13, b'I', b'H', b'D', b'R'] {
@@ -757,6 +762,8 @@ mod helper_tests {
         d.extend_from_slice(&w.to_be_bytes());
         d.extend_from_slice(&h.to_be_bytes());
         d.extend_from_slice(&[depth, color, 0, 0, 0]);
+        // CRC (not checked here), then the end marker
+        d.extend_from_slice(b"\0\0\0\0\0\0\0\0IEND\xae\x42\x60\x82");
         d
     }
 
@@ -773,6 +780,8 @@ mod helper_tests {
         assert_eq!(check_png(&png_header(64, 64, 8, 3), 128), None);
         // Truncated, not a PNG, IHDR not first
         assert_eq!(check_png(&png_header(64, 64, 8, 6)[..20], 128), None);
+        // Complete header but cut off before IEND
+        assert_eq!(check_png(&png_header(64, 64, 8, 6)[..37], 128), None);
         assert_eq!(check_png(b"GIF89a", 128), None);
         let mut d = png_header(64, 64, 8, 6);
         d[12..16].copy_from_slice(b"tEXt");
