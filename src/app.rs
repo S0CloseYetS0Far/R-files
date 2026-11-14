@@ -556,6 +556,8 @@ pub struct App {
     pub(crate) status: gtk::Label,
     /// One progress row per running copy / move, above the status bar
     pub(crate) transfers: gtk::Box,
+    /// The last operation's result, between the transfer rows and the status bar
+    banner: Rc<crate::banner::Banner>,
     view_stack: gtk::Stack,
     grid: gtk::GridView,
     list: gtk::ColumnView,
@@ -895,6 +897,8 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     let transfers = gtk::Box::new(gtk::Orientation::Vertical, 0);
     files_box.append(&view_overlay);
     files_box.append(&transfers);
+    let banner = crate::banner::Banner::new();
+    files_box.append(&banner.row);
     files_box.append(&status);
 
     // ---------- sidebar ----------
@@ -972,6 +976,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         search,
         status,
         transfers,
+        banner,
         view_stack,
         grid,
         list,
@@ -1174,6 +1179,10 @@ impl App {
                     if let Some(s) = s.upgrade() {
                         a.keyboard_menu(&s);
                     }
+                    return glib::Propagation::Stop;
+                }
+                // Escape first dismisses a result banner, then clears the selection
+                if key == gdk::Key::Escape && a.banner.dismiss() {
                     return glib::Propagation::Stop;
                 }
                 let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
@@ -2026,6 +2035,25 @@ impl App {
         self.update_status();
     }
 
+    /// Shows how an operation ended in the result banner, where it survives the next click. The status bar goes
+    /// back to the item counts, or shows the result itself while an earlier error is kept in the banner.
+    pub(crate) fn notify(&self, n: crate::banner::Notice) {
+        self.update_status();
+        if let Some(n) = self.banner.show(n) {
+            self.status.set_text(&n.text);
+        }
+    }
+
+    /// `notify` for code that has no `App`, holding the window weakly.
+    fn notifier(self: &Rc<Self>) -> crate::archive::Notify {
+        let w = Rc::downgrade(self);
+        Rc::new(move |n| {
+            if let Some(a) = w.upgrade() {
+                a.notify(n);
+            }
+        })
+    }
+
     fn update_status(&self) {
         let n = self.selection.n_items();
         let mut s = format!("{n} item{}", if n == 1 { "" } else { "s" });
@@ -2634,7 +2662,10 @@ impl App {
                 },
                 // The user cancelled the password prompt
                 Err(e) if e.matches(gio::IOErrorEnum::FailedHandled) => a.update_status(),
-                Err(e) => a.status.set_text(&format!("Couldn't mount “{name}”: {}", e.message())),
+                Err(e) => a.notify(crate::banner::Notice {
+                    text: format!("Couldn't mount “{name}”: {}", e.message()),
+                    errors: vec![e.message().to_string()],
+                }),
             }
         });
     }
@@ -2691,8 +2722,11 @@ impl App {
             match r {
                 // The user dismissed the "still in use" dialog
                 Err(e) if e.matches(gio::IOErrorEnum::FailedHandled) => a.update_status(),
-                Err(e) => a.status.set_text(&eject_message(&name, eject, Some(e.message()))),
-                Ok(()) => a.status.set_text(&eject_message(&name, eject, None)),
+                Err(e) => a.notify(crate::banner::Notice {
+                    text: eject_message(&name, eject, Some(e.message())),
+                    errors: vec![e.message().to_string()],
+                }),
+                Ok(()) => a.notify(crate::banner::Notice::ok(eject_message(&name, eject, None))),
             }
         };
         let flags = gio::MountUnmountFlags::NONE;
@@ -3199,8 +3233,8 @@ impl App {
         let a = self.clone();
         glib::spawn_future_local(async move {
             match gio::spawn_blocking(move || crate::trash::restore(items)).await {
-                Ok(o) => a.status.set_text(&crate::trash::restore_message(&o)),
-                Err(_) => a.status.set_text("Restore failed"),
+                Ok(o) => a.notify(crate::banner::Notice { text: crate::trash::restore_message(&o), errors: o.errors }),
+                Err(_) => a.notify(crate::banner::Notice::stopped("Restore failed")),
             }
         });
     }
@@ -3566,7 +3600,7 @@ impl App {
             // Starred / search results have no folder of their own: use the first item's
             let dir = a.current_dir().and_then(|d| d.path()).or_else(|| paths[0].parent().map(Path::to_path_buf));
             if let Some(dir) = dir {
-                crate::archive::compress_dialog(&a.window, &a.status, dir, paths);
+                crate::archive::compress_dialog(&a.window, &a.status, a.notifier(), dir, paths);
             }
         }));
         add("extract-here", Box::new(|a| {
@@ -3579,7 +3613,7 @@ impl App {
                 a.status.set_text("Can only extract local files");
                 return;
             }
-            crate::archive::extract_here(&a.status, paths);
+            crate::archive::extract_here(&a.status, a.notifier(), paths);
         }));
         add("trash", Box::new(|a| a.delete_selected(false)));
         add("delete-permanently", Box::new(|a| a.delete_selected(true)));

@@ -12,6 +12,7 @@
 //!   folder next to it, then moved to a free name; on failure the scratch
 //!   folder is removed, so no partial output is left behind.
 
+use crate::banner::Notice;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::ffi::{OsStr, OsString};
@@ -666,9 +667,12 @@ pub(crate) fn extract(archive: &Path, dest: &Path, p: &Progress) -> io::Result<(
 
 // ================= UI =================
 
+/// How a finished job reports its result (the window's result banner).
+pub type Notify = std::rc::Rc<dyn Fn(Notice)>;
+
 /// Runs `work` on a worker thread, showing `busy` plus progress in the
-/// status bar, then the result message.
-fn run_job(status: &gtk::Label, busy: String, work: impl FnOnce(&Progress) -> String + Send + 'static) {
+/// status bar, then hands the result to `notify`.
+fn run_job(status: &gtk::Label, busy: String, notify: Notify, work: impl FnOnce(&Progress) -> Notice + Send + 'static) {
     let progress = Arc::new(Progress::default());
     status.set_text(&busy);
     let (st, p) = (status.clone(), progress.clone());
@@ -676,16 +680,21 @@ fn run_job(status: &gtk::Label, busy: String, work: impl FnOnce(&Progress) -> St
         st.set_text(&format!("{busy}  {}", p.text()));
         glib::ControlFlow::Continue
     });
-    let status = status.clone();
     glib::spawn_future_local(async move {
         let res = gio::spawn_blocking(move || work(&progress)).await;
         timer.remove();
-        status.set_text(&res.unwrap_or_else(|_| "Archive operation failed".into()));
+        notify(res.unwrap_or_else(|_| Notice::stopped("Archive operation failed")));
     });
 }
 
 /// Asks for a name and format, then compresses `sources` into `dir`.
-pub fn compress_dialog(parent: &impl IsA<gtk::Window>, status: &gtk::Label, dir: PathBuf, sources: Vec<PathBuf>) {
+pub fn compress_dialog(
+    parent: &impl IsA<gtk::Window>,
+    status: &gtk::Label,
+    notify: Notify,
+    dir: PathBuf,
+    sources: Vec<PathBuf>,
+) {
     if sources.is_empty() {
         return;
     }
@@ -763,10 +772,10 @@ pub fn compress_dialog(parent: &impl IsA<gtk::Window>, status: &gtk::Label, dir:
             }
             win.close();
             let (sources, dir) = (sources.as_ref().clone(), dir.clone());
-            run_job(&status, format!("Compressing “{stem}{ext}”…"), move |p| {
+            run_job(&status, format!("Compressing “{stem}{ext}”…"), notify.clone(), move |p| {
                 match compress(&sources, &dir, &stem, &ext, fmt, p) {
-                    Ok(out) => format!("Created “{}”", display_name(&out)),
-                    Err(e) => format!("Couldn't compress — {e}"),
+                    Ok(out) => Notice::ok(format!("Created “{}”", display_name(&out))),
+                    Err(e) => Notice { text: format!("Couldn't compress — {e}"), errors: vec![e.to_string()] },
                 }
             });
         })
@@ -799,13 +808,13 @@ pub fn compress_dialog(parent: &impl IsA<gtk::Window>, status: &gtk::Label, dir:
 }
 
 /// Extracts each archive next to itself.
-pub fn extract_here(status: &gtk::Label, archives: Vec<PathBuf>) {
+pub fn extract_here(status: &gtk::Label, notify: Notify, archives: Vec<PathBuf>) {
     let busy = match archives.as_slice() {
         [] => return,
         [one] => format!("Extracting “{}”…", display_name(one)),
         many => format!("Extracting {} archives…", many.len()),
     };
-    run_job(status, busy, move |p| {
+    run_job(status, busy, notify, move |p| {
         let (mut done, mut skipped, mut errors) = (Vec::new(), 0, Vec::new());
         for a in &archives {
             let res = match a.parent() {
@@ -820,15 +829,16 @@ pub fn extract_here(status: &gtk::Label, archives: Vec<PathBuf>) {
                 Err(e) => errors.push(format!("{}: {e}", display_name(a))),
             }
         }
-        let mut msg = match (done.as_slice(), errors.is_empty()) {
-            ([one], true) => format!("Extracted to “{}”", display_name(one)),
-            (_, true) => format!("Extracted {} archives", done.len()),
-            _ => format!("Couldn't extract {}", errors.join("; ")),
+        let done_text = match done.as_slice() {
+            [one] => format!("Extracted to “{}”", display_name(one)),
+            _ => format!("Extracted {} archives", done.len()),
         };
+        let none = |n| format!("Couldn't extract {n} archive(s)");
+        let mut text = crate::banner::outcome_text(&done_text, none, done.len(), &errors);
         if skipped > 0 {
-            msg.push_str(&format!(" ({skipped} special file(s) skipped)"));
+            text.push_str(&format!(" ({skipped} special file(s) skipped)"));
         }
-        msg
+        Notice { text, errors }
     });
 }
 
