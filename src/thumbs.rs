@@ -8,12 +8,16 @@
 //! scrolling past thousands of files queues nothing. Workers decode at
 //! reduced size, write the PNG atomically and send back the pixels, and the
 //! UI thread updates only the tile that still shows that file.
+//!
+//! Thumbnails already in the cache are loaded the same way, never on the UI
+//! thread; the decoded textures are kept in a small in-memory LRU so tiles
+//! scrolled back into view show them at once.
 
 use crate::util::{item_file, ICON_SIZE};
 use gtk::prelude::*;
 use gtk::{gdk, gdk_pixbuf::{Colorspace, Pixbuf}, gio, glib};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -32,6 +36,8 @@ const MAX_OUTSTANDING: usize = 3;
 const MAX_SKIP: usize = 4096;
 /// Existing thumbnails bigger than this are not trusted.
 const MAX_THUMB_FILE: u64 = 4 * 1024 * 1024;
+/// Decoded thumbnails kept in memory (per process, shared by all windows).
+const TEXTURE_BUDGET: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Size {
@@ -146,6 +152,8 @@ struct Job {
     path: PathBuf,
     mime: String,
     size: Size,
+    /// An existing, valid thumbnail to load instead of making one
+    load: Option<PathBuf>,
 }
 
 /// Pixels of a finished thumbnail (plain data, safe to send to the UI).
@@ -227,6 +235,12 @@ fn pixels(pb: &Pixbuf) -> Pixels {
 }
 
 fn process(job: &Job) -> Outcome {
+    if let Some(thumb) = &job.load {
+        return match Pixbuf::from_file(thumb) {
+            Ok(pb) => Outcome::Ready(thumb.clone(), pixels(&pb)),
+            Err(_) => Outcome::Skipped,
+        };
+    }
     let Ok(meta) = std::fs::metadata(&job.path) else { return Outcome::Skipped };
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_FILE_SIZE as u64 {
         return Outcome::Skipped;
@@ -356,6 +370,7 @@ struct Want {
     path: PathBuf,
     mime: String,
     size: Size,
+    load: Option<PathBuf>,
     li: glib::WeakRef<gtk::ListItem>,
     img: glib::WeakRef<gtk::Image>,
     info: glib::WeakRef<gio::FileInfo>,
@@ -497,7 +512,14 @@ fn pump() {
             let Some(w) = ui.wanted.remove(&slot) else { continue };
             ui.next_id += 1;
             let id = ui.next_id;
-            jobs.push_back(Job { id, uri: w.uri.clone(), path: w.path.clone(), mime: w.mime.clone(), size: w.size });
+            jobs.push_back(Job {
+                id,
+                uri: w.uri.clone(),
+                path: w.path.clone(),
+                mime: w.mime.clone(),
+                size: w.size,
+                load: w.load.clone(),
+            });
             ui.outstanding += 1;
             ui.by_slot.insert(slot, id);
             ui.pending.insert(id, (slot, w));
@@ -509,7 +531,7 @@ fn pump() {
 
 /// Marks that tiles may have moved or appeared. The check runs after the
 /// next frame is painted, when GTK has laid the tiles out.
-fn mark_dirty() {
+pub fn mark_dirty() {
     UI.with(|ui| ui.borrow_mut().dirty = true);
 }
 
@@ -536,10 +558,20 @@ pub fn watch_scroll(scroll: &gtk::ScrolledWindow) {
     });
 }
 
-/// Called from a grid tile's bind, after the normal icon was set. Notes
-/// that the tile wants a thumbnail when its file needs one, and drops the
-/// tile's older request.
+/// Called from a grid tile's bind, after `set_icon(.., true)`. Notes that
+/// the tile wants a thumbnail when its file needs one (an existing one to
+/// load, or a new one to make), and drops the tile's older request.
 pub fn bind(li: &gtk::ListItem, img: &gtk::Image, info: &gio::FileInfo) {
+    bind_with(li, img, info, true);
+}
+
+/// Like `bind`, but only loads thumbnails that already exist (the folder
+/// preview doesn't make new ones).
+pub fn bind_existing(li: &gtk::ListItem, img: &gtk::Image, info: &gio::FileInfo) {
+    bind_with(li, img, info, false);
+}
+
+fn bind_with(li: &gtk::ListItem, img: &gtk::Image, info: &gio::FileInfo, make: bool) {
     let slot = li.as_ptr() as usize;
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
@@ -556,23 +588,46 @@ pub fn bind(li: &gtk::ListItem, img: &gtk::Image, info: &gio::FileInfo) {
             });
         }
 
-        if info.file_type() != gio::FileType::Regular {
-            return;
-        }
-        let size = info.size();
-        if size <= 0 || size > MAX_FILE_SIZE {
-            return;
-        }
         if info.attribute_string("metadata::custom-icon").is_some_and(|s| !s.is_empty()) {
             return;
         }
         let want = Size::for_pixels(ICON_SIZE.with(|s| s.get()) * img.scale_factor().max(1));
         if let Some(p) = info.attribute_byte_string("thumbnail::path").filter(|p| !p.is_empty()) {
             let valid = !info.has_attribute("thumbnail::is-valid") || info.boolean("thumbnail::is-valid");
-            let too_small = want == Size::Large && p.contains("/thumbnails/normal/");
+            let too_small = make && want == Size::Large && p.contains("/thumbnails/normal/");
             if valid && !too_small {
+                // set_icon already showed it if it was decoded before
+                if info.file_type() == gio::FileType::Directory || cached(info).is_some() {
+                    return;
+                }
+                let file = item_file(info);
+                let uri = file.uri().to_string();
+                if ui.skip.contains(&uri) {
+                    return;
+                }
+                ui.wanted.insert(
+                    slot,
+                    Want {
+                        uri,
+                        path: file.path().unwrap_or_default(),
+                        mime: String::new(),
+                        size: want,
+                        load: Some(PathBuf::from(p.as_str())),
+                        li: li.downgrade(),
+                        img: img.downgrade(),
+                        info: info.downgrade(),
+                    },
+                );
+                ui.dirty = true;
                 return;
             }
+        }
+        if !make || info.file_type() != gio::FileType::Regular {
+            return;
+        }
+        let size = info.size();
+        if size <= 0 || size > MAX_FILE_SIZE {
+            return;
         }
         let Some(mime) = info.content_type() else { return };
         if !ui.supported(&mime) {
@@ -591,6 +646,7 @@ pub fn bind(li: &gtk::ListItem, img: &gtk::Image, info: &gio::FileInfo) {
                 path,
                 mime: mime.to_string(),
                 size: want,
+                load: None,
                 li: li.downgrade(),
                 img: img.downgrade(),
                 info: info.downgrade(),
@@ -619,15 +675,182 @@ fn deliver(id: u64, outcome: Outcome) {
         Some(w)
     });
     let (Some(w), Outcome::Ready(path, px)) = (w, outcome) else { return };
+    let fmt = if px.alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
+    let tex = gdk::MemoryTexture::new(px.w, px.h, fmt, &px.bytes, px.stride);
     if let (Some(info), false) = (w.info.upgrade(), path.as_os_str().is_empty()) {
         // Later binds of this item use the new file directly
         info.set_attribute_byte_string("thumbnail::path", path.to_string_lossy().as_ref());
         info.set_attribute_boolean("thumbnail::is-valid", true);
+        // Kept even if the tile moved on, for when it scrolls back
+        let bytes = texture_bytes(px.w, px.h, px.alpha);
+        TEXTURES.with(|t| t.borrow_mut().insert(path, mtime(&info), bytes, tex.clone().upcast()));
     }
     let Some((_, img)) = w.tile() else { return };
-    let fmt = if px.alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
-    let tex = gdk::MemoryTexture::new(px.w, px.h, fmt, &px.bytes, px.stride);
     img.set_paintable(Some(&tex));
+}
+
+// ======================= decoded texture cache =======================
+
+thread_local! {
+    static TEXTURES: RefCell<TexCache<gdk::Texture>> = RefCell::new(TexCache::new(TEXTURE_BUDGET));
+}
+
+fn mtime(info: &gio::FileInfo) -> i64 {
+    info.attribute_uint64("time::modified") as i64
+}
+
+/// Memory a decoded thumbnail takes: 3 or 4 bytes per pixel.
+fn texture_bytes(w: i32, h: i32, alpha: bool) -> usize {
+    w.max(0) as usize * h.max(0) as usize * if alpha { 4 } else { 3 }
+}
+
+/// The decoded thumbnail of this file, if it was shown recently and the
+/// file hasn't changed since. No disk access.
+pub fn cached(info: &gio::FileInfo) -> Option<gdk::Texture> {
+    let p = info.attribute_byte_string("thumbnail::path").filter(|p| !p.is_empty())?;
+    TEXTURES.with(|t| t.borrow_mut().get(Path::new(p.as_str()), mtime(info)))
+}
+
+struct CacheEntry<T> {
+    mtime: i64,
+    bytes: usize,
+    tick: u64,
+    value: T,
+}
+
+/// Values keyed by thumbnail path, valid for one mtime of the file, within
+/// a byte budget; the least recently used go first.
+struct TexCache<T> {
+    budget: usize,
+    used: usize,
+    tick: u64,
+    map: HashMap<PathBuf, CacheEntry<T>>,
+    /// Last use -> key, oldest first
+    order: BTreeMap<u64, PathBuf>,
+}
+
+impl<T: Clone> TexCache<T> {
+    fn new(budget: usize) -> Self {
+        TexCache { budget, used: 0, tick: 0, map: HashMap::new(), order: BTreeMap::new() }
+    }
+
+    fn get(&mut self, key: &Path, mtime: i64) -> Option<T> {
+        let e = self.map.get_mut(key).filter(|e| e.mtime == mtime)?;
+        self.order.remove(&e.tick);
+        self.tick += 1;
+        e.tick = self.tick;
+        self.order.insert(self.tick, key.to_path_buf());
+        Some(e.value.clone())
+    }
+
+    fn remove(&mut self, key: &Path) {
+        if let Some(e) = self.map.remove(key) {
+            self.order.remove(&e.tick);
+            self.used -= e.bytes;
+        }
+    }
+
+    fn insert(&mut self, key: PathBuf, mtime: i64, bytes: usize, value: T) {
+        // Empty or larger than everything: not worth keeping
+        if bytes == 0 || bytes > self.budget {
+            return;
+        }
+        if self.map.get(&key).is_some_and(|e| e.mtime > mtime) {
+            return;
+        }
+        self.remove(&key);
+        while self.used + bytes > self.budget {
+            let Some((_, oldest)) = self.order.pop_first() else { break };
+            if let Some(e) = self.map.remove(&oldest) {
+                self.used -= e.bytes;
+            }
+        }
+        self.tick += 1;
+        self.order.insert(self.tick, key.clone());
+        self.map.insert(key, CacheEntry { mtime, bytes, tick: self.tick, value });
+        self.used += bytes;
+    }
+}
+
+#[cfg(test)]
+mod tex_cache_tests {
+    use super::{texture_bytes, TexCache};
+    use std::path::{Path, PathBuf};
+
+    fn k(n: &str) -> PathBuf {
+        PathBuf::from(format!("/c/{n}.png"))
+    }
+
+    #[test]
+    fn bytes_from_dimensions() {
+        assert_eq!(texture_bytes(128, 96, true), 128 * 96 * 4);
+        assert_eq!(texture_bytes(256, 256, false), 256 * 256 * 3);
+        assert_eq!(texture_bytes(0, 256, true), 0);
+        assert_eq!(texture_bytes(-1, 5, true), 0);
+    }
+
+    #[test]
+    fn stays_within_budget_evicting_least_recent() {
+        let mut c = TexCache::new(100);
+        c.insert(k("a"), 1, 40, 'a');
+        c.insert(k("b"), 1, 40, 'b');
+        // Using "a" makes "b" the oldest
+        assert_eq!(c.get(&k("a"), 1), Some('a'));
+        c.insert(k("c"), 1, 40, 'c');
+        assert_eq!(c.used, 80);
+        assert_eq!(c.get(&k("b"), 1), None);
+        assert_eq!(c.get(&k("a"), 1), Some('a'));
+        assert_eq!(c.get(&k("c"), 1), Some('c'));
+        // A big one pushes out as many as needed, oldest first
+        c.insert(k("d"), 1, 90, 'd');
+        assert_eq!(c.used, 90);
+        assert_eq!(c.map.len(), 1);
+        assert_eq!(c.order.len(), 1);
+        assert_eq!(c.get(&k("d"), 1), Some('d'));
+    }
+
+    #[test]
+    fn mtime_must_match_and_newer_replaces() {
+        let mut c = TexCache::new(100);
+        c.insert(k("a"), 10, 30, 'x');
+        assert_eq!(c.get(&k("a"), 11), None);
+        assert_eq!(c.get(Path::new("/c/other.png"), 10), None);
+        c.insert(k("a"), 11, 50, 'y');
+        assert_eq!(c.get(&k("a"), 10), None);
+        assert_eq!(c.get(&k("a"), 11), Some('y'));
+        assert_eq!(c.used, 50);
+        // A late result for the older file doesn't win
+        c.insert(k("a"), 10, 30, 'x');
+        assert_eq!(c.get(&k("a"), 11), Some('y'));
+        assert_eq!((c.used, c.map.len(), c.order.len()), (50, 1, 1));
+        // Same mtime again replaces in place
+        c.insert(k("a"), 11, 20, 'z');
+        assert_eq!(c.get(&k("a"), 11), Some('z'));
+        assert_eq!((c.used, c.map.len(), c.order.len()), (20, 1, 1));
+    }
+
+    #[test]
+    fn zero_size_and_oversized_are_not_kept() {
+        let mut c = TexCache::new(100);
+        c.insert(k("a"), 1, 60, 'a');
+        c.insert(k("z"), 1, 0, 'z');
+        c.insert(k("big"), 1, 101, 'b');
+        assert_eq!(c.get(&k("z"), 1), None);
+        assert_eq!(c.get(&k("big"), 1), None);
+        // Nothing was evicted for them
+        assert_eq!(c.get(&k("a"), 1), Some('a'));
+        assert_eq!(c.used, 60);
+        // Exactly the budget fits
+        c.insert(k("full"), 1, 100, 'f');
+        assert_eq!(c.get(&k("full"), 1), Some('f'));
+        assert_eq!((c.used, c.map.len()), (100, 1));
+    }
+
+    #[test]
+    fn empty_until_used() {
+        let c: TexCache<char> = TexCache::new(100);
+        assert_eq!((c.used, c.map.capacity(), c.order.len()), (0, 0, 0));
+    }
 }
 
 #[cfg(test)]

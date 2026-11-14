@@ -346,8 +346,9 @@ mod compare_infos_tests {
     }
 }
 
-/// Uses an existing system thumbnail when there is one (cheap, already on
-/// disk), otherwise the themed icon.
+/// With `thumbs`, shows the file's thumbnail if it was decoded recently;
+/// otherwise the themed icon, and `thumbs::bind` loads the thumbnail off the
+/// UI thread.
 pub fn set_icon(img: &gtk::Image, info: &gio::FileInfo, thumbs: bool) {
     // A per-file icon chosen with "Change Icon…"
     if let Some(ci) = info.attribute_string("metadata::custom-icon") {
@@ -364,11 +365,9 @@ pub fn set_icon(img: &gtk::Image, info: &gio::FileInfo, thumbs: bool) {
         }
     }
     if thumbs {
-        if let Some(p) = info.attribute_byte_string("thumbnail::path") {
-            if !p.is_empty() {
-                img.set_from_file(Some(p.as_str()));
-                return;
-            }
+        if let Some(tex) = crate::thumbs::cached(info) {
+            img.set_paintable(Some(&tex));
+            return;
         }
     }
     match info.icon() {
