@@ -269,6 +269,7 @@ impl Preview {
             let img = bx.first_child().and_downcast::<gtk::Image>().unwrap();
             let lbl = img.next_sibling().and_downcast::<gtk::Label>().unwrap();
             set_icon(&img, &info, true);
+            crate::thumbs::bind_existing(li, &img, &info);
             lbl.set_text(&info.display_name());
         });
 
@@ -291,6 +292,8 @@ impl Preview {
             .child(&grid)
             .build();
         scroll.add_css_class("files");
+        // Tiles scrolled into view load their thumbnails
+        scroll.vadjustment().connect_value_changed(|_| crate::thumbs::mark_dirty());
 
         let empty = gtk::Label::new(Some("Loading…"));
         empty.add_css_class("dim");
