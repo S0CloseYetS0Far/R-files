@@ -1,5 +1,6 @@
 mod app;
 mod archive;
+mod banner;
 mod batch_rename;
 mod config;
 mod dbus_service;
@@ -75,6 +76,10 @@ columnview.files > header > button { background: #050505; color: #8c8c8c; border
 .transfer-row { background: #080808; color: #a8a8a8; padding: 0 4px 0 12px; font-size: 12px; }
 .transfer-row { border-top: 1px solid #161616; }
 .transfer-row button { min-height: 22px; padding: 0 8px; }
+.banner { background: #0c0c0c; color: #d0d0d0; padding: 0 4px 0 12px; font-size: 12px; border-top: 1px solid #161616; }
+.banner.banner-error { box-shadow: inset 3px 0 #d9534f; }
+.banner button { min-height: 22px; padding: 0 8px; }
+textview.details-text, textview.details-text text { background-color: #0c0c0c; color: #dcdcdc; }
 
 /* ---------- preview ---------- */
 .preview { background-color: #050505; padding: 14px; border-left: 1px solid #1d1d1d; }

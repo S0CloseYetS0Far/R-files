@@ -104,13 +104,10 @@ pub fn restore(items: Vec<(gio::File, PathBuf, bool)>) -> RestoreOutcome {
     out
 }
 
-/// The status bar line after a restore: how many, the first error, and any new names.
+/// The banner line after a restore: how many worked and failed, and any new names.
 pub fn restore_message(o: &RestoreOutcome) -> String {
-    let mut s = if o.errors.is_empty() {
-        format!("Restored {} item(s)", o.done)
-    } else {
-        format!("Restored {}, {} failed — {}", o.done, o.errors.len(), o.errors[0])
-    };
+    let none = |n| format!("Couldn't restore {n} item(s)");
+    let mut s = crate::banner::outcome_text(&format!("Restored {} item(s)", o.done), none, o.done, &o.errors);
     match o.renamed.as_slice() {
         [] => {}
         [one] => s += &format!("; the name was taken, so it was restored as “{one}”"),
@@ -225,7 +222,7 @@ mod restore_tests {
         );
         assert_eq!(
             restore_message(&o(2, &["a (restored)", "b (restored)"], &["c: No space"])),
-            "Restored 2, 1 failed — c: No space; 2 names were taken, so “(restored)” was added to them"
+            "Restored 2 item(s), 1 failed — c: No space; 2 names were taken, so “(restored)” was added to them"
         );
     }
 
@@ -320,7 +317,7 @@ impl Job {
     }
 }
 
-/// The status bar line after a job: how many items worked, then the first error and how many more there were.
+/// The banner line after a job: how many items worked and how many failed. Every error is in `o.errors`.
 pub fn job_message(job: Job, o: &Outcome) -> String {
     let done = match job {
         Job::Trash => format!("Moved {} item(s) to the trash", o.done),
@@ -329,21 +326,18 @@ pub fn job_message(job: Job, o: &Outcome) -> String {
         Job::EmptyTrash => format!("Deleted {} item(s) from the trash", o.done),
         Job::ForgetRecent => format!("Removed {} item(s) from Recent", o.done),
     };
-    let Some(first) = o.errors.first() else { return done };
-    let verb = match job {
-        Job::Trash => "Couldn't move",
-        Job::ForgetRecent => "Couldn't remove",
-        Job::Delete | Job::EmptyTrash => "Couldn't delete",
+    let none = |n| match job {
+        Job::Trash => format!("Couldn't move {n} item(s) to the trash"),
+        Job::Delete => format!("Couldn't delete {n} item(s)"),
+        Job::EmptyTrash => format!("Couldn't delete {n} item(s) from the trash"),
+        Job::ForgetRecent => format!("Couldn't remove {n} item(s) from Recent"),
     };
-    let more = match o.errors.len() {
-        1 => String::new(),
-        n => format!(" (and {} more)", n - 1),
-    };
-    if o.done == 0 {
-        format!("{verb} {first}{more}")
-    } else {
-        format!("{done}. {verb} {first}{more}")
-    }
+    crate::banner::outcome_text(&done, none, o.done, &o.errors)
+}
+
+/// The banner notice after a job.
+fn job_notice(job: Job, o: Outcome) -> crate::banner::Notice {
+    crate::banner::Notice { text: job_message(job, &o), errors: o.errors }
 }
 
 /// "“name”" for one item, "N items" for several, as the confirmation dialog names them.
@@ -464,7 +458,7 @@ fn spawn_job<T: Send + 'static>(
         let Some(app) = weak.upgrade() else { return };
         match res {
             Ok(v) => then(&app, v),
-            Err(_) => app.status.set_text(job.failed()),
+            Err(_) => app.notify(crate::banner::Notice::stopped(job.failed())),
         }
         // Folder views update themselves; Starred, search results, Recent and the trash may not
         let watched = match app.current_loc() {
@@ -483,7 +477,7 @@ pub fn move_to_trash(app: &Rc<App>, items: Vec<(gio::File, String)>) {
         return;
     }
     spawn_job(app, Job::Trash, items.len(), move || trash_all(items), |app, t| {
-        app.status.set_text(&job_message(Job::Trash, &t.out));
+        app.notify(job_notice(Job::Trash, t.out));
         if t.unsupported.is_empty() {
             return;
         }
@@ -527,7 +521,7 @@ pub fn confirm_delete(app: &Rc<App>, items: Vec<(gio::File, String)>) {
 
 fn delete_files(app: &Rc<App>, items: Vec<(gio::File, String)>) {
     spawn_job(app, Job::Delete, items.len(), move || delete_all(items), |app, o| {
-        app.status.set_text(&job_message(Job::Delete, &o));
+        app.notify(job_notice(Job::Delete, o));
     });
 }
 
@@ -544,7 +538,7 @@ pub fn empty_trash(app: &Rc<App>) {
     dlg.choose(Some(&app.window), None::<&gio::Cancellable>, move |r| {
         if let (Ok(1), Some(app)) = (r, weak.upgrade()) {
             spawn_job(&app, Job::EmptyTrash, 0, empty_all, |app, o| {
-                app.status.set_text(&job_message(Job::EmptyTrash, &o));
+                app.notify(job_notice(Job::EmptyTrash, o));
             });
         }
     });
@@ -556,7 +550,7 @@ pub fn forget_recent(app: &Rc<App>, items: Vec<(gio::File, String)>) {
         return;
     }
     spawn_job(app, Job::ForgetRecent, items.len(), move || delete_all(items), |app, o| {
-        app.status.set_text(&job_message(Job::ForgetRecent, &o));
+        app.notify(job_notice(Job::ForgetRecent, o));
     });
 }
 
@@ -627,13 +621,13 @@ mod delete_tests {
         assert_eq!(job_message(Job::Trash, &o(3, &[])), "Moved 3 item(s) to the trash");
         assert_eq!(
             job_message(Job::Trash, &o(2, &["a: Permission denied", "b: x", "c: y"])),
-            "Moved 2 item(s) to the trash. Couldn't move a: Permission denied (and 2 more)"
+            "Moved 2 item(s) to the trash, 3 failed"
         );
-        assert_eq!(job_message(Job::Delete, &o(0, &["a: Busy"])), "Couldn't delete a: Busy");
+        assert_eq!(job_message(Job::Delete, &o(0, &["a: Busy"])), "Couldn't delete 1 item(s) — a: Busy");
         assert_eq!(job_message(Job::EmptyTrash, &o(4, &[])), "Emptied the trash");
         assert_eq!(
             job_message(Job::EmptyTrash, &o(4, &["x/y: No", "z: No"])),
-            "Deleted 4 item(s) from the trash. Couldn't delete x/y: No (and 1 more)"
+            "Deleted 4 item(s) from the trash, 2 failed"
         );
         assert_eq!(job_message(Job::ForgetRecent, &o(1, &[])), "Removed 1 item(s) from Recent");
     }

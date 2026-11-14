@@ -551,9 +551,10 @@ pub fn start_transfer(
         if let Some(row) = wrow.upgrade() {
             app.transfers.remove(&row);
         }
-        app.status.set_text(&match &out {
-            Ok(o) => result_text(cut, o, cancelled),
-            Err(_) => if cut { "Move failed" } else { "Copy failed" }.into(),
+        // In the result banner, so it survives the next click; Details lists every error
+        app.notify(match out {
+            Ok(o) => crate::banner::Notice { text: result_text(cut, &o, cancelled), errors: o.errors },
+            Err(_) => crate::banner::Notice::stopped(if cut { "Move failed" } else { "Copy failed" }),
         });
         // Folder views update themselves; Starred / search results don't
         if !matches!(app.current_loc(), Loc::Dir(_)) {
