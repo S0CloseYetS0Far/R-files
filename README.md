@@ -58,7 +58,7 @@ on a laptop with Intel + NVIDIA graphics; numbers vary with the graphics driver)
 | Custom folder icons and size | ✅ light blue, system, or your own image | icon size only |
 | Open in Terminal | ✅ built in | needs an extension |
 | Search | file names, Enter includes subfolders | ✅ faster, also searches inside documents |
-| Copy / cut / paste | ✅ with progress; never overwrites (adds “(copy)”) | ✅ with progress, overwrite prompts |
+| Copy / cut / paste | ✅ with progress; asks on a taken name: keep both, replace or skip | ✅ with progress, overwrite prompts |
 | Undo (Ctrl+Z) | ❌ | ✅ |
 | Drag and drop files | ✅ | ✅ |
 | Creates thumbnails | ✅ images and PDFs | ✅ also videos |

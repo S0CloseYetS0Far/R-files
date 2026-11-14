@@ -141,7 +141,7 @@ fn copy_recursive(src: &gio::File, dst: &gio::File, done: &AtomicU64) -> Result<
 /// Copies non-local `sources` (such as trash items) into the local folder `dest`, with GIO. A taken name gets
 /// "name (copy).ext" like a normal paste; nothing is overwritten. Runs on a worker thread.
 pub fn copy_into(sources: Vec<gio::File>, dest: PathBuf, progress: Arc<AtomicU64>) -> Outcome {
-    let mut out = Outcome { done: 0, errors: Vec::new() };
+    let mut out = Outcome::default();
     for src in sources {
         let attrs = "standard::display-name,standard::type,trash::orig-path";
         let info = match src.query_info(attrs, NOFOLLOW, None::<&gio::Cancellable>) {
@@ -356,7 +356,7 @@ pub struct TrashOutcome {
 
 /// Moves each (file, label) to the trash. Runs on a worker thread.
 pub fn trash_all(items: Vec<(gio::File, String)>) -> TrashOutcome {
-    let mut t = TrashOutcome { out: Outcome { done: 0, errors: Vec::new() }, unsupported: Vec::new() };
+    let mut t = TrashOutcome { out: Outcome::default(), unsupported: Vec::new() };
     for (f, label) in items {
         match f.trash(None::<&gio::Cancellable>) {
             Ok(()) => t.out.done += 1,
@@ -411,7 +411,7 @@ fn delete_tree(f: &gio::File, label: &str, errors: &mut Vec<String>) -> bool {
 
 /// Permanently deletes each (file, label), going on past failures. Runs on a worker thread.
 pub fn delete_all(items: Vec<(gio::File, String)>) -> Outcome {
-    let mut out = Outcome { done: 0, errors: Vec::new() };
+    let mut out = Outcome::default();
     for (f, label) in items {
         if delete_tree(&f, &label, &mut out.errors) {
             out.done += 1;
@@ -617,7 +617,11 @@ mod delete_tests {
 
     #[test]
     fn status_line_counts_errors() {
-        let o = |done, errors: &[&str]| Outcome { done, errors: errors.iter().map(|s| s.to_string()).collect() };
+        let o = |done, errors: &[&str]| Outcome {
+            done,
+            errors: errors.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
         assert_eq!(job_message(Job::Trash, &o(3, &[])), "Moved 3 item(s) to the trash");
         assert_eq!(
             job_message(Job::Trash, &o(2, &["a: Permission denied", "b: x", "c: y"])),
