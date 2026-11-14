@@ -273,7 +273,7 @@ fn copy_file_chunked(
 
 /// Copies `src` to `dst`. Pipes, sockets and devices are left out and counted in `skipped`: reading a
 /// pipe blocks until something writes to it, and a device like /dev/zero never ends.
-fn copy_recursive(src: &Path, dst: &Path, progress: &CopyProgress, skipped: &mut usize) -> io::Result<()> {
+pub(crate) fn copy_recursive(src: &Path, dst: &Path, progress: &CopyProgress, skipped: &mut usize) -> io::Result<()> {
     progress.check()?;
     let md = src.symlink_metadata()?;
     let ft = md.file_type();
@@ -463,7 +463,7 @@ fn temp_name(dir: &Path, tag: &str) -> PathBuf {
     unreachable!()
 }
 
-fn remove_any(p: &Path) -> io::Result<()> {
+pub(crate) fn remove_any(p: &Path) -> io::Result<()> {
     match p.symlink_metadata() {
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
         Ok(_) => std::fs::remove_file(p),
@@ -1338,13 +1338,18 @@ fn run_transfer(
         if let Ok(o) = &out {
             then(o, cancelled);
         }
+        // Copies out of the trash report no items, so they aren't recorded
+        let note = match &out {
+            Ok(o) => crate::undo::record_transfer(cut, &o.items),
+            Err(_) => String::new(),
+        };
         let Some(app) = weak.upgrade() else { return };
         if let Some(row) = wrow.upgrade() {
             app.transfers.remove(&row);
         }
         // In the result banner, so it survives the next click; Details lists every error
         app.notify(match out {
-            Ok(o) => crate::banner::Notice { text: result_text(cut, &o, cancelled), errors: o.errors },
+            Ok(o) => crate::banner::Notice { text: result_text(cut, &o, cancelled) + &note, errors: o.errors },
             Err(_) => crate::banner::Notice::stopped(if cut { "Move failed" } else { "Copy failed" }),
         });
         // Folder views update themselves; Starred / search results don't

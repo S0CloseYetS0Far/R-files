@@ -13,6 +13,7 @@ mod preview;
 mod properties;
 mod thumbs;
 mod trash;
+mod undo;
 mod util;
 
 use gtk::prelude::*;
