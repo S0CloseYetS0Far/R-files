@@ -11,6 +11,8 @@ poppler-rs = "0.26"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tar = { version = "0.4.46", default-features = false }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+# setrlimit and kill for the thumbnail helper process (already used by glib; see thumbs.rs)
+libc = "0.2"
 lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "xz", "optimization"] }
 
 [profile.release]

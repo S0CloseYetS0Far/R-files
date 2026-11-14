@@ -287,6 +287,10 @@ mod version_tests {
 }
 
 fn main() -> glib::ExitCode {
+    // `--thumbnail`: a short-lived helper that decodes one file for thumbs.rs; no GTK, no display
+    if let Some(code) = thumbs::helper_request(&std::env::args().collect::<Vec<_>>()) {
+        return glib::ExitCode::from(code as u8);
+    }
     // `--version`: answer before GTK, the D-Bus service or any forwarding to a running RFiles
     if let Some(line) = version_request(&std::env::args().collect::<Vec<_>>()) {
         println!("{line}");

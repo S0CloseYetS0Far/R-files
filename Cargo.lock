@@ -666,6 +666,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "gtk4",
+ "libc",
  "lzma-rust2",
  "poppler-rs",
  "tar",
