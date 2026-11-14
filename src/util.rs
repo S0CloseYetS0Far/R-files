@@ -480,6 +480,97 @@ pub fn infos_store(files: impl Iterator<Item = gio::File>) -> gio::ListStore {
 }
 
 #[cfg(test)]
+mod location_tests {
+    use super::*;
+
+    fn path(p: &std::path::Path) -> gio::File {
+        gio::File::for_path(p)
+    }
+
+    #[test]
+    fn display_paths() {
+        let home = glib::home_dir();
+        assert_eq!(display_path(&path(&home)), "~");
+        assert_eq!(display_path(&path(&home.join("Pictures/2024"))), "~/Pictures/2024");
+        assert_eq!(display_path(&path(std::path::Path::new("/"))), "/");
+        // A sibling whose name starts with the home folder's name is not inside it.
+        if let (Some(parent), Some(name)) = (home.parent(), home.file_name()) {
+            let sibling = parent.join(format!("{}x", name.to_string_lossy()));
+            assert_eq!(display_path(&path(&sibling)), sibling.display().to_string());
+        }
+        assert_eq!(display_path(&gio::File::for_uri("trash:///")), "trash:///");
+    }
+
+    #[test]
+    fn titles_and_icons() {
+        let home = glib::home_dir();
+        let cases = [
+            (path(&home), "Home", "user-home-symbolic"),
+            (path(std::path::Path::new("/")), "Computer", "drive-harddisk-symbolic"),
+            (gio::File::for_uri("trash:///"), "Trash", "user-trash-symbolic"),
+            (gio::File::for_uri("recent:///"), "Recent", "document-open-recent-symbolic"),
+            (gio::File::for_uri("network:///"), "Network", "network-workgroup-symbolic"),
+            (path(std::path::Path::new("/tmp/some folder")), "some folder", "folder-symbolic"),
+        ];
+        for (f, title, icon) in cases {
+            assert_eq!((file_title(&f).as_str(), icon_for_file(&f)), (title, icon), "{}", f.uri());
+        }
+    }
+
+    #[test]
+    fn trash_uris() {
+        assert!(is_trash(&gio::File::for_uri("trash:///")));
+        assert!(is_trash(&gio::File::for_uri("trash:///a%20b")));
+        assert!(!is_trash(&path(std::path::Path::new("/tmp/trash"))));
+        assert!(!is_trash(&path(&glib::home_dir().join(".local/share/Trash/files"))));
+    }
+
+    fn info(name: &str, kind: gio::FileType, size: i64) -> gio::FileInfo {
+        let i = gio::FileInfo::new();
+        i.set_name(name);
+        i.set_file_type(kind);
+        i.set_size(size);
+        i
+    }
+
+    #[test]
+    fn sizes_and_types() {
+        // Folders and folder-like items have no size; a negative size counts as zero.
+        assert_eq!(format_size(&info("d", gio::FileType::Directory, 4096)), "");
+        assert_eq!(format_size(&info("m", gio::FileType::Mountable, 1)), "");
+        assert_eq!(format_size(&info("f", gio::FileType::Regular, -5)), glib::format_size(0).as_str());
+        assert_eq!(format_size(&info("f", gio::FileType::Regular, 1500)), glib::format_size(1500).as_str());
+        let (big, zero) = (info("f", gio::FileType::Regular, 1500), info("f", gio::FileType::Regular, 0));
+        assert_ne!(format_size(&big), format_size(&zero));
+
+        let dir = info("d", gio::FileType::Directory, 0);
+        dir.set_content_type("text/plain");
+        assert_eq!(type_description(&dir), "Folder");
+        let txt = info("f.txt", gio::FileType::Regular, 0);
+        txt.set_content_type("text/plain");
+        assert!(!type_description(&txt).is_empty());
+    }
+
+    #[test]
+    fn store_of_files() {
+        let d = std::env::temp_dir().join(format!("rfiles-infos-store-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("a.txt"), "hello").unwrap();
+        let files = [d.join("a.txt"), d.join("missing"), d.join("sub")].map(|p| gio::File::for_path(&p));
+        let store = infos_store(files.clone().into_iter());
+        // Files that can't be queried are left out; the rest keep their order.
+        let infos: Vec<gio::FileInfo> = (0..store.n_items()).filter_map(|i| store.item(i).and_downcast()).collect();
+        let names: Vec<String> = infos.iter().map(|i| i.name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["a.txt", "sub"]);
+        assert_eq!((infos[0].size(), infos[1].file_type()), (5, gio::FileType::Directory));
+        // Each item points back at its file, as items from a GtkDirectoryList do.
+        assert!(item_file(&infos[0]).equal(&files[0]));
+        assert!(item_file(&infos[1]).equal(&files[2]));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

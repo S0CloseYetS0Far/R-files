@@ -16,14 +16,7 @@ const GNOME_MIME: &str = "x-special/gnome-copied-files";
 const URI_LIST: &str = "text/uri-list";
 
 pub fn set_clipboard(clipboard: &gdk::Clipboard, files: &[gio::File], cut: bool) {
-    let uris: Vec<String> = files.iter().map(|f| f.uri().to_string()).collect();
-    let gnome = format!("{}\n{}", if cut { "cut" } else { "copy" }, uris.join("\n"));
-    let list = uris.iter().map(|u| format!("{u}\r\n")).collect::<String>();
-    let text = files
-        .iter()
-        .map(|f| f.parse_name().to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let [gnome, list, text] = clipboard_texts(files, cut);
     let provider = gdk::ContentProvider::new_union(&[
         gdk::ContentProvider::for_bytes(GNOME_MIME, &glib::Bytes::from_owned(gnome.into_bytes())),
         gdk::ContentProvider::for_bytes(URI_LIST, &glib::Bytes::from_owned(list.into_bytes())),
@@ -33,6 +26,19 @@ pub fn set_clipboard(clipboard: &gdk::Clipboard, files: &[gio::File], cut: bool)
         ),
     ]);
     let _ = clipboard.set_content(Some(&provider));
+}
+
+/// The GNOME, uri-list and plain-text forms `set_clipboard` offers.
+fn clipboard_texts(files: &[gio::File], cut: bool) -> [String; 3] {
+    let uris: Vec<String> = files.iter().map(|f| f.uri().to_string()).collect();
+    let gnome = format!("{}\n{}", if cut { "cut" } else { "copy" }, uris.join("\n"));
+    let list = uris.iter().map(|u| format!("{u}\r\n")).collect::<String>();
+    let text = files
+        .iter()
+        .map(|f| f.parse_name().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    [gnome, list, text]
 }
 
 /// Returns (is_cut, files) from the clipboard, or None if it holds no files.
@@ -52,9 +58,14 @@ pub async fn read_clipboard(clipboard: &gdk::Clipboard) -> Option<(bool, Vec<gio
         }
         data.extend_from_slice(&chunk);
     }
-    let text = String::from_utf8_lossy(&data);
+    parse_clipboard(&data, mime == GNOME_MIME)
+}
+
+/// Reads what `read_clipboard` got: the GNOME form when `gnome`, else a uri-list.
+fn parse_clipboard(data: &[u8], gnome: bool) -> Option<(bool, Vec<gio::File>)> {
+    let text = String::from_utf8_lossy(data);
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
-    let cut = if mime == GNOME_MIME {
+    let cut = if gnome {
         lines.next() == Some("cut")
     } else {
         false
@@ -64,6 +75,52 @@ pub async fn read_clipboard(clipboard: &gdk::Clipboard) -> Option<(bool, Vec<gio
         None
     } else {
         Some((cut, files))
+    }
+}
+
+#[cfg(test)]
+mod clipboard_format_tests {
+    use super::{clipboard_texts, parse_clipboard};
+    use gtk::gio;
+    use gtk::prelude::*;
+
+    fn uris(files: &[gio::File]) -> Vec<String> {
+        files.iter().map(|f| f.uri().to_string()).collect()
+    }
+
+    #[test]
+    fn texts_in_every_format() {
+        let files = [gio::File::for_path("/tmp/a b"), gio::File::for_path("/tmp/é")];
+        let [gnome, list, text] = clipboard_texts(&files, false);
+        assert_eq!(gnome, "copy\nfile:///tmp/a%20b\nfile:///tmp/%C3%A9");
+        assert_eq!(list, "file:///tmp/a%20b\r\nfile:///tmp/%C3%A9\r\n");
+        assert_eq!(text, "/tmp/a b\n/tmp/é");
+        assert!(clipboard_texts(&files, true)[0].starts_with("cut\n"));
+    }
+
+    #[test]
+    fn what_is_written_reads_back() {
+        let files = [gio::File::for_path("/tmp/a b"), gio::File::for_path("/tmp/é")];
+        for cut in [false, true] {
+            let [gnome, list, _] = clipboard_texts(&files, cut);
+            let (c, got) = parse_clipboard(gnome.as_bytes(), true).unwrap();
+            assert_eq!((c, uris(&got)), (cut, uris(&files)));
+            // A uri-list never means cut.
+            let (c, got) = parse_clipboard(list.as_bytes(), false).unwrap();
+            assert_eq!((c, uris(&got)), (false, uris(&files)));
+        }
+    }
+
+    #[test]
+    fn other_apps_and_empty_clipboards() {
+        // Comments, blank lines and stray spaces in a uri-list are skipped.
+        let (cut, got) = parse_clipboard(b"# from a browser\r\n\r\n  file:///tmp/x  \r\n", false).unwrap();
+        assert_eq!((cut, uris(&got)), (false, vec!["file:///tmp/x".to_string()]));
+        // In a uri-list the first line is a file, not the copy/cut word.
+        assert_eq!(parse_clipboard(b"file:///a\nfile:///b", false).unwrap().1.len(), 2);
+        assert!(parse_clipboard(b"", true).is_none());
+        assert!(parse_clipboard(b"cut\n", true).is_none());
+        assert!(parse_clipboard(b"# only a comment\n", false).is_none());
     }
 }
 

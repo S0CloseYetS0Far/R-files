@@ -586,6 +586,103 @@ fn read_text(path: &Path) -> Result<String, String> {
     Ok(s)
 }
 
+#[cfg(test)]
+mod read_text_tests {
+    use super::*;
+
+    /// A fresh temp folder that is removed again when the test ends, even on failure.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("rfiles-preview-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            TempDir(d)
+        }
+        fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let p = self.0.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn text_empty_and_missing() {
+        let t = TempDir::new("text");
+        assert_eq!(read_text(&t.file("e", b"")).unwrap(), "(empty file)");
+        assert_eq!(read_text(&t.file("u", "grüße\n".as_bytes())).unwrap(), "grüße\n");
+        assert!(read_text(&t.0.join("missing")).is_err());
+        // A folder is not a regular file.
+        assert_eq!(read_text(&t.0), Err("not a regular file".into()));
+    }
+
+    #[test]
+    fn binary_detection() {
+        let t = TempDir::new("binary");
+        // A NUL in the first 8 KiB means binary; one later on does not.
+        assert_eq!(read_text(&t.file("nul", b"abc\0def")), Err("binary".into()));
+        let mut late = vec![b'x'; 8192];
+        late.push(0);
+        assert!(read_text(&t.file("late", &late)).is_ok());
+        // Up to 32 invalid UTF-8 bytes are shown as replacement characters; more means binary.
+        let some: Vec<u8> = (0..32).flat_map(|_| [b'a', 0xff]).collect();
+        assert_eq!(read_text(&t.file("some", &some)).unwrap().matches('\u{FFFD}').count(), 32);
+        let many: Vec<u8> = (0..33).flat_map(|_| [b'a', 0xff]).collect();
+        assert_eq!(read_text(&t.file("many", &many)), Err("binary".into()));
+    }
+
+    #[test]
+    fn long_file_is_truncated() {
+        let t = TempDir::new("long");
+        let exact = vec![b'a'; TEXT_LIMIT];
+        assert_eq!(read_text(&t.file("exact", &exact)).unwrap().len(), TEXT_LIMIT);
+        let over = vec![b'a'; TEXT_LIMIT + 1];
+        let s = read_text(&t.file("over", &over)).unwrap();
+        let text = s.strip_suffix("\n\n… (preview truncated)").expect("truncation marker");
+        assert_eq!(text.len(), TEXT_LIMIT);
+        // Cut inside a character: only that last character becomes a replacement character.
+        let mut multi = vec![b'a'];
+        multi.extend("é".repeat(TEXT_LIMIT / 2).as_bytes());
+        let s = read_text(&t.file("multi", &multi)).unwrap();
+        assert_eq!(s.matches('\u{FFFD}').count(), 1);
+        assert!(s.ends_with("é\u{FFFD}\n\n… (preview truncated)"));
+    }
+
+    /// Saves a `w` x `h` PNG, or None when gdk-pixbuf has no PNG saver here.
+    fn png(t: &TempDir, name: &str, w: i32, h: i32) -> Option<PathBuf> {
+        let pb = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, w, h)?;
+        pb.fill(0x3366ffff);
+        let p = t.0.join(name);
+        pb.savev(&p, "png", &[]).ok()?;
+        Some(p)
+    }
+
+    #[test]
+    fn images_are_scaled_to_the_limit() {
+        let t = TempDir::new("image");
+        let Some(small) = png(&t, "small.png", 3, 2) else {
+            eprintln!("gdk-pixbuf cannot write PNG here; skipping image checks");
+            return;
+        };
+        let (bytes, w, h, stride, alpha, orig) = load_scaled(&small).expect("small png");
+        assert_eq!((w, h, alpha, orig), (3, 2, true, (3, 2)));
+        assert!(stride >= 3 * 4 && bytes.len() >= (stride * (h - 1) + w * 4) as usize);
+
+        // Kept in proportion, the longer side at IMAGE_MAX; the original size is reported too.
+        let big = png(&t, "big.png", IMAGE_MAX * 2, IMAGE_MAX / 2).unwrap();
+        let (_, w, h, _, _, orig) = load_scaled(&big).expect("big png");
+        assert_eq!((w, h, orig), (IMAGE_MAX, IMAGE_MAX / 4, (IMAGE_MAX * 2, IMAGE_MAX / 2)));
+
+        assert!(load_scaled(&t.file("not.png", b"not an image")).is_none());
+        assert!(load_scaled(&t.0.join("missing.png")).is_none());
+    }
+}
+
 /// Adds a scroll delta to the running total and returns (whole pages to turn, what is left over).
 /// Turning back the other way drops what was gathered in the old direction.
 fn scroll_pages(acc: f64, dy: f64, step: f64) -> (i32, f64) {

@@ -91,6 +91,44 @@ impl Loc {
     }
 }
 
+#[cfg(test)]
+mod loc_grid_tests {
+    use super::*;
+
+    #[test]
+    fn grid_columns() {
+        assert_eq!(grid_columns_for_width(0.0), 4);
+        assert_eq!(grid_columns_for_width(-10.0), 4);
+        assert_eq!(grid_columns_for_width(f64::NAN), 4);
+        assert_eq!(grid_columns_for_width(640.0), 10);
+        assert_eq!(grid_columns_for_width(641.0), 11);
+        assert_eq!(grid_columns_for_width(1e9), 64);
+        assert_eq!(grid_columns_for_width(f64::INFINITY), 64);
+        // Never fewer columns than the narrowest tiles need, up to the cap.
+        for w in (0..5000).step_by(7) {
+            let w = w as f64;
+            assert!(grid_columns_for_width(w) >= ((w / GRID_MIN_TILE_PX) as u32).min(64), "{w}");
+        }
+    }
+
+    #[test]
+    fn loc_keys_and_titles() {
+        let tmp = Loc::Dir(gio::File::for_uri("file:///tmp/a%20b/"));
+        assert_eq!((tmp.key(), tmp.title()), ("file:///tmp/a%20b".to_string(), "a b".to_string()));
+        // With and without a trailing slash is the same place.
+        assert_eq!(Loc::Dir(gio::File::for_path("/tmp/a b")).key(), tmp.key());
+        assert_eq!(Loc::Dir(gio::File::for_uri("trash:///")).title(), "Trash");
+        assert_eq!((Loc::Starred.key(), Loc::Starred.title()), ("starred:".to_string(), "Starred".to_string()));
+        let search = Loc::Search {
+            root: gio::File::for_path("/tmp"),
+            query: "cat".into(),
+            results: Rc::new(Vec::new()),
+            end: SearchEnd::Done,
+        };
+        assert_eq!((search.key(), search.title()), ("search:cat".to_string(), "“cat”".to_string()));
+    }
+}
+
 /// One entry of a right-click menu; `None` in a menu list is a separator.
 struct MItem {
     label: String,
@@ -2537,24 +2575,26 @@ impl App {
         self.sidebar.append(&row);
     }
 
+    /// Moves `src` next to `dst` in `list`; false (and the list unchanged) when either is missing.
+    fn move_in(list: &mut Vec<String>, src: &str, dst: &str, before: bool) -> bool {
+        let Some(si) = list.iter().position(|k| k == src) else { return false };
+        let item = list.remove(si);
+        let Some(di) = list.iter().position(|k| k == dst) else {
+            list.insert(si, item);
+            return false;
+        };
+        list.insert(if before { di } else { di + 1 }, item);
+        true
+    }
+
     fn reorder_sidebar(self: &Rc<Self>, src: &str, dst: &str, before: bool) {
         if src == dst {
             return;
         }
-        fn move_in(list: &mut Vec<String>, src: &str, dst: &str, before: bool) -> bool {
-            let Some(si) = list.iter().position(|k| k == src) else { return false };
-            let item = list.remove(si);
-            let Some(di) = list.iter().position(|k| k == dst) else {
-                list.insert(si, item);
-                return false;
-            };
-            list.insert(if before { di } else { di + 1 }, item);
-            true
-        }
         match (src.split_once(':'), dst.split_once(':')) {
             (Some(("place", s)), Some(("place", d))) => {
                 let mut order: Vec<String> = self.places().iter().map(|p| p.0.to_string()).collect();
-                if move_in(&mut order, s, d, before) {
+                if Self::move_in(&mut order, s, d, before) {
                     let mut c = self.config.borrow_mut();
                     c.places_order = order;
                     c.save();
@@ -2562,7 +2602,7 @@ impl App {
             }
             (Some(("pin", s)), Some(("pin", d))) => {
                 let mut c = self.config.borrow_mut();
-                if move_in(&mut c.pins, s, d, before) {
+                if Self::move_in(&mut c.pins, s, d, before) {
                     c.save();
                 }
             }
@@ -3937,6 +3977,34 @@ fn plan_open(is_dir: &[bool]) -> OpenPlan {
         }
     }
     plan
+}
+
+#[cfg(test)]
+mod sidebar_move_tests {
+    use super::App;
+
+    fn moved(src: &str, dst: &str, before: bool) -> (bool, Vec<String>) {
+        let mut list: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+        let ok = App::move_in(&mut list, src, dst, before);
+        (ok, list)
+    }
+
+    #[test]
+    fn moves_before_or_after() {
+        assert_eq!(moved("a", "c", false), (true, ["b", "c", "a", "d"].map(String::from).to_vec()));
+        assert_eq!(moved("a", "c", true), (true, ["b", "a", "c", "d"].map(String::from).to_vec()));
+        assert_eq!(moved("d", "a", true), (true, ["d", "a", "b", "c"].map(String::from).to_vec()));
+        assert_eq!(moved("d", "a", false), (true, ["a", "d", "b", "c"].map(String::from).to_vec()));
+        assert_eq!(moved("b", "d", false), (true, ["a", "c", "d", "b"].map(String::from).to_vec()));
+    }
+
+    #[test]
+    fn missing_items_leave_the_list_alone() {
+        let same = ["a", "b", "c", "d"].map(String::from).to_vec();
+        assert_eq!(moved("x", "a", true), (false, same.clone()));
+        assert_eq!(moved("b", "x", true), (false, same.clone()));
+        assert_eq!(moved("c", "c", false), (false, same));
+    }
 }
 
 #[cfg(test)]
