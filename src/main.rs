@@ -127,6 +127,101 @@ scrolledwindow.br-scroll { border: 1px solid #1d1d1d; border-radius: 8px; }
 /// ("Show in folder" or a launch) opens instantly instead of starting over.
 const LINGER_SECS: u32 = 30;
 
+/// Identifies one version of the executable file: replacing it (install.sh,
+/// a package update) gives a new inode or at least a new modification time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExeStamp {
+    dev: u64,
+    ino: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl ExeStamp {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some(Self { dev: m.dev(), ino: m.ino(), mtime: m.mtime(), mtime_nsec: m.mtime_nsec() })
+    }
+}
+
+/// Whether the executable on disk is no longer the one this process started
+/// from. Unknown at start-up means "not replaced"; gone now (uninstalled) means replaced.
+fn exe_replaced(at_start: Option<ExeStamp>, now: Option<ExeStamp>) -> bool {
+    at_start.is_some_and(|s| now != Some(s))
+}
+
+/// What to do when the process may have become idle.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleStep {
+    /// Windows are open: nothing changes.
+    Keep,
+    /// Stay a while for a quick next launch.
+    Linger,
+    /// Drop the linger hold; the process ends once no job holds it.
+    Exit,
+}
+
+/// `last_window_closed`: the last window just closed (otherwise "quit if idle" was asked for).
+fn idle_step(windows_open: bool, last_window_closed: bool, exe_replaced: bool) -> IdleStep {
+    match (windows_open, last_window_closed, exe_replaced) {
+        (true, _, _) => IdleStep::Keep,
+        (false, true, false) => IdleStep::Linger,
+        _ => IdleStep::Exit,
+    }
+}
+
+#[cfg(test)]
+mod exe_update_tests {
+    use super::{exe_replaced, idle_step, ExeStamp, IdleStep};
+
+    fn st(ino: u64, mtime: i64) -> ExeStamp {
+        ExeStamp { dev: 1, ino, mtime, mtime_nsec: 0 }
+    }
+
+    #[test]
+    fn replaced_when_inode_or_mtime_changes_or_file_is_gone() {
+        assert!(!exe_replaced(Some(st(5, 100)), Some(st(5, 100))));
+        assert!(exe_replaced(Some(st(5, 100)), Some(st(6, 100))));
+        assert!(exe_replaced(Some(st(5, 100)), Some(st(5, 101))));
+        assert!(exe_replaced(Some(st(5, 100)), None));
+        // Never treated as replaced when the start-up stamp is unknown
+        assert!(!exe_replaced(None, None));
+        assert!(!exe_replaced(None, Some(st(5, 100))));
+    }
+
+    #[test]
+    fn stamp_follows_a_file_replaced_like_install_does() {
+        let dir = std::env::temp_dir().join(format!("rfiles-exe-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("rfiles");
+        std::fs::write(&exe, b"old").unwrap();
+        let start = ExeStamp::of(&exe);
+        assert!(start.is_some());
+        assert!(!exe_replaced(start, ExeStamp::of(&exe)));
+        // install(1) puts a new file in place of the old one
+        let new = dir.join("rfiles.new");
+        std::fs::write(&new, b"new").unwrap();
+        std::fs::rename(&new, &exe).unwrap();
+        assert!(exe_replaced(start, ExeStamp::of(&exe)));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(exe_replaced(start, ExeStamp::of(&exe)));
+    }
+
+    #[test]
+    fn idle_decisions() {
+        // Open windows always keep the process as it is
+        for (closed, replaced) in [(true, false), (true, true), (false, false), (false, true)] {
+            assert_eq!(idle_step(true, closed, replaced), IdleStep::Keep);
+        }
+        assert_eq!(idle_step(false, true, false), IdleStep::Linger);
+        assert_eq!(idle_step(false, true, true), IdleStep::Exit);
+        // "quit-if-idle" with no windows
+        assert_eq!(idle_step(false, false, false), IdleStep::Exit);
+        assert_eq!(idle_step(false, false, true), IdleStep::Exit);
+    }
+}
+
 /// Whether `file` is a local file that is not a folder (so it opens as its folder, selected).
 fn is_file(file: &gio::File) -> bool {
     file.path().is_some()
@@ -221,6 +316,10 @@ fn main() -> glib::ExitCode {
         None,
     );
 
+    // Checked when the last window closes: an updated binary should take over then
+    let exe = std::env::current_exe().ok();
+    let exe_at_start = exe.as_deref().and_then(ExeStamp::of);
+
     app.connect_startup(move |a| {
         if let Some(s) = gtk::Settings::default() {
             s.set_gtk_application_prefer_dark_theme(true);
@@ -238,12 +337,31 @@ fn main() -> glib::ExitCode {
         // GTK is ready: open "Show in folder" requests from now on
         let app = a.clone();
         glib::idle_add_local_once(move || dbus_service::attach(&app));
-        // Keep the process briefly when its last window closes
-        a.connect_window_removed(|a, _| {
-            if a.windows().is_empty() {
-                dbus_service::linger(a, LINGER_SECS);
+        // Keep the process briefly when its last window closes, unless the
+        // binary was updated meanwhile: then end now so the next launch is the new version
+        let exe = exe.clone();
+        a.connect_window_removed(move |a, _| {
+            if !a.windows().is_empty() {
+                return;
+            }
+            let replaced = exe_replaced(exe_at_start, exe.as_deref().and_then(ExeStamp::of));
+            match idle_step(false, true, replaced) {
+                IdleStep::Linger => dbus_service::linger(a, LINGER_SECS),
+                IdleStep::Exit => dbus_service::stop_lingering(),
+                IdleStep::Keep => {}
             }
         });
+        // For install.sh, over D-Bus (org.gtk.Actions): exit if no window is open
+        let quit_if_idle = gio::SimpleAction::new("quit-if-idle", None);
+        let weak = a.downgrade();
+        quit_if_idle.connect_activate(move |_, _| {
+            if let Some(a) = weak.upgrade() {
+                if idle_step(!a.windows().is_empty(), false, false) == IdleStep::Exit {
+                    dbus_service::stop_lingering();
+                }
+            }
+        });
+        a.add_action(&quit_if_idle);
         if service {
             // Stay a little even if the request opened nothing
             dbus_service::linger(a, LINGER_SECS);

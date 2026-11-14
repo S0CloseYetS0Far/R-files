@@ -87,6 +87,9 @@ password once (for `apt`).
 
 Then open **RFiles** from the app grid, or run `rfiles` (or `rfiles ~/Some/Folder`).
 
+To update, run `git pull` and `./install.sh` again; if RFiles is open, its windows keep running the
+old version until you close them all (or press Ctrl+Q).
+
 To uninstall: `./install.sh uninstall`
 
 ### Make RFiles your default file manager
