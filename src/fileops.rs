@@ -351,9 +351,126 @@ fn keep_times(dst: &Path, md: &std::fs::Metadata) {
     }
 }
 
+#[derive(Default)]
 pub struct Outcome {
     pub done: usize,
     pub errors: Vec<String>,
+    /// One entry per completed top-level item (those counted in `done`), so the operation can be undone
+    pub items: Vec<Transferred>,
+    /// Clashing items left where they are because the user chose Skip
+    pub skipped: usize,
+    /// Items of a move that already were in the destination folder
+    pub already: usize,
+}
+
+/// A top-level item a copy or move completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transferred {
+    pub source: PathBuf,
+    /// Where it ended up: the same name, a "name (copy)" one, or the name of the item it replaced
+    pub target: PathBuf,
+    /// True when an item already at `target` was replaced (and is gone)
+    pub replaced: bool,
+}
+
+/// What to do with an item whose name is already taken in the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Clash {
+    /// Give the new one a free name, "name (copy).ext"
+    KeepBoth,
+    Replace,
+    Skip,
+}
+
+fn same_item(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (a.symlink_metadata(), b.symlink_metadata()) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+/// True when `target` is taken by something other than `src` itself (pasting next to the original isn't a clash).
+fn clashes(src: &Path, target: &Path) -> bool {
+    target.symlink_metadata().is_ok() && !same_item(src, target)
+}
+
+/// A free hidden name in `dir` for a half-done replace. Short, so a long item name can't make it too long.
+fn temp_name(dir: &Path, tag: &str) -> PathBuf {
+    for i in 0.. {
+        let p = dir.join(format!(".rfiles-{tag}-{}-{i}", std::process::id()));
+        if p.symlink_metadata().is_err() {
+            return p;
+        }
+    }
+    unreachable!()
+}
+
+fn remove_any(p: &Path) -> io::Result<()> {
+    match p.symlink_metadata() {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
+        Ok(_) => std::fs::remove_file(p),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Puts folder `new` at `target` in place of the folder there: the old one is moved aside, the new one moved in,
+/// and only then is the old one deleted. If moving in fails, the old one is put back.
+fn swap_dir(new: &Path, target: &Path) -> io::Result<()> {
+    let aside = temp_name(target.parent().unwrap_or(Path::new(".")), "old");
+    std::fs::rename(target, &aside)?;
+    if let Err(e) = std::fs::rename(new, target) {
+        let _ = std::fs::rename(&aside, target);
+        return Err(e);
+    }
+    std::fs::remove_dir_all(&aside).map_err(|e| {
+        let at = aside.display();
+        io::Error::other(format!("replaced, but the old folder couldn't be deleted ({e}); it is at {at}"))
+    })
+}
+
+/// Puts `src` at `target` in place of the item there. The new item is complete before the old one goes, so a failure
+/// or Cancel part-way leaves the old item untouched and no temporary behind. A move on the same drive is a rename
+/// (atomic for files); otherwise the item is copied to a temporary name next to `target` and then swapped in.
+fn replace(src: &Path, target: &Path, cut: bool, progress: &CopyProgress, skipped: &mut usize) -> io::Result<()> {
+    let new_dir = src.symlink_metadata()?.is_dir();
+    let old_dir = target.symlink_metadata()?.is_dir();
+    if new_dir != old_dir {
+        let why = if new_dir { "can't replace a file with a folder" } else { "can't replace a folder with a file" };
+        return Err(io::Error::other(why));
+    }
+    if src.starts_with(target) {
+        return Err(io::Error::other("can't replace the folder it is in"));
+    }
+    progress.check()?;
+    if cut {
+        let r = if new_dir { swap_dir(src, target) } else { std::fs::rename(src, target) };
+        match r {
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {}
+            r => return r,
+        }
+    }
+    let tmp = temp_name(target.parent().unwrap_or(Path::new(".")), "new");
+    let res = copy_recursive(src, &tmp, progress, skipped).and_then(|()| {
+        if *skipped > 0 {
+            let why = if tmp.symlink_metadata().is_err() {
+                "is a pipe, socket or device, not copied"
+            } else {
+                "holds pipes, sockets or devices that can't be copied; not replaced"
+            };
+            return Err(io::Error::other(why));
+        }
+        if new_dir { swap_dir(&tmp, target) } else { std::fs::rename(&tmp, target) }
+    });
+    if res.is_err() {
+        let _ = remove_any(&tmp);
+        return res;
+    }
+    if cut {
+        remove_any(src)?;
+    }
+    Ok(())
 }
 
 /// Bytes that `transfer` will copy for `src`: none for a move on the same drive, which is a rename.
@@ -368,13 +485,21 @@ fn bytes_to_copy(src: &Path, dest: &Path, cut: bool, progress: &CopyProgress) ->
     tree_size(src, progress)
 }
 
+/// `transfer_with`, keeping both on a clash (the tests' shorthand).
+#[cfg(test)]
+fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: &CopyProgress) -> Outcome {
+    transfer_with(sources, dest, cut, Clash::KeepBoth, progress)
+}
+
 /// Copies or moves `sources` into `dest`. Runs on a worker thread. Counts the total first, then reports bytes in
 /// `progress`; on cancel it stops after removing the file being written and sets `progress.stopped`.
-pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: &CopyProgress) -> Outcome {
-    let total = sources.iter().map(|s| bytes_to_copy(s, &dest, cut, progress)).sum();
+/// `policy` decides what happens to items whose name is taken in `dest` by another item.
+fn transfer_with(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, policy: Clash, progress: &CopyProgress) -> Outcome {
+    let skips = |s: &PathBuf| policy == Clash::Skip && s.file_name().is_some_and(|n| clashes(s, &dest.join(n)));
+    let total = sources.iter().filter(|s| !skips(s)).map(|s| bytes_to_copy(s, &dest, cut, progress)).sum();
     progress.total.store(total, Ordering::Relaxed);
     progress.counted.store(true, Ordering::Relaxed);
-    let mut out = Outcome { done: 0, errors: Vec::new() };
+    let mut out = Outcome::default();
     for src in sources {
         if progress.check().is_err() {
             progress.stopped.store(true, Ordering::Relaxed);
@@ -387,11 +512,20 @@ pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: &Copy
             continue;
         }
         if cut && src.parent() == Some(dest.as_path()) {
-            continue; // moving into the same folder: nothing to do
+            out.already += 1; // moving into the same folder: nothing to do
+            continue;
         }
-        let target = free_name(&dest, name);
+        let clash = clashes(&src, &dest.join(name));
+        if clash && policy == Clash::Skip {
+            out.skipped += 1;
+            continue;
+        }
+        let replacing = clash && policy == Clash::Replace;
+        let target = if replacing { dest.join(name) } else { free_name(&dest, name) };
         let mut skipped = 0;
-        let res = if cut {
+        let res = if replacing {
+            replace(&src, &target, cut, progress, &mut skipped)
+        } else if cut {
             match std::fs::rename(&src, &target) {
                 Ok(()) => Ok(()),
                 // Different drive: copy, then remove the original. If something was left out, the
@@ -413,7 +547,10 @@ pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: &Copy
             copy_recursive(&src, &target, progress, &mut skipped)
         };
         match res {
-            Ok(()) if skipped == 0 => out.done += 1,
+            Ok(()) if skipped == 0 => {
+                out.done += 1;
+                out.items.push(Transferred { source: src, target, replaced: replacing });
+            }
             Ok(()) => {
                 // Nothing at the target means the item itself was the special file
                 let top_level = target.symlink_metadata().is_err();
@@ -427,6 +564,277 @@ pub fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: &Copy
         }
     }
     out
+}
+
+#[cfg(test)]
+mod clash_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A fresh `<tmp>/rfiles-clash-<tag>-<pid>` with `src/` and `dest/` folders.
+    fn base(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rfiles-clash-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::create_dir_all(d.join("dest")).unwrap();
+        d
+    }
+
+    fn write(p: &Path, data: &[u8]) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, data).unwrap();
+    }
+
+    fn read(p: &Path) -> Vec<u8> {
+        std::fs::read(p).unwrap()
+    }
+
+    /// Names of the temporaries a replace left behind in `dir`
+    fn temps(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".rfiles-"))
+            .collect()
+    }
+
+    fn run(srcs: &[PathBuf], dest: &Path, cut: bool, policy: Clash) -> Outcome {
+        transfer_with(srcs.to_vec(), dest.to_path_buf(), cut, policy, &CopyProgress::default())
+    }
+
+    #[test]
+    fn finds_clashes() {
+        let d = base("find");
+        let (src, dest) = (d.join("src"), d.join("dest"));
+        write(&src.join("a.txt"), b"new a");
+        write(&src.join("b.txt"), b"b");
+        write(&src.join("f/x"), b"x");
+        write(&dest.join("a.txt"), b"old");
+        write(&dest.join("f/y"), b"y");
+        write(&dest.join("f/z"), b"z");
+        write(&dest.join("here.txt"), b"h");
+        let srcs = [src.join("a.txt"), src.join("b.txt"), src.join("f")];
+        let plan = find_clashes(&srcs, &dest, false);
+        assert_eq!(plan.names, ["a.txt", "f"]);
+        assert!(plan.already == 0 && plan.single.is_none());
+
+        // One clash: both sides are described
+        let plan = find_clashes(&srcs[1..], &dest, false);
+        assert_eq!(plan.names, ["f"]);
+        let (old, new) = plan.single.unwrap();
+        assert_eq!((old.is_dir, old.size, new.is_dir, new.size), (true, 2, true, 1));
+        assert!(old.modified.is_some());
+        let plan = find_clashes(&srcs[..1], &dest, false);
+        let (old, new) = plan.single.unwrap();
+        assert_eq!((old.is_dir, old.size, new.size), (false, 3, 5));
+
+        // An item pasted next to itself is no clash; one moved into its own folder is "already there"
+        let plan = find_clashes(&[dest.join("here.txt")], &dest, false);
+        assert!(plan.names.is_empty());
+        let plan = find_clashes(&[dest.join("here.txt"), src.join("b.txt")], &dest, true);
+        assert_eq!((plan.names.len(), plan.already), (0, 1));
+        // Into itself: refused later, not asked about
+        assert!(find_clashes(&[d.clone()], &dest, false).names.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn keep_both_records_the_new_names() {
+        let d = base("keep");
+        let (src, dest) = (d.join("src"), d.join("dest"));
+        write(&src.join("a.txt"), b"new");
+        write(&src.join("f/x"), b"x");
+        write(&src.join("free.txt"), b"free");
+        write(&dest.join("a.txt"), b"old");
+        write(&dest.join("f/y"), b"y");
+        let srcs = [src.join("a.txt"), src.join("f"), src.join("free.txt")];
+        let out = run(&srcs, &dest, false, Clash::KeepBoth);
+        assert_eq!((out.done, out.errors.len(), out.skipped), (3, 0, 0));
+        assert_eq!(read(&dest.join("a.txt")), b"old");
+        assert_eq!(read(&dest.join("a (copy).txt")), b"new");
+        assert_eq!(read(&dest.join("f (copy)/x")), b"x");
+        assert!(dest.join("f/y").exists());
+        let t = |s: &str, t: &str| Transferred { source: src.join(s), target: dest.join(t), replaced: false };
+        assert_eq!(out.items, [t("a.txt", "a (copy).txt"), t("f", "f (copy)"), t("free.txt", "free.txt")]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn replace_files_and_folders() {
+        let d = base("replace");
+        let (src, dest) = (d.join("src"), d.join("dest"));
+        write(&src.join("a.txt"), b"new");
+        write(&src.join("f/x"), b"new x");
+        write(&dest.join("a.txt"), b"old old");
+        write(&dest.join("f/x"), b"old x");
+        write(&dest.join("f/only-old"), b"o");
+        let srcs = [src.join("a.txt"), src.join("f")];
+        let out = run(&srcs, &dest, false, Clash::Replace);
+        assert_eq!((out.done, out.errors.len()), (2, 0), "{:?}", out.errors);
+        assert_eq!(read(&dest.join("a.txt")), b"new");
+        // The whole folder is replaced, not merged
+        assert_eq!(read(&dest.join("f/x")), b"new x");
+        assert!(!dest.join("f/only-old").exists());
+        assert!(src.join("a.txt").exists() && src.join("f/x").exists());
+        assert!(temps(&dest).is_empty(), "{:?}", temps(&dest));
+        let t = |s: &str| Transferred { source: src.join(s), target: dest.join(s), replaced: true };
+        assert_eq!(out.items, [t("a.txt"), t("f")]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn move_with_replace_on_the_same_drive() {
+        let d = base("move-replace");
+        let (src, dest) = (d.join("src"), d.join("dest"));
+        write(&src.join("a.txt"), b"new");
+        write(&src.join("f/x"), b"new x");
+        write(&dest.join("a.txt"), b"old");
+        write(&dest.join("f/only-old"), b"o");
+        let out = run(&[src.join("a.txt"), src.join("f")], &dest, true, Clash::Replace);
+        assert_eq!((out.done, out.errors.len()), (2, 0), "{:?}", out.errors);
+        assert_eq!(read(&dest.join("a.txt")), b"new");
+        assert_eq!(read(&dest.join("f/x")), b"new x");
+        assert!(!dest.join("f/only-old").exists());
+        assert!(!src.join("a.txt").exists() && !src.join("f").exists());
+        assert!(temps(&dest).is_empty());
+        assert!(out.items.iter().all(|i| i.replaced));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn skip_leaves_clashing_items_alone() {
+        let d = base("skip");
+        let (src, dest) = (d.join("src"), d.join("dest"));
+        write(&src.join("a.txt"), b"new");
+        write(&src.join("f/x"), b"new x");
+        write(&src.join("free.txt"), b"free");
+        write(&dest.join("a.txt"), b"old");
+        write(&dest.join("f/y"), b"y");
+        let srcs = [src.join("a.txt"), src.join("f"), src.join("free.txt")];
+        let out = run(&srcs, &dest, false, Clash::Skip);
+        assert_eq!((out.done, out.skipped, out.errors.len()), (1, 2, 0));
+        assert_eq!(read(&dest.join("a.txt")), b"old");
+        assert!(!dest.join("f/x").exists() && !dest.join("a (copy).txt").exists());
+        assert_eq!(read(&dest.join("free.txt")), b"free");
+        assert_eq!(result_text(false, &out, false), "Copied 1 item, skipped 2");
+
+        // A move: the skipped sources stay where they are; the rest is moved
+        std::fs::remove_file(dest.join("free.txt")).unwrap();
+        let out = run(&srcs, &dest, true, Clash::Skip);
+        assert_eq!((out.done, out.skipped), (1, 2));
+        assert_eq!(read(&src.join("a.txt")), b"new");
+        assert_eq!(read(&src.join("f/x")), b"new x");
+        assert!(!src.join("free.txt").exists());
+        let moved = Transferred { source: src.join("free.txt"), target: dest.join("free.txt"), replaced: false };
+        assert_eq!(out.items, [moved]);
+        assert_eq!(result_text(true, &out, false), "Moved 1 item, skipped 2");
+        let out = run(&srcs[..2], &dest, true, Clash::Skip);
+        assert_eq!(result_text(true, &out, false), "Skipped 2 items");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_replace_keeps_the_old_item() {
+        let d = base("replace-fail");
+        let (src, dest) = (d.join("src"), d.join("dest"));
+        write(&src.join("a.txt"), b"new");
+        write(&src.join("f/ok"), b"ok");
+        write(&src.join("f/secret"), b"s");
+        write(&dest.join("a.txt"), b"old");
+        write(&dest.join("f/old"), b"old");
+        let lock = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        lock(&src.join("a.txt"), 0o000);
+        lock(&src.join("f/secret"), 0o000);
+        // Root can read anything; then there is nothing to test
+        if std::fs::File::open(src.join("a.txt")).is_err() {
+            let out = run(&[src.join("a.txt"), src.join("f")], &dest, false, Clash::Replace);
+            assert_eq!((out.done, out.errors.len()), (0, 2));
+            assert_eq!(read(&dest.join("a.txt")), b"old");
+            assert_eq!(read(&dest.join("f/old")), b"old");
+            assert!(!dest.join("f/ok").exists());
+            assert!(temps(&dest).is_empty(), "{:?}", temps(&dest));
+            assert!(out.items.is_empty());
+        }
+        lock(&src.join("a.txt"), 0o644);
+        lock(&src.join("f/secret"), 0o644);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cancelled_replace_keeps_the_old_item() {
+        let d = base("replace-cancel");
+        let (src, dest) = (d.join("src"), d.join("dest"));
+        let data: Vec<u8> = (0..2 * CHUNK as usize + 5).map(|i| i as u8).collect();
+        write(&src.join("big.bin"), &data);
+        write(&src.join("f/big.bin"), &data);
+        write(&dest.join("big.bin"), b"old");
+        write(&dest.join("f/old"), b"old");
+        for s in [src.join("big.bin"), src.join("f")] {
+            let p = CopyProgress { cancel_at: AtomicU64::new(1), ..Default::default() };
+            let out = transfer_with(vec![s], dest.clone(), false, Clash::Replace, &p);
+            assert!(p.stopped.load(Ordering::Relaxed));
+            assert_eq!((out.done, out.errors.len()), (0, 0));
+        }
+        assert_eq!(read(&dest.join("big.bin")), b"old");
+        assert_eq!(read(&dest.join("f/old")), b"old");
+        assert!(!dest.join("f/big.bin").exists());
+        assert!(temps(&dest).is_empty(), "{:?}", temps(&dest));
+        assert_eq!(read(&src.join("big.bin")), data);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn file_and_folder_never_replace_each_other() {
+        let d = base("kinds");
+        let (src, dest) = (d.join("src"), d.join("dest"));
+        write(&src.join("a"), b"file");
+        write(&src.join("b/x"), b"x");
+        write(&dest.join("a/keep"), b"k");
+        write(&dest.join("b"), b"file b");
+        for cut in [false, true] {
+            let out = run(&[src.join("a"), src.join("b")], &dest, cut, Clash::Replace);
+            assert_eq!(out.errors, ["a: can't replace a folder with a file", "b: can't replace a file with a folder"]);
+            assert_eq!(read(&dest.join("a/keep")), b"k");
+            assert_eq!(read(&dest.join("b")), b"file b");
+            assert!(src.join("a").exists() && src.join("b/x").exists());
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn replacing_an_item_with_itself_keeps_both() {
+        let d = base("self");
+        let dest = d.join("dest");
+        write(&dest.join("a.txt"), b"a");
+        let out = run(&[dest.join("a.txt")], &dest, false, Clash::Replace);
+        assert_eq!(out.done, 1);
+        assert_eq!(read(&dest.join("a.txt")), b"a");
+        assert_eq!(read(&dest.join("a (copy).txt")), b"a");
+        let copied = Transferred { source: dest.join("a.txt"), target: dest.join("a (copy).txt"), replaced: false };
+        assert_eq!(out.items, [copied]);
+
+        // Never replaces the folder the source is inside
+        write(&d.join("x/x/f"), b"f");
+        let out = run(&[d.join("x/x")], &d, false, Clash::Replace);
+        assert_eq!(out.errors, ["x: can't replace the folder it is in"]);
+        assert_eq!(read(&d.join("x/x/f")), b"f");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn move_into_its_own_folder_is_already_there() {
+        let d = base("already");
+        let dest = d.join("dest");
+        write(&dest.join("a.txt"), b"a");
+        write(&d.join("src/b.txt"), b"b");
+        let out = run(&[dest.join("a.txt")], &dest, true, Clash::KeepBoth);
+        assert_eq!((out.done, out.already), (0, 1));
+        assert_eq!(result_text(true, &out, false), "Already in this folder");
+        let out = run(&[dest.join("a.txt"), d.join("src/b.txt")], &dest, true, Clash::KeepBoth);
+        assert_eq!(result_text(true, &out, false), "Moved 1 item, 1 already in this folder");
+        assert_eq!(read(&dest.join("a.txt")), b"a");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 fn items(n: usize) -> String {
@@ -450,6 +858,9 @@ fn progress_text(cut: bool, n: usize, done: u64, total: Option<u64>) -> String {
 /// The status bar line once a job has ended.
 fn result_text(cut: bool, o: &Outcome, cancelled: bool) -> String {
     let verb = if cut { "Moved" } else { "Copied" };
+    if !cancelled && o.errors.is_empty() && o.done == 0 && o.skipped + o.already > 0 {
+        return if o.skipped == 0 { "Already in this folder".into() } else { format!("Skipped {}", items(o.skipped)) };
+    }
     let mut s = if cancelled {
         format!("Cancelled after {}", items(o.done))
     } else if o.errors.is_empty() {
@@ -460,20 +871,246 @@ fn result_text(cut: bool, o: &Outcome, cancelled: bool) -> String {
     if cancelled && !o.errors.is_empty() {
         s += &format!(", {} failed — {}", o.errors.len(), o.errors[0]);
     }
+    // Only when nothing failed, so the first error stays at the end where it is easy to read
+    if o.errors.is_empty() && o.skipped > 0 {
+        s += &format!(", skipped {}", o.skipped);
+    }
+    if o.errors.is_empty() && o.already > 0 {
+        s += &format!(", {} already in this folder", o.already);
+    }
     s
 }
 
-/// Copies or moves `files` into `dest` on a worker thread, with a progress row (text, bar, Cancel) above the
-/// status bar, then leaves the result in the status bar and calls `then` with it and whether it was cancelled.
-/// Used by paste and drag-and-drop.
-/// Items with no local path (the trash) are copied through GIO and can't be cancelled or moved.
-/// The window is held weakly and the application kept running until the job ends, so closing the window
-/// doesn't cut the copy short; it then just has no row to update.
+/// One side of a clash, for the dialog.
+#[derive(Clone, Debug, PartialEq)]
+struct Side {
+    is_dir: bool,
+    /// Bytes for a file; items directly inside for a folder (counting a whole tree could take long)
+    size: u64,
+    /// Seconds since 1970
+    modified: Option<i64>,
+}
+
+fn side(p: &Path) -> Option<Side> {
+    let md = p.symlink_metadata().ok()?;
+    let size = if md.is_dir() { std::fs::read_dir(p).map(|r| r.count() as u64).unwrap_or(0) } else { md.len() };
+    let modified = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    Some(Side { is_dir: md.is_dir(), size, modified: modified.map(|d| d.as_secs() as i64) })
+}
+
+/// Which sources of a paste or drop would land on a taken name.
+#[derive(Debug, Default)]
+struct Plan {
+    /// Names of the clashing sources
+    names: Vec<String>,
+    /// (existing, incoming) when exactly one source clashes
+    single: Option<(Side, Side)>,
+    /// Sources of a move that already are in the destination
+    already: usize,
+}
+
+/// Finds the clashes before anything is copied. Runs on a worker thread.
+fn find_clashes(sources: &[PathBuf], dest: &Path, cut: bool) -> Plan {
+    let mut plan = Plan::default();
+    let mut first = None;
+    for src in sources {
+        let Some(name) = src.file_name() else { continue };
+        if dest.starts_with(src) {
+            continue; // refused by `transfer` anyway
+        }
+        if cut && src.parent() == Some(dest) {
+            plan.already += 1;
+            continue;
+        }
+        let target = dest.join(name);
+        if clashes(src, &target) {
+            first.get_or_insert((src.clone(), target));
+            plan.names.push(name.to_string_lossy().into_owned());
+        }
+    }
+    if let (1, Some((src, target))) = (plan.names.len(), first) {
+        plan.single = side(&target).zip(side(&src));
+    }
+    plan
+}
+
+/// The clash dialog's (message, detail). `total` is how many items the operation acts on; `date` formats a time.
+fn clash_text(plan: &Plan, total: usize, cut: bool, date: &dyn Fn(i64) -> String) -> (String, String) {
+    let n = plan.names.len();
+    let describe = |s: &Side| {
+        let what = if s.is_dir {
+            format!("folder with {}", items(s.size as usize))
+        } else {
+            glib::format_size(s.size).to_string()
+        };
+        match s.modified {
+            Some(t) => format!("{what}, modified {}", date(t)),
+            None => what,
+        }
+    };
+    let mut parts = Vec::new();
+    let msg = if n == 1 {
+        if let Some((old, new)) = &plan.single {
+            parts.push(format!("Existing: {}\nNew: {}", describe(old), describe(new)));
+        }
+        format!("“{}” already exists in this folder", plan.names[0])
+    } else {
+        let mut shown = plan.names.iter().take(3).map(|s| format!("“{s}”")).collect::<Vec<_>>().join(", ");
+        if n > 3 {
+            shown += &format!(" and {} more", n - 3);
+        }
+        parts.push(format!("{shown}. Your choice applies to all of them."));
+        format!("{n} items already exist in this folder")
+    };
+    let verb = if cut { "moved" } else { "copied" };
+    match total.saturating_sub(n) {
+        0 => {}
+        1 => parts.push(format!("The other item is {verb} either way.")),
+        r => parts.push(format!("The other {r} items are {verb} either way.")),
+    }
+    parts.push(REPLACE_NOTE.into());
+    (msg, parts.join("\n\n"))
+}
+
+#[cfg(test)]
+mod clash_text_tests {
+    use super::*;
+
+    fn text(plan: &Plan, total: usize, cut: bool) -> (String, String) {
+        let (m, d) = clash_text(plan, total, cut, &|t| format!("<{t}>"));
+        (m, d.replace('\u{a0}', " "))
+    }
+
+    const REPLACE: &str = REPLACE_NOTE;
+
+    #[test]
+    fn one_clash_shows_both_items() {
+        let old = Side { is_dir: false, size: 1_200_000, modified: Some(10) };
+        let new = Side { is_dir: false, size: 1_300_000, modified: Some(20) };
+        let plan = Plan { names: vec!["report.pdf".into()], single: Some((old, new)), already: 0 };
+        let (m, d) = text(&plan, 1, false);
+        assert_eq!(m, "“report.pdf” already exists in this folder");
+        assert_eq!(d, format!("Existing: 1.2 MB, modified <10>\nNew: 1.3 MB, modified <20>\n\n{REPLACE}"));
+        let (_, d) = text(&plan, 3, true);
+        assert!(d.contains("\n\nThe other 2 items are moved either way.\n\n"), "{d}");
+
+        let old = Side { is_dir: true, size: 1, modified: None };
+        let new = Side { is_dir: true, size: 4, modified: Some(5) };
+        let plan = Plan { names: vec!["Photos".into()], single: Some((old, new)), already: 0 };
+        let (_, d) = text(&plan, 2, false);
+        assert_eq!(
+            d,
+            format!(
+                "Existing: folder with 1 item\nNew: folder with 4 items, modified <5>\n\n\
+                 The other item is copied either way.\n\n{REPLACE}"
+            )
+        );
+    }
+
+    #[test]
+    fn several_clashes_are_counted() {
+        let names = |n: usize| (1..=n).map(|i| format!("f{i}")).collect();
+        let plan = Plan { names: names(2), single: None, already: 0 };
+        assert_eq!(
+            text(&plan, 2, false),
+            (
+                "2 items already exist in this folder".into(),
+                format!("“f1”, “f2”. Your choice applies to all of them.\n\n{REPLACE}")
+            )
+        );
+        let plan = Plan { names: names(5), single: None, already: 0 };
+        let (m, d) = text(&plan, 6, false);
+        assert_eq!(m, "5 items already exist in this folder");
+        assert!(d.starts_with("“f1”, “f2”, “f3” and 2 more. Your choice"), "{d}");
+        assert!(d.contains("The other item is copied either way."));
+    }
+}
+
+const REPLACE_NOTE: &str = "Replace puts the new item in place of the old one; folders are replaced whole, not merged.";
+
+fn local_date(secs: i64) -> String {
+    glib::DateTime::from_unix_local(secs)
+        .ok()
+        .and_then(|d| d.format("%Y-%m-%d  %H:%M").ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+/// Copies or moves `files` into `dest` (see `run_transfer`). First checks on a worker thread which names are taken
+/// in `dest`; if any are, one dialog asks whether to keep both, replace or skip them, or cancel the whole operation.
+/// Items with no local path (the trash) always keep both. The window is held weakly: if it closes before the copy
+/// starts, nothing is copied.
 pub fn start_transfer(
     app: &Rc<App>,
     files: Vec<gio::File>,
     dest: PathBuf,
     cut: bool,
+    then: impl FnOnce(&Outcome, bool) + 'static,
+) {
+    let srcs: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
+    if srcs.len() < files.len() {
+        run_transfer(app, files, dest, cut, Clash::KeepBoth, then);
+        return;
+    }
+    let weak = Rc::downgrade(app);
+    glib::spawn_future_local(async move {
+        let (s, d) = (srcs.clone(), dest.clone());
+        let Ok(plan) = gio::spawn_blocking(move || find_clashes(&s, &d, cut)).await else { return };
+        let Some(app) = weak.upgrade() else { return };
+        if cut && plan.already == srcs.len() {
+            // Nothing to do; the clipboard is kept, so the files can still be pasted elsewhere
+            app.status.set_text("Already in this folder");
+            return;
+        }
+        if plan.names.is_empty() {
+            run_transfer(&app, files, dest, cut, Clash::KeepBoth, then);
+            return;
+        }
+        let (msg, detail) = clash_text(&plan, srcs.len() - plan.already, cut, &local_date);
+        // Keep both is the default, so Enter never loses anything; Escape is Cancel
+        let dlg = gtk::AlertDialog::builder()
+            .message(msg)
+            .detail(detail)
+            .buttons(["Cancel", "Skip", "Replace", "Keep both"])
+            .cancel_button(0)
+            .default_button(3)
+            .build();
+        // A dialog doesn't close with its parent on its own; this takes it away when the window goes
+        let gone = gio::Cancellable::new();
+        let c = gone.clone();
+        let on_destroy = app.window.connect_destroy(move |_| c.cancel());
+        let weak = Rc::downgrade(&app);
+        let g = gone.clone();
+        dlg.choose(Some(&app.window), Some(&gone), move |r| {
+            // Window closed meanwhile (its handlers are gone with it): copy nothing
+            let Some(app) = weak.upgrade() else { return };
+            if g.is_cancelled() {
+                return;
+            }
+            app.window.disconnect(on_destroy);
+            let policy = match r {
+                Ok(1) => Clash::Skip,
+                Ok(2) => Clash::Replace,
+                Ok(3) => Clash::KeepBoth,
+                _ => return,
+            };
+            run_transfer(&app, files, dest, cut, policy, then);
+        });
+    });
+}
+
+/// Copies or moves `files` into `dest` on a worker thread, with a progress row (text, bar, Cancel) above the
+/// status bar, then leaves the result in the status bar and calls `then` with it and whether it was cancelled.
+/// `policy` says what to do with names taken in `dest`.
+/// Items with no local path (the trash) are copied through GIO and can't be cancelled or moved.
+/// The window is held weakly and the application kept running until the job ends, so closing the window
+/// doesn't cut the copy short; it then just has no row to update.
+fn run_transfer(
+    app: &Rc<App>,
+    files: Vec<gio::File>,
+    dest: PathBuf,
+    cut: bool,
+    policy: Clash,
     then: impl FnOnce(&Outcome, bool) + 'static,
 ) {
     let srcs: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
@@ -537,7 +1174,7 @@ pub fn start_transfer(
                 p.counted.store(true, Ordering::Relaxed);
                 crate::trash::copy_into(files, dest, p.done.clone())
             } else {
-                transfer(srcs, dest, cut, &p)
+                transfer_with(srcs, dest, cut, policy, &p)
             }
         })
         .await;
@@ -665,10 +1302,10 @@ mod transfer_cancel_tests {
         // Never past 100%, even if files grew while being copied
         assert_eq!(progress_text(false, 2, 3 * gb, Some(2 * gb)), "Copying 2 items… 100%  2.0 GB of 2.0 GB");
         assert_eq!(progress_text(false, 2, 1_500_000, Some(0)), "Copying 2 items…  1.5 MB");
-        let o = Outcome { done: 2, errors: vec![] };
+        let o = Outcome { done: 2, ..Default::default() };
         assert_eq!(result_text(true, &o, false), "Moved 2 items");
         assert_eq!(result_text(false, &o, true), "Cancelled after 2 items");
-        let o = Outcome { done: 1, errors: vec!["x: denied".into()] };
+        let o = Outcome { done: 1, errors: vec!["x: denied".into()], ..Default::default() };
         assert_eq!(result_text(false, &o, false), "Copied 1, 1 failed — x: denied");
         assert_eq!(result_text(false, &o, true), "Cancelled after 1 item, 1 failed — x: denied");
     }

@@ -3080,9 +3080,10 @@ impl App {
                 a.status.set_text("Nothing to paste — copy or cut some files first");
                 return;
             };
-            // Cleared after a complete move, so pasting again doesn't look for files that are gone
+            // Cleared after a complete move, so pasting again doesn't look for files that are gone. Kept when some
+            // were skipped or already there, since those are still where they were.
             fileops::start_transfer(&a, files, dest_path, cut, move |o, cancelled| {
-                if cut && o.errors.is_empty() && !cancelled {
+                if cut && o.errors.is_empty() && !cancelled && o.skipped == 0 && o.already == 0 {
                     let _ = cb.set_content(None::<&gdk::ContentProvider>);
                 }
             });
