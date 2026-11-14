@@ -1993,7 +1993,7 @@ impl App {
 
     fn on_selection_changed(self: &Rc<Self>) {
         // A hidden preview pane does no work; showing it previews the selection
-        if !self.preview.root.is_visible() {
+        if !self.preview.root.get_visible() {
             self.update_status();
             return;
         }
@@ -3322,9 +3322,9 @@ impl App {
 
     /// Puts the pane widths into `c`. A hidden pane keeps the width it had.
     fn note_widths(&self, c: &mut Config) {
-        let sidebar = self.side_scroll.is_visible().then(|| self.outer.position());
+        let sidebar = self.side_scroll.get_visible().then(|| self.outer.position());
         let iw = self.inner.width();
-        let inner = (self.preview.root.is_visible() && iw > 0).then(|| (iw, self.inner.position()));
+        let inner = (self.preview.root.get_visible() && iw > 0).then(|| (iw, self.inner.position()));
         (c.sidebar_pos, c.preview_width, c.files_pos) =
             widths_to_save((c.sidebar_pos, c.preview_width, c.files_pos), sidebar, inner);
     }
@@ -3354,7 +3354,7 @@ impl App {
     /// Shows or hides the sidebar (F9). GtkPaned gives the rest all the room and keeps its
     /// position (the sidebar width) while the sidebar is hidden.
     fn set_sidebar_shown(&self, show: bool) {
-        if self.side_scroll.is_visible() == show {
+        if self.side_scroll.get_visible() == show {
             return;
         }
         if !show {
@@ -3369,9 +3369,11 @@ impl App {
 
     /// Shows or hides the preview pane (F4). While hidden nothing is previewed and a playing
     /// video stops; showing it again previews the selection at the width it had.
+    // `get_visible()` (the widget's own flag), not `is_visible()`: the latter is also false while the window
+    // is not shown yet, which made start-up take the "show" path before the first tab existed and crash.
     fn set_preview_shown(self: &Rc<Self>, show: bool) {
         let root = &self.preview.root;
-        if root.is_visible() == show {
+        if root.get_visible() == show {
             return;
         }
         if show {
