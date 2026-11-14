@@ -249,10 +249,11 @@ fn process(job: &Job) -> Outcome {
         return Outcome::Failed;
     }
 
-    let rendered = if job.mime == "application/pdf" {
-        render_pdf(&job.uri, job.size.px()).map(|pb| (pb, None))
-    } else {
-        render_image(&job.path, job.size.px())
+    // Decoding happens in a helper process; this one only checks its PNG
+    let rendered = match render_in_helper(&job.path, &job.mime, job.size.px()) {
+        Helper::Done(pb, dims) => Some((pb, dims)),
+        Helper::Failed => None,
+        Helper::Unavailable => return Outcome::Skipped,
     };
     let Some((pb, dims)) = rendered else {
         // Record it so it isn't retried until the file changes
@@ -269,6 +270,65 @@ fn process(job: &Job) -> Outcome {
         return Outcome::Ready(PathBuf::new(), pixels(&pb));
     }
     Outcome::Ready(thumb, pixels(&pb))
+}
+
+/// Thumbnails per second over the files in `$RFILES_BENCH_DIR`, two workers like the app: helper run (through
+/// bwrap unless `RFILES_BENCH_DIRECT` is set; in this process with `RFILES_BENCH_IN_PROCESS`), check, metadata
+/// and atomic write, as `process` does. Run with a private `XDG_CACHE_HOME`:
+/// `cargo test --release thumb_bench -- --ignored --nocapture`.
+#[cfg(test)]
+mod thumb_bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn thumb_bench() {
+        let Ok(dir) = std::env::var("RFILES_BENCH_DIR") else { return };
+        let mut jobs: Vec<Job> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| {
+                let path = e.path();
+                let data = std::fs::read(&path).unwrap_or_default();
+                let (mime, _) = gio::content_type_guess(Some(&path), &data[..data.len().min(4096)]);
+                let uri = gio::File::for_path(&path).uri().to_string();
+                Job { id: 0, uri, path, mime: mime.to_string(), size: Size::Normal }
+            })
+            .collect();
+        let n = jobs.len();
+        let second = jobs.split_off(n / 2);
+        // The rfiles binary next to this test binary (target/<profile>/deps/..)
+        let exe = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("rfiles");
+        let direct = std::env::var_os("RFILES_BENCH_DIRECT").is_some();
+        let bwrap = find_bwrap().filter(|b| !direct && sandbox_works(b, &exe));
+        println!("BENCH sandbox: {bwrap:?}");
+        let one = |j: &Job| {
+            let Ok(meta) = std::fs::metadata(&j.path) else { return false };
+            let done = if std::env::var_os("RFILES_BENCH_IN_PROCESS").is_some() {
+                // How it was before the helper, for comparison
+                let r = if j.mime == "application/pdf" {
+                    render_pdf(&j.uri, j.size.px()).map(|pb| (pb, None))
+                } else {
+                    render_image(&j.path, j.size.px())
+                };
+                r.map_or(Helper::Failed, |(pb, dims)| Helper::Done(pb, dims))
+            } else {
+                run_helper(&exe, bwrap.as_deref(), &j.path, &j.mime, j.size.px())
+            };
+            let Helper::Done(pb, dims) = done else { return false };
+            let dir = cache_root().join(j.size.dir());
+            let opts = spec_metadata(&j.uri, meta.mtime(), meta.len(), &j.mime, dims);
+            write_atomic(&pb, &dir, &dir.join(thumb_name(&j.uri)), &opts).is_ok()
+        };
+        let start = std::time::Instant::now();
+        let ready = std::thread::scope(|s| {
+            let a = s.spawn(|| jobs.iter().filter(|j| one(j)).count());
+            let b = s.spawn(|| second.iter().filter(|j| one(j)).count());
+            a.join().unwrap() + b.join().unwrap()
+        });
+        let secs = start.elapsed().as_secs_f64();
+        println!("BENCH {ready}/{n} ready in {secs:.2} s: {:.1} thumbnails/s", n as f64 / secs);
+    }
 }
 
 /// Decodes an image no bigger than `px` (JPEG decodes at reduced scale).
@@ -346,6 +406,646 @@ fn write_atomic(pb: &Pixbuf, dir: &Path, target: &Path, opts: &[(String, String)
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+// ======================= helper process =======================
+//
+// Image and PDF parsers are a common source of memory-safety bugs, and folders fill with files nobody chose to
+// open. So the decoding runs in a short-lived `rfiles --thumbnail` process, inside bwrap when it works here, with
+// a time and memory limit. The main process only reads back a small PNG after checking its header.
+
+/// A helper that runs longer than this is killed and the file marked failed.
+const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Address-space limit of the helper. Generous: the pixel limit above already bounds real decodes.
+const HELPER_MEMORY: u64 = 2 * 1024 * 1024 * 1024;
+/// Largest thumbnail size the helper accepts (the spec's biggest is 1024).
+const HELPER_MAX_PX: i32 = 1024;
+/// Where things are inside the sandbox.
+const BOX_EXE: &str = "/tmp/rfiles";
+const BOX_OUT_DIR: &str = "/tmp/out";
+const BOX_OUT: &str = "/tmp/out/thumb.png";
+
+/// What a helper run gave.
+enum Helper {
+    Done(Pixbuf, Option<(i32, i32)>),
+    /// The file couldn't be thumbnailed (bad file, timeout, unusable result)
+    Failed,
+    /// No helper could be started (binary replaced by an update?): try again another time
+    Unavailable,
+}
+
+/// `rfiles --thumbnail <input> <output-png> <size-px> <mime>`: renders the input and writes a plain PNG. Returns
+/// the exit code when that is what was asked for. Runs before GTK starts and needs no display.
+pub fn helper_request(args: &[String]) -> Option<i32> {
+    if args.get(1).map(String::as_str) != Some("--thumbnail") {
+        return None;
+    }
+    let ok = match parse_helper_args(&args[2..]) {
+        Some((input, out, px, mime)) => helper_render(input, out, px, mime),
+        None => false,
+    };
+    Some(if ok { 0 } else { 1 })
+}
+
+fn parse_helper_args(a: &[String]) -> Option<(&Path, &Path, i32, &str)> {
+    let [input, out, px, mime] = a else { return None };
+    let px = px.parse::<i32>().ok().filter(|p| (1..=HELPER_MAX_PX).contains(p))?;
+    Some((Path::new(input), Path::new(out), px, mime.as_str()))
+}
+
+fn helper_render(input: &Path, out: &Path, px: i32, mime: &str) -> bool {
+    if !std::fs::metadata(input).is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() <= MAX_FILE_SIZE as u64) {
+        return false;
+    }
+    let rendered = if mime == "application/pdf" {
+        let Ok(uri) = glib::filename_to_uri(input, None) else { return false };
+        render_pdf(&uri, px).map(|pb| (pb, None))
+    } else {
+        render_image(input, px)
+    };
+    let Some((pb, dims)) = rendered else { return false };
+    if pb.width() > px || pb.height() > px {
+        return false;
+    }
+    // The original size goes back as text chunks; the caller writes the real spec metadata
+    let dims: Vec<(String, String)> = dims
+        .map(|(w, h)| {
+            let (w, h) = (w.to_string(), h.to_string());
+            vec![("tEXt::Thumb::Image::Width".into(), w), ("tEXt::Thumb::Image::Height".into(), h)]
+        })
+        .unwrap_or_default();
+    let opts: Vec<(&str, &str)> = dims.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    pb.savev(out, "png", &opts).is_ok()
+}
+
+/// Width and height of a helper's PNG when it is what `helper_render` writes: an 8-bit RGB or RGBA PNG of
+/// 1..=`px` pixels each way, complete up to IEND. Anything else is refused before the PNG decoder sees it.
+fn check_png(data: &[u8], px: i32) -> Option<(i32, i32)> {
+    const SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    // Some libpng loaders accept a cut-off file and fill in the rest
+    const IEND: &[u8] = b"\0\0\0\0IEND\xae\x42\x60\x82";
+    if !data.ends_with(IEND) {
+        return None;
+    }
+    // The first chunk must be a 13-byte IHDR
+    let ihdr = data.strip_prefix(SIG)?.get(..8 + 13)?;
+    if ihdr[..8] != [0, 0, 0, 13, b'I', b'H', b'D', b'R'] {
+        return None;
+    }
+    let num = |i: usize| i32::try_from(u32::from_be_bytes([ihdr[i], ihdr[i + 1], ihdr[i + 2], ihdr[i + 3]])).ok();
+    let (w, h) = (num(8)?, num(12)?);
+    let (depth, color) = (ihdr[16], ihdr[17]);
+    let ok = (1..=px).contains(&w) && (1..=px).contains(&h) && depth == 8 && (color == 2 || color == 6);
+    ok.then_some((w, h))
+}
+
+/// The original image size the helper reported, if it is sane.
+fn helper_dims(text: &[(String, String)]) -> Option<(i32, i32)> {
+    let get = |k: &str| {
+        let v = text.iter().find(|(key, _)| key == k)?.1.parse::<i32>().ok()?;
+        (v > 0).then_some(v)
+    };
+    Some((get("Thumb::Image::Width")?, get("Thumb::Image::Height")?))
+}
+
+/// Decodes a helper's PNG once `check_png` accepted it, with the PNG loader only (no format sniffing).
+fn load_helper_png(data: &[u8], px: i32) -> Option<(Pixbuf, Option<(i32, i32)>)> {
+    let (w, h) = check_png(data, px)?;
+    let loader = gtk::gdk_pixbuf::PixbufLoader::with_type("png").ok()?;
+    let fed = loader.write(data).is_ok();
+    if loader.close().is_err() || !fed {
+        return None;
+    }
+    let pb = loader.pixbuf()?;
+    (pb.width() == w && pb.height() == h).then(|| (pb, helper_dims(&png_text(data))))
+}
+
+/// bwrap, if installed.
+fn find_bwrap() -> Option<PathBuf> {
+    let fixed = PathBuf::from("/usr/bin/bwrap");
+    if fixed.is_file() {
+        return Some(fixed);
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|d| d.join("bwrap")).find(|p| p.is_file())
+}
+
+/// Top-level folders the dynamic loader and libraries are found through, besides /usr: on merged-/usr systems
+/// these are symlinks into it, elsewhere real folders. (path, symlink target)
+fn root_entries() -> Vec<(&'static str, Option<PathBuf>)> {
+    ["/lib", "/lib64", "/lib32", "/libx32"]
+        .into_iter()
+        .filter_map(|p| {
+            let meta = std::fs::symlink_metadata(p).ok()?;
+            if meta.file_type().is_symlink() {
+                Some((p, Some(std::fs::read_link(p).ok()?)))
+            } else {
+                meta.is_dir().then_some((p, None))
+            }
+        })
+        .collect()
+}
+
+/// File name of the input inside the sandbox. Keeps a plain extension, which some loaders look at.
+fn box_input(path: &Path) -> String {
+    let ext = path.extension().and_then(|e| e.to_str()).filter(|e| {
+        !e.is_empty() && e.len() <= 10 && e.bytes().all(|b| b.is_ascii_alphanumeric())
+    });
+    match ext {
+        Some(e) => format!("/tmp/input.{e}"),
+        None => "/tmp/input".to_string(),
+    }
+}
+
+/// bwrap arguments, up to and including the program to run. With `job` = (input file, output folder), the input
+/// is bound read-only at `box_input` and the folder writable at `BOX_OUT_DIR`; without, it only runs the binary.
+fn bwrap_args(
+    exe: &Path,
+    home: Option<&Path>,
+    roots: &[(&str, Option<PathBuf>)],
+    job: Option<(&Path, &Path)>,
+) -> Vec<std::ffi::OsString> {
+    let mut a: Vec<std::ffi::OsString> = Vec::new();
+    let mut add = |items: &[&std::ffi::OsStr]| a.extend(items.iter().map(|s| s.to_os_string()));
+    let s = |v: &'static str| std::ffi::OsStr::new(v);
+    // No network, own PID/IPC/user namespaces; nothing outlives RFiles; no access to the terminal
+    add(&[s("--unshare-all"), s("--die-with-parent"), s("--new-session")]);
+    add(&[s("--ro-bind"), s("/usr"), s("/usr")]);
+    for (path, link) in roots {
+        match link {
+            Some(target) => add(&[s("--symlink"), target.as_os_str(), std::ffi::OsStr::new(path)]),
+            None => add(&[s("--ro-bind"), std::ffi::OsStr::new(path), std::ffi::OsStr::new(path)]),
+        }
+    }
+    // Library lookup and fonts for PDFs
+    add(&[s("--ro-bind-try"), s("/etc/ld.so.cache"), s("/etc/ld.so.cache")]);
+    add(&[s("--ro-bind-try"), s("/etc/fonts"), s("/etc/fonts")]);
+    add(&[s("--ro-bind-try"), s("/var/cache/fontconfig"), s("/var/cache/fontconfig")]);
+    // gdk-pixbuf's glycin loaders (Ubuntu 25.10+) run as child processes, which need these
+    add(&[s("--proc"), s("/proc"), s("--dev"), s("/dev")]);
+    add(&[s("--tmpfs"), s("/tmp")]);
+    if let Some(home) = home.filter(|h| h.is_absolute() && h.parent().is_some() && !h.starts_with("/tmp")) {
+        add(&[s("--tmpfs"), home.as_os_str()]);
+    }
+    add(&[s("--ro-bind"), exe.as_os_str(), s(BOX_EXE)]);
+    if let Some((input, out_dir)) = job {
+        let inside = std::ffi::OsString::from(box_input(input));
+        add(&[s("--ro-bind"), input.as_os_str(), &inside]);
+        add(&[s("--bind"), out_dir.as_os_str(), s(BOX_OUT_DIR)]);
+    }
+    add(&[s("--chdir"), s("/"), s(BOX_EXE)]);
+    a
+}
+
+/// A command with the helper's environment and limits: cleared environment, no core dumps, an address-space
+/// limit, and its own process group so a timeout kills everything it started.
+fn limited(program: &Path) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(program);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", glib::home_dir())
+        .env("GIO_USE_VFS", "local")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    // SAFETY: setrlimit is async-signal-safe and touches no memory of the parent
+    unsafe {
+        cmd.pre_exec(|| {
+            let core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let mem = libc::rlimit { rlim_cur: HELPER_MEMORY, rlim_max: HELPER_MEMORY };
+            if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 || libc::setrlimit(libc::RLIMIT_AS, &mem) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// Runs a command to the end or kills it (and its process group) after `HELPER_TIMEOUT`. Err when it couldn't be
+/// started; Ok(false) when it failed or ran too long.
+fn run_limited(cmd: std::process::Command) -> std::io::Result<bool> {
+    run_for(cmd, HELPER_TIMEOUT)
+}
+
+fn run_for(mut cmd: std::process::Command, limit: std::time::Duration) -> std::io::Result<bool> {
+    let mut child = cmd.spawn()?;
+    let start = std::time::Instant::now();
+    let mut nap = std::time::Duration::from_millis(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.success()),
+            Ok(None) if start.elapsed() < limit => {
+                std::thread::sleep(nap);
+                nap = (nap * 2).min(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                // Not reaped yet, so the group id is still ours
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(false);
+            }
+        }
+    }
+}
+
+/// Set when bwrap stopped working during the session.
+static SANDBOX_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when `bwrap` can run `exe` in the sandbox here: user namespaces may be disabled or restricted
+/// (containers, AppArmor). Running `--version` in it proves bwrap and the binary's libraries both work.
+fn sandbox_works(bwrap: &Path, exe: &Path) -> bool {
+    let mut cmd = limited(bwrap);
+    cmd.args(bwrap_args(exe, Some(&glib::home_dir()), &root_entries(), None)).arg("--version");
+    run_limited(cmd).unwrap_or(false)
+}
+
+/// bwrap, if it works here. Checked once per session, as otherwise every file would fail the same way.
+fn sandbox(exe: &Path) -> Option<&'static Path> {
+    static BWRAP: OnceLock<Option<PathBuf>> = OnceLock::new();
+    if SANDBOX_OFF.load(Ordering::Relaxed) {
+        return None;
+    }
+    BWRAP.get_or_init(|| find_bwrap().filter(|b| sandbox_works(b, exe))).as_deref()
+}
+
+/// Renders `path` in a helper process (sandboxed when bwrap works) and reads back its thumbnail.
+fn render_in_helper(path: &Path, mime: &str, px: i32) -> Helper {
+    let Ok(exe) = std::env::current_exe() else { return Helper::Unavailable };
+    // Replaced by an update: shows as "… (deleted)"
+    if !exe.is_file() {
+        return Helper::Unavailable;
+    }
+    match sandbox(&exe) {
+        Some(bwrap) => match run_helper(&exe, Some(bwrap), path, mime, px) {
+            Helper::Unavailable if !bwrap.is_file() => {
+                // bwrap went away: carry on without it for this session
+                SANDBOX_OFF.store(true, Ordering::Relaxed);
+                run_helper(&exe, None, path, mime, px)
+            }
+            done => done,
+        },
+        None => run_helper(&exe, None, path, mime, px),
+    }
+}
+
+/// Runs the helper `exe` on one file, inside `bwrap` if given, in a private temp folder.
+fn run_helper(exe: &Path, bwrap: Option<&Path>, path: &Path, mime: &str, px: i32) -> Helper {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "rfiles-thumb-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    // Not recursive: fails rather than reuse a folder someone else made
+    if std::fs::DirBuilder::new().mode(0o700).create(&tmp).is_err() {
+        return Helper::Unavailable;
+    }
+    let out = tmp.join("thumb.png");
+    let mut cmd = match bwrap {
+        Some(bwrap) => {
+            let mut cmd = limited(bwrap);
+            cmd.args(bwrap_args(exe, Some(&glib::home_dir()), &root_entries(), Some((path, &tmp))));
+            cmd.arg("--thumbnail").arg(box_input(path)).arg(BOX_OUT);
+            cmd
+        }
+        None => {
+            let mut cmd = limited(exe);
+            cmd.arg("--thumbnail").arg(path).arg(&out);
+            cmd
+        }
+    };
+    cmd.arg(px.to_string()).arg(mime);
+    let result = match run_limited(cmd) {
+        Err(_) => Helper::Unavailable,
+        Ok(false) => Helper::Failed,
+        Ok(true) => {
+            let mut data = Vec::new();
+            let read = std::fs::File::open(&out).and_then(|f| f.take(MAX_THUMB_FILE).read_to_end(&mut data));
+            match read.ok().and_then(|_| load_helper_png(&data, px)) {
+                Some((pb, dims)) => Helper::Done(pb, dims),
+                None => Helper::Failed,
+            }
+        }
+    };
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn helper_arguments() {
+        assert_eq!(helper_request(&v(&["rfiles", "/tmp"])), None);
+        assert_eq!(helper_request(&v(&["rfiles"])), None);
+        // Wrong argument counts and sizes fail without touching anything
+        assert_eq!(helper_request(&v(&["rfiles", "--thumbnail"])), Some(1));
+        assert_eq!(helper_request(&v(&["rfiles", "--thumbnail", "/a", "/b", "128"])), Some(1));
+        let a = v(&["/in.png", "/out.png", "128", "image/png"]);
+        assert_eq!(parse_helper_args(&a), Some((Path::new("/in.png"), Path::new("/out.png"), 128, "image/png")));
+        for bad in ["0", "-5", "1025", "99999999999", "abc"] {
+            assert_eq!(parse_helper_args(&v(&["/in.png", "/out.png", bad, "image/png"])), None);
+        }
+    }
+
+    fn png_header(w: u32, h: u32, depth: u8, color: u8) -> Vec<u8> {
+        let mut d = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        d.extend_from_slice(&w.to_be_bytes());
+        d.extend_from_slice(&h.to_be_bytes());
+        d.extend_from_slice(&[depth, color, 0, 0, 0]);
+        // CRC (not checked here), then the end marker
+        d.extend_from_slice(b"\0\0\0\0\0\0\0\0IEND\xae\x42\x60\x82");
+        d
+    }
+
+    #[test]
+    fn png_check() {
+        assert_eq!(check_png(&png_header(128, 96, 8, 6), 128), Some((128, 96)));
+        assert_eq!(check_png(&png_header(1, 1, 8, 2), 128), Some((1, 1)));
+        // Bigger than asked, empty, absurd
+        assert_eq!(check_png(&png_header(129, 96, 8, 6), 128), None);
+        assert_eq!(check_png(&png_header(0, 96, 8, 6), 128), None);
+        assert_eq!(check_png(&png_header(u32::MAX, 96, 8, 6), 128), None);
+        // Other bit depths, palette and gray images are not what the helper writes
+        assert_eq!(check_png(&png_header(64, 64, 16, 6), 128), None);
+        assert_eq!(check_png(&png_header(64, 64, 8, 3), 128), None);
+        // Truncated, not a PNG, IHDR not first
+        assert_eq!(check_png(&png_header(64, 64, 8, 6)[..20], 128), None);
+        // Complete header but cut off before IEND
+        assert_eq!(check_png(&png_header(64, 64, 8, 6)[..37], 128), None);
+        assert_eq!(check_png(b"GIF89a", 128), None);
+        let mut d = png_header(64, 64, 8, 6);
+        d[12..16].copy_from_slice(b"tEXt");
+        assert_eq!(check_png(&d, 128), None);
+    }
+
+    #[test]
+    fn real_png_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("rfiles-helper-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("t.png");
+        let pb = Pixbuf::new(Colorspace::Rgb, true, 8, 100, 50).unwrap();
+        pb.fill(0x336699ff);
+        pb.savev(&out, "png", &[("tEXt::Thumb::Image::Width", "4000"), ("tEXt::Thumb::Image::Height", "2000")])
+            .unwrap();
+        let data = std::fs::read(&out).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (got, dims) = load_helper_png(&data, 128).unwrap();
+        assert_eq!((got.width(), got.height(), dims), (100, 50, Some((4000, 2000))));
+        // Too big for a normal thumbnail request
+        assert!(load_helper_png(&data, 64).is_none());
+        // Cut off after the header
+        assert!(load_helper_png(&data[..data.len() / 2], 128).is_none());
+    }
+
+    #[test]
+    fn dims_from_text() {
+        let t = |w: &str, h: &str| {
+            let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
+            vec![kv("Thumb::Image::Width", w), kv("Thumb::Image::Height", h)]
+        };
+        assert_eq!(helper_dims(&t("800", "600")), Some((800, 600)));
+        assert_eq!(helper_dims(&t("0", "600")), None);
+        assert_eq!(helper_dims(&t("x", "600")), None);
+        assert_eq!(helper_dims(&[]), None);
+    }
+
+    #[test]
+    fn input_name_keeps_plain_extensions() {
+        assert_eq!(box_input(Path::new("/a/b.JPG")), "/tmp/input.JPG");
+        assert_eq!(box_input(Path::new("/a/b")), "/tmp/input");
+        assert_eq!(box_input(Path::new("/a/b.tar.gz")), "/tmp/input.gz");
+        assert_eq!(box_input(Path::new("/a/b.p g")), "/tmp/input");
+        assert_eq!(box_input(Path::new("/a/b.verylongextension")), "/tmp/input");
+    }
+
+    #[test]
+    fn sandbox_arguments() {
+        let roots = [("/lib", Some(PathBuf::from("usr/lib"))), ("/lib64", None)];
+        let a = bwrap_args(
+            Path::new("/opt/rf/rfiles"),
+            Some(Path::new("/home/me")),
+            &roots,
+            Some((Path::new("/media/usb/x.png"), Path::new("/tmp/rfiles-thumb-1-0"))),
+        );
+        let a: Vec<&str> = a.iter().map(|s| s.to_str().unwrap()).collect();
+        let has = |w: &[&str]| a.windows(w.len()).any(|x| x == w);
+        assert!(has(&["--unshare-all", "--die-with-parent", "--new-session"]));
+        assert!(has(&["--ro-bind", "/usr", "/usr"]));
+        assert!(has(&["--symlink", "usr/lib", "/lib"]));
+        assert!(has(&["--ro-bind", "/lib64", "/lib64"]));
+        assert!(has(&["--tmpfs", "/tmp"]) && has(&["--tmpfs", "/home/me"]));
+        assert!(has(&["--ro-bind", "/opt/rf/rfiles", BOX_EXE]));
+        assert!(has(&["--ro-bind", "/media/usb/x.png", "/tmp/input.png"]));
+        assert!(has(&["--bind", "/tmp/rfiles-thumb-1-0", BOX_OUT_DIR]));
+        assert_eq!(a.last(), Some(&BOX_EXE));
+        // The only writable bind is the output folder, and binds under /tmp come after its tmpfs
+        assert_eq!(a.iter().filter(|&&x| x == "--bind").count(), 1);
+        let pos = |x: &str| a.iter().position(|&y| y == x).unwrap();
+        assert!(pos("/tmp") < pos(BOX_EXE) && pos("/tmp") < pos(BOX_OUT_DIR));
+        // Nothing of the home folder or the rest of the system is visible
+        assert!(!a.contains(&"/home/me/.cache") && !a.contains(&"/etc") && !a.contains(&"/media/usb"));
+
+        // Without a job: just the binary; an odd HOME gets no tmpfs
+        let b = bwrap_args(Path::new("/usr/bin/rfiles"), Some(Path::new("/")), &[], None);
+        let b: Vec<&str> = b.iter().map(|s| s.to_str().unwrap()).collect();
+        assert!(!b.contains(&"--bind") && !b.windows(2).any(|x| x == ["--tmpfs", "/"]));
+        assert_eq!(b.iter().filter(|&&x| x == "--tmpfs").count(), 1);
+    }
+}
+
+/// Runs the built `rfiles` binary as the helper, through bwrap and without it, like the app does.
+#[cfg(test)]
+mod helper_run_tests {
+    use super::*;
+
+    /// The `rfiles` binary cargo builds next to this test binary (target/<profile>/deps/..).
+    fn rfiles_exe() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?.parent()?.parent()?.join("rfiles");
+        exe.is_file().then_some(exe)
+    }
+
+    /// A minimal one-page PDF with a filled rectangle.
+    fn pdf() -> Vec<u8> {
+        let content = "0 0 1 rg 20 20 160 100 re f";
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 4 0 R >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        let trailer = format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1);
+        out.extend_from_slice(trailer.as_bytes());
+        out
+    }
+
+    struct Files {
+        dir: PathBuf,
+    }
+
+    impl Drop for Files {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn files(tag: &str) -> Files {
+        let dir = std::env::temp_dir().join(format!("rfiles-helper-run-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pb = Pixbuf::new(Colorspace::Rgb, false, 8, 300, 200).unwrap();
+        pb.fill(0x2266aaff);
+        pb.savev(dir.join("good.png"), "png", &[]).unwrap();
+        pb.savev(dir.join("good.jpg"), "jpeg", &[]).unwrap();
+        std::fs::write(dir.join("doc.pdf"), pdf()).unwrap();
+        let png = std::fs::read(dir.join("good.png")).unwrap();
+        std::fs::write(dir.join("cut.png"), &png[..60]).unwrap();
+        let mut garbage = png[..33].to_vec();
+        garbage.extend((0..4000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8));
+        std::fs::write(dir.join("garbage.png"), garbage).unwrap();
+        std::fs::write(dir.join("notes.png"), "just some text, not an image\n").unwrap();
+        Files { dir }
+    }
+
+    fn check_all(exe: &Path, bwrap: Option<&Path>, f: &Files) {
+        let run = |name: &str, mime: &str, px: i32| run_helper(exe, bwrap, &f.dir.join(name), mime, px);
+        match run("good.png", "image/png", 128) {
+            Helper::Done(pb, dims) => {
+                assert_eq!((pb.width(), pb.height()), (128, 85));
+                assert_eq!(dims, Some((300, 200)));
+            }
+            _ => panic!("good.png gave no thumbnail"),
+        }
+        match run("good.jpg", "image/jpeg", 256) {
+            // Smaller than the request: kept at its own size
+            Helper::Done(pb, dims) => assert_eq!((pb.width(), pb.height(), dims), (256, 171, Some((300, 200)))),
+            _ => panic!("good.jpg gave no thumbnail"),
+        }
+        match run("doc.pdf", "application/pdf", 128) {
+            Helper::Done(pb, dims) => assert_eq!((pb.width(), pb.height(), dims), (85, 128, None)),
+            _ => panic!("doc.pdf gave no thumbnail"),
+        }
+        for (name, mime) in [("cut.png", "image/png"), ("garbage.png", "image/png"), ("notes.png", "image/png")] {
+            assert!(matches!(run(name, mime, 128), Helper::Failed), "{name} should fail");
+        }
+        assert!(matches!(run("notes.png", "application/pdf", 128), Helper::Failed));
+        // Oversized request and a missing file
+        assert!(matches!(run("good.png", "image/png", 5000), Helper::Failed));
+        assert!(matches!(run("missing.png", "image/png", 128), Helper::Failed));
+    }
+
+    #[test]
+    fn helper_without_sandbox() {
+        let Some(exe) = rfiles_exe() else {
+            eprintln!("SKIPPED: the rfiles binary isn't built next to the tests");
+            return;
+        };
+        check_all(&exe, None, &files("direct"));
+    }
+
+    #[test]
+    fn helper_in_sandbox() {
+        let Some(exe) = rfiles_exe() else {
+            eprintln!("SKIPPED: the rfiles binary isn't built next to the tests");
+            return;
+        };
+        let Some(bwrap) = find_bwrap() else {
+            eprintln!("SKIPPED: bwrap is not installed");
+            return;
+        };
+        if !sandbox_works(&bwrap, &exe) {
+            eprintln!("SKIPPED: bwrap can't create a sandbox here (user namespaces restricted?)");
+            return;
+        }
+        check_all(&exe, Some(&bwrap), &files("bwrap"));
+    }
+
+    #[test]
+    fn sandbox_hides_the_system() {
+        let Some(bwrap) = find_bwrap() else {
+            eprintln!("SKIPPED: bwrap is not installed");
+            return;
+        };
+        let sh = Path::new("/usr/bin/sh");
+        let mut probe = limited(&bwrap);
+        probe.args(bwrap_args(sh, None, &root_entries(), None)).args(["-c", "exit 0"]);
+        if !run_limited(probe).unwrap_or(false) {
+            eprintln!("SKIPPED: bwrap can't create a sandbox here (user namespaces restricted?)");
+            return;
+        }
+        let f = files("confine");
+        let input = f.dir.join("good.png");
+        let home = glib::home_dir();
+        // Only the input and the output folder are there; home is empty; /usr is read-only; only loopback
+        let script = format!(
+            "test -r {inp} && test ! -e {real} && test -z \"$(ls -A {home})\" && test ! -e /etc/passwd \
+             && ! touch /usr/x 2>/dev/null && touch {out}/ok \
+             && test \"$(wc -l < /proc/net/dev)\" -le 3",
+            inp = box_input(&input),
+            real = input.display(),
+            home = home.display(),
+            out = BOX_OUT_DIR,
+        );
+        let mut cmd = limited(&bwrap);
+        cmd.args(bwrap_args(sh, Some(&home), &root_entries(), Some((&input, &f.dir)))).args(["-c", &script]);
+        assert!(run_limited(cmd).unwrap());
+        assert!(f.dir.join("ok").exists());
+    }
+
+    #[test]
+    fn limits_and_exit_status() {
+        let sh = Path::new("/bin/sh");
+        let mut ok = limited(sh);
+        ok.args(["-c", "exit 0"]);
+        assert!(run_limited(ok).unwrap());
+        let mut bad = limited(sh);
+        bad.args(["-c", "exit 3"]);
+        assert!(!run_limited(bad).unwrap());
+        assert!(run_limited(limited(Path::new("/nonexistent/rfiles"))).is_err());
+        // The environment is cleared and core dumps are off
+        let mut env = limited(sh);
+        env.args(["-c", r#"test -z "$DBUS_SESSION_BUS_ADDRESS$DISPLAY$WAYLAND_DISPLAY" && test "$(ulimit -c)" = 0"#]);
+        assert!(run_limited(env).unwrap());
+        // The address-space limit holds
+        let mut mem = limited(sh);
+        mem.args(["-c", &format!("test \"$(ulimit -v)\" = {}", HELPER_MEMORY / 1024)]);
+        assert!(run_limited(mem).unwrap());
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_group() {
+        let pid_file = std::env::temp_dir().join(format!("rfiles-helper-timeout-{}", std::process::id()));
+        let mut cmd = limited(Path::new("/bin/sh"));
+        cmd.args(["-c", &format!("sleep 30 & echo $! > {}; wait", pid_file.display())]);
+        let start = std::time::Instant::now();
+        assert!(!run_for(cmd, std::time::Duration::from_millis(300)).unwrap());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        std::fs::remove_file(&pid_file).unwrap();
+        // The background child is gone too (or a zombie waiting for init)
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).unwrap_or_default();
+        assert!(stat.is_empty() || stat.contains(") Z "), "{stat}");
+    }
 }
 
 // ======================= UI side =======================
