@@ -32,8 +32,8 @@ fn dir() -> PathBuf {
     glib::user_config_dir().join("rfiles")
 }
 
-fn read_lines(name: &str) -> Vec<String> {
-    std::fs::read_to_string(dir().join(name))
+fn read_lines(dir: &std::path::Path, name: &str) -> Vec<String> {
+    std::fs::read_to_string(dir.join(name))
         .unwrap_or_default()
         .lines()
         .map(str::trim)
@@ -44,9 +44,14 @@ fn read_lines(name: &str) -> Vec<String> {
 
 impl Config {
     pub fn load() -> Self {
+        Self::load_from(&dir())
+    }
+
+    /// `load` from a given folder, so tests can use a temp dir.
+    fn load_from(dir: &std::path::Path) -> Self {
         let mut c = Config {
-            pins: read_lines("pins"),
-            starred: read_lines("starred"),
+            pins: read_lines(dir, "pins"),
+            starred: read_lines(dir, "starred"),
             width: 1300,
             height: 820,
             sidebar_pos: 220,
@@ -63,7 +68,7 @@ impl Config {
             show_sidebar: true,
             show_preview: true,
         };
-        for line in read_lines("settings") {
+        for line in read_lines(dir, "settings") {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k.trim() {
                 "folder_icon" => {
@@ -102,8 +107,12 @@ impl Config {
     }
 
     pub fn save(&self) {
-        let d = dir();
-        let _ = std::fs::create_dir_all(&d);
+        self.save_to(&dir())
+    }
+
+    /// `save` into a given folder, so tests can use a temp dir.
+    fn save_to(&self, d: &std::path::Path) {
+        let _ = std::fs::create_dir_all(d);
         let _ = std::fs::write(d.join("pins"), self.pins.join("\n"));
         let _ = std::fs::write(d.join("starred"), self.starred.join("\n"));
         let _ = std::fs::write(
@@ -126,6 +135,137 @@ impl Config {
                 pane_settings(self.show_sidebar, self.show_preview)
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod load_save_tests {
+    use super::Config;
+    use crate::util::SortKey;
+    use std::path::{Path, PathBuf};
+
+    /// A fresh temp folder that is removed again when the test ends, even on failure.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("rfiles-config-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            TempDir(d)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_defaults(c: &Config) {
+        assert!(c.pins.is_empty() && c.starred.is_empty() && c.places_order.is_empty());
+        assert_eq!((c.width, c.height, c.sidebar_pos, c.files_pos, c.preview_width), (1300, 820, 220, 700, 420));
+        assert!(!c.maximized && !c.list_view && !c.show_hidden && !c.sort_desc);
+        assert_eq!((c.folder_icon.as_str(), c.icon_size, c.sort), ("blue", 40, SortKey::Name));
+        assert!(c.show_sidebar && c.show_preview);
+    }
+
+    fn write(d: &Path, name: &str, text: &str) {
+        std::fs::write(d.join(name), text).unwrap();
+    }
+
+    #[test]
+    fn missing_folder_gives_defaults() {
+        let t = TempDir::new("missing");
+        assert_defaults(&Config::load_from(&t.0.join("does-not-exist")));
+    }
+
+    #[test]
+    fn round_trip_keeps_every_field() {
+        let t = TempDir::new("round-trip");
+        // Saving creates the folder itself.
+        let d = t.0.join("rfiles");
+        let mut c = Config::load_from(&d);
+        c.pins = vec!["file:///home/a/b%20c".into(), "file:///tmp".into()];
+        c.starred = vec!["file:///home/a/x.txt".into()];
+        (c.width, c.height, c.sidebar_pos, c.files_pos, c.preview_width) = (1024, 700, 180, 500, 300);
+        (c.maximized, c.list_view, c.show_hidden, c.sort_desc) = (true, true, true, true);
+        c.folder_icon = "custom:/home/a/pic=1.png".into();
+        c.icon_size = 96;
+        c.places_order = vec!["trash".into(), "home".into(), "downloads".into()];
+        c.sort = SortKey::Modified;
+        (c.show_sidebar, c.show_preview) = (false, false);
+        c.save_to(&d);
+
+        let r = Config::load_from(&d);
+        assert_eq!(r.pins, c.pins);
+        assert_eq!(r.starred, c.starred);
+        assert_eq!((r.width, r.height, r.sidebar_pos, r.files_pos, r.preview_width), (1024, 700, 180, 500, 300));
+        assert!(r.maximized && r.list_view && r.show_hidden && r.sort_desc);
+        // The value is everything after the first '=', so a path holding '=' survives.
+        assert_eq!(r.folder_icon, "custom:/home/a/pic=1.png");
+        assert_eq!((r.icon_size, r.sort), (96, SortKey::Modified));
+        assert_eq!(r.places_order, c.places_order);
+        assert!(!r.show_sidebar && !r.show_preview);
+
+        // Saving again with empty lists empties the files instead of leaving the old entries.
+        let mut e = r;
+        e.pins.clear();
+        e.starred.clear();
+        e.places_order.clear();
+        e.save_to(&d);
+        let r = Config::load_from(&d);
+        assert!(r.pins.is_empty() && r.starred.is_empty() && r.places_order.is_empty());
+    }
+
+    #[test]
+    fn partial_file_keeps_defaults_for_the_rest() {
+        let t = TempDir::new("partial");
+        write(&t.0, "settings", "width=900\nsort=size\n");
+        let c = Config::load_from(&t.0);
+        assert_eq!((c.width, c.sort), (900, SortKey::Size));
+        assert_eq!((c.height, c.icon_size, c.folder_icon.as_str()), (820, 40, "blue"));
+        assert!(c.show_sidebar && c.show_preview && !c.maximized);
+    }
+
+    #[test]
+    fn bad_lines_and_values_are_ignored() {
+        let t = TempDir::new("bad");
+        write(
+            &t.0,
+            "settings",
+            "garbage without equals\n\n  width = 1500  \nheight=abc\nsidebar=10\nfiles=-5\npreview=99999999999\n\
+             icon_size=500\nsort=bogus\nmaximized=yes\nlist_view=2\nunknown=1\n=3\nplaces= home , ,trash,\n",
+        );
+        let c = Config::load_from(&t.0);
+        // Spaces around keys and values are trimmed.
+        assert_eq!(c.width, 1500);
+        // Not a number, below the minimum or out of i32 range: default kept.
+        assert_eq!((c.height, c.sidebar_pos, c.files_pos, c.preview_width), (820, 220, 700, 420));
+        assert_eq!((c.icon_size, c.sort), (40, SortKey::Name));
+        assert!(!c.maximized);
+        // Any non-zero number turns a flag on.
+        assert!(c.list_view);
+        // Empty entries in the places list are dropped.
+        assert_eq!(c.places_order, vec!["home".to_string(), "trash".to_string()]);
+    }
+
+    #[test]
+    fn list_files_skip_blank_lines_and_trim() {
+        let t = TempDir::new("lists");
+        write(&t.0, "pins", "\n  file:///a  \n\n\nfile:///b\r\n");
+        write(&t.0, "starred", "");
+        let c = Config::load_from(&t.0);
+        assert_eq!(c.pins, vec!["file:///a".to_string(), "file:///b".to_string()]);
+        assert!(c.starred.is_empty());
+    }
+
+    #[test]
+    fn unreadable_files_give_defaults() {
+        let t = TempDir::new("unreadable");
+        // Not UTF-8: read_to_string fails and the whole file is treated as missing.
+        std::fs::write(t.0.join("settings"), [b'w', b'=', 0xff, 0xfe, b'\n']).unwrap();
+        // A folder where a file is expected.
+        std::fs::create_dir(t.0.join("pins")).unwrap();
+        assert_defaults(&Config::load_from(&t.0));
     }
 }
 
