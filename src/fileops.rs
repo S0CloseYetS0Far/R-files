@@ -495,12 +495,14 @@ fn transfer(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, progress: &CopyProg
 /// `progress`; on cancel it stops after removing the file being written and sets `progress.stopped`.
 /// `policy` decides what happens to items whose name is taken in `dest` by another item.
 fn transfer_with(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, policy: Clash, progress: &CopyProgress) -> Outcome {
-    let skips = |s: &PathBuf| policy == Clash::Skip && s.file_name().is_some_and(|n| clashes(s, &dest.join(n)));
-    let total = sources.iter().filter(|s| !skips(s)).map(|s| bytes_to_copy(s, &dest, cut, progress)).sum();
+    let flags = clash_flags(&sources, &dest, cut);
+    // Skipped items aren't copied, so they don't count
+    let copied = sources.iter().zip(&flags).filter(|&(_, &f)| !(f && policy == Clash::Skip));
+    let total = copied.map(|(s, _)| bytes_to_copy(s, &dest, cut, progress)).sum();
     progress.total.store(total, Ordering::Relaxed);
     progress.counted.store(true, Ordering::Relaxed);
     let mut out = Outcome::default();
-    for src in sources {
+    for (src, flagged) in sources.into_iter().zip(flags) {
         if progress.check().is_err() {
             progress.stopped.store(true, Ordering::Relaxed);
             break;
@@ -515,7 +517,8 @@ fn transfer_with(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, policy: Clash,
             out.already += 1; // moving into the same folder: nothing to do
             continue;
         }
-        let clash = clashes(&src, &dest.join(name));
+        // Still there: something else may have removed it since the check
+        let clash = flagged && clashes(&src, &dest.join(name));
         if clash && policy == Clash::Skip {
             out.skipped += 1;
             continue;
@@ -822,6 +825,56 @@ mod clash_tests {
     }
 
     #[test]
+    fn same_named_sources_never_replace_each_other() {
+        let d = base("same-names");
+        let dest = d.join("dest");
+        let srcs = [d.join("a/report.txt"), d.join("b/report.txt")];
+        let fill = || {
+            write(&srcs[0], b"from a");
+            write(&srcs[1], b"from b");
+        };
+        let both = || {
+            assert_eq!(read(&dest.join("report.txt")), b"from a");
+            assert_eq!(read(&dest.join("report (copy).txt")), b"from b");
+        };
+        for policy in [Clash::Replace, Clash::Skip] {
+            for cut in [false, true] {
+                // Empty destination: both arrive, nothing is replaced or skipped
+                let _ = std::fs::remove_dir_all(&dest);
+                std::fs::create_dir_all(&dest).unwrap();
+                fill();
+                let plan = find_clashes(&srcs, &dest, cut);
+                assert!(plan.names.is_empty(), "{policy:?} {cut}");
+                let out = run(&srcs, &dest, cut, policy);
+                assert_eq!((out.done, out.skipped, out.errors.len()), (2, 0, 0), "{policy:?} {cut}");
+                both();
+                assert!(out.items.iter().all(|i| !i.replaced));
+                assert_eq!(srcs[0].exists() || srcs[1].exists(), !cut);
+
+                // One pre-existing: it is replaced (or skipped) once; the second source is kept alongside
+                let _ = std::fs::remove_dir_all(&dest);
+                write(&dest.join("report.txt"), b"old");
+                fill();
+                assert_eq!(find_clashes(&srcs, &dest, cut).names, ["report.txt"]);
+                let out = run(&srcs, &dest, cut, policy);
+                if policy == Clash::Replace {
+                    assert_eq!((out.done, out.errors.len()), (2, 0), "{cut}");
+                    assert_eq!(read(&dest.join("report.txt")), b"from a");
+                    assert_eq!(read(&dest.join("report (copy).txt")), b"from b");
+                    assert_eq!(out.items.iter().map(|i| i.replaced).collect::<Vec<_>>(), [true, false]);
+                    assert_eq!(srcs[0].exists() || srcs[1].exists(), !cut);
+                } else {
+                    assert_eq!((out.done, out.skipped), (1, 1), "{cut}");
+                    assert_eq!(read(&dest.join("report.txt")), b"old");
+                    assert_eq!(read(&dest.join("report (copy).txt")), b"from b");
+                    assert_eq!(read(&srcs[0]), b"from a");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn move_into_its_own_folder_is_already_there() {
         let d = base("already");
         let dest = d.join("dest");
@@ -909,11 +962,55 @@ struct Plan {
     already: usize,
 }
 
-/// Finds the clashes before anything is copied. Runs on a worker thread.
+/// For each source, whether it lands on a name that was taken before this operation, so Replace / Skip apply to it.
+/// Only the first source with a given name can clash, and never on a name held by a source of this operation itself
+/// (one already in `dest`): later ones keep both, so one source of a paste never replaces or skips another.
+fn clash_flags(sources: &[PathBuf], dest: &Path, cut: bool) -> Vec<bool> {
+    let at_dest = |src: &Path, name: &std::ffi::OsStr| src.parent() == Some(dest) || same_item(src, &dest.join(name));
+    let mut seen: std::collections::HashSet<&std::ffi::OsStr> =
+        sources.iter().filter_map(|s| s.file_name().filter(|n| at_dest(s, n))).collect();
+    sources
+        .iter()
+        .map(|src| {
+            let Some(name) = src.file_name() else { return false };
+            if dest.starts_with(src) || (cut && src.parent() == Some(dest)) {
+                return false;
+            }
+            seen.insert(name) && clashes(src, &dest.join(name))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod clash_flags_tests {
+    use super::*;
+
+    #[test]
+    fn only_names_taken_before_count() {
+        let d = std::env::temp_dir().join(format!("rfiles-clash-flags-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for f in ["a/r.txt", "b/r.txt", "c/r.txt", "dest/x.txt", "a/x.txt"] {
+            std::fs::create_dir_all(d.join(f).parent().unwrap()).unwrap();
+            std::fs::write(d.join(f), f).unwrap();
+        }
+        let dest = d.join("dest");
+        let r = |p: &str| d.join(p);
+        assert_eq!(clash_flags(&[r("a/r.txt"), r("b/r.txt")], &dest, false), [false, false]);
+        std::fs::write(dest.join("r.txt"), b"old").unwrap();
+        assert_eq!(clash_flags(&[r("a/r.txt"), r("b/r.txt"), r("c/r.txt")], &dest, true), [true, false, false]);
+        // A source already in dest holds its name, wherever it is in the list
+        for cut in [false, true] {
+            assert_eq!(clash_flags(&[r("a/x.txt"), r("dest/x.txt")], &dest, cut), [false, false]);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Finds the clashes before anything is copied, by the same rule as `transfer_with`. Runs on a worker thread.
 fn find_clashes(sources: &[PathBuf], dest: &Path, cut: bool) -> Plan {
     let mut plan = Plan::default();
     let mut first = None;
-    for src in sources {
+    for (src, flagged) in sources.iter().zip(clash_flags(sources, dest, cut)) {
         let Some(name) = src.file_name() else { continue };
         if dest.starts_with(src) {
             continue; // refused by `transfer` anyway
@@ -923,7 +1020,7 @@ fn find_clashes(sources: &[PathBuf], dest: &Path, cut: bool) -> Plan {
             continue;
         }
         let target = dest.join(name);
-        if clashes(src, &target) {
+        if flagged {
             first.get_or_insert((src.clone(), target));
             plan.names.push(name.to_string_lossy().into_owned());
         }
