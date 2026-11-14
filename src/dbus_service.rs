@@ -221,8 +221,34 @@ pub fn forward_queued(app: &gtk::Application) {
 /// Keeps the process alive for `secs` without any window, so a quick
 /// follow-up request (or launch) reuses it instead of starting a new one.
 pub fn linger(app: &gtk::Application, secs: u32) {
-    let guard = app.hold();
-    glib::timeout_add_seconds_local_once(secs, move || drop(guard));
+    // One hold at a time, kept where `stop_lingering` can drop it early; a
+    // newer linger replaces the older one, and each timer only ends its own.
+    let id = LINGER.with_borrow_mut(|l| {
+        l.0 += 1;
+        l.1 = Some(app.hold());
+        l.0
+    });
+    glib::timeout_add_seconds_local_once(secs, move || {
+        LINGER.with_borrow_mut(|l| {
+            if l.0 == id {
+                l.1 = None;
+            }
+        })
+    });
+}
+
+/// Drops the linger hold now, so a process with no windows (and no job
+/// holding it) exits right away.
+pub fn stop_lingering() {
+    // Taken out first: dropping the guard may run GTK code that lingers again
+    let guard = LINGER.with_borrow_mut(|l| l.1.take());
+    drop(guard);
+}
+
+thread_local! {
+    /// The current linger hold and a counter telling the timers apart.
+    static LINGER: RefCell<(u64, Option<gio::ApplicationHoldGuard>)> =
+        const { RefCell::new((0, None)) };
 }
 
 #[cfg(test)]

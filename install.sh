@@ -26,6 +26,28 @@ unset_default() {
     fi
 }
 
+# Whether D-Bus name $1 is owned on the session bus (asking does not start anything).
+bus_name_owned() {
+    [[ "$(gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.NameHasOwner "$1" 2>/dev/null)" == *true* ]]
+}
+
+# A running RFiles keeps running the old binary, and every new launch goes to it.
+# Asks it to exit if it has no windows (it is just lingering); otherwise tells the user.
+# It is found by its unique bus name, so nothing else can be hit.
+switch_running_rfiles() {
+    local name=io.github.rfiles.Files
+    bus_name_owned "$name" || return 0
+    gdbus call --session --dest "$name" --object-path /io/github/rfiles/Files \
+        --method org.gtk.Actions.Activate quit-if-idle '[]' '{}' >/dev/null 2>&1 || true
+    for _ in {1..30}; do
+        bus_name_owned "$name" || return 0
+        sleep 0.1
+    done
+    echo "RFiles is open right now, and its windows still run the old version."
+    echo "Close all RFiles windows (or press Ctrl+Q in one) to switch to the new version."
+}
+
 case "${1:-}" in
     uninstall)
         unset_default
@@ -122,6 +144,7 @@ install -m644 data/io.github.rfiles.Files.svg "$ICON_FILE"
 # Two Exec lines: the main entry (with %U) and the "New Window" action (without)
 sed -e "s|^Exec=rfiles %U\$|Exec=$BIN_DIR/rfiles %U|" -e "s|^Exec=rfiles\$|Exec=$BIN_DIR/rfiles|" rfiles.desktop > "$APP_DIR/rfiles.desktop"
 update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
+switch_running_rfiles
 
 echo
 echo "Done! Open \"RFiles\" from your app grid, or run: rfiles"
