@@ -59,7 +59,7 @@ on a laptop with Intel + NVIDIA graphics; numbers vary with the graphics driver)
 | Open in Terminal | ✅ built in | needs an extension |
 | Search | file names, Enter includes subfolders | ✅ faster, also searches inside documents |
 | Copy / cut / paste | ✅ with progress; asks on a taken name: keep both, replace or skip | ✅ with progress, overwrite prompts |
-| Undo (Ctrl+Z) | ❌ | ✅ |
+| Undo (Ctrl+Z) | ✅ rename, move, copy, new folder, move to trash (not permanent delete or replace) | ✅ |
 | Drag and drop files | ✅ | ✅ |
 | Creates thumbnails | ✅ images and PDFs | ✅ also videos |
 | Compress / extract | ✅ zip, tar.gz, tar.xz | ✅ more formats |
@@ -67,7 +67,7 @@ on a laptop with Intel + NVIDIA graphics; numbers vary with the graphics driver)
 | Batch rename | ✅ find & replace, numbering | ✅ |
 
 **In short:** RFiles now covers the everyday file-management basics and adds the
-instant preview pane, with less memory. GNOME Files still has undo, faster
+instant preview pane, with less memory. GNOME Files still has faster
 full-text search and more archive formats. The two work side by side: copy/paste,
 drag and drop and thumbnails are shared between them.
 
@@ -125,6 +125,7 @@ Keep GNOME Files installed; Ubuntu uses it in a few places. To switch back:
 | Tab keys (tab focused) | Left / Right / Home / End move between tabs, Enter or Space opens, Delete closes |
 | Preview / open | single-click / double-click or Enter (several selected: opens all, up to 20; the first folder here, other folders in new tabs) |
 | Copy / cut / paste | Ctrl+C / Ctrl+X / Ctrl+V |
+| Undo / redo a file operation | Ctrl+Z / Ctrl+Shift+Z (rename, move, copy, new folder, move to trash; also at the top of the right-click menu on empty space) |
 | Select several | Ctrl+click, Shift+click, drag a box, Ctrl+A |
 | Rename / move to trash | F2 (several selected = batch rename) / Delete |
 | Delete permanently | Shift+Delete (asks first) |

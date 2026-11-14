@@ -352,14 +352,19 @@ pub struct TrashOutcome {
     pub out: Outcome,
     /// Items on drives without a trash (some USB sticks, network shares), with their labels
     pub unsupported: Vec<(gio::File, String)>,
+    /// Local paths of the items moved to the trash, for undo
+    pub trashed: Vec<PathBuf>,
 }
 
 /// Moves each (file, label) to the trash. Runs on a worker thread.
 pub fn trash_all(items: Vec<(gio::File, String)>) -> TrashOutcome {
-    let mut t = TrashOutcome { out: Outcome::default(), unsupported: Vec::new() };
+    let mut t = TrashOutcome { out: Outcome::default(), unsupported: Vec::new(), trashed: Vec::new() };
     for (f, label) in items {
         match f.trash(None::<&gio::Cancellable>) {
-            Ok(()) => t.out.done += 1,
+            Ok(()) => {
+                t.out.done += 1;
+                t.trashed.extend(f.path());
+            }
             Err(e) => {
                 t.out.errors.push(format!("{label}: {}", e.message()));
                 if e.matches(gio::IOErrorEnum::NotSupported) {
@@ -476,8 +481,18 @@ pub fn move_to_trash(app: &Rc<App>, items: Vec<(gio::File, String)>) {
     if items.is_empty() {
         return;
     }
-    spawn_job(app, Job::Trash, items.len(), move || trash_all(items), |app, t| {
-        app.notify(job_notice(Job::Trash, t.out));
+    let n = items.len();
+    let work = move || {
+        let since = crate::undo::trash_stamp();
+        let t = trash_all(items);
+        // Looked up right away, so undo can restore them
+        let found = crate::undo::find_trash_items(&t.trashed, &since);
+        (t, found)
+    };
+    spawn_job(app, Job::Trash, n, work, |app, (t, found)| {
+        let mut notice = job_notice(Job::Trash, t.out);
+        notice.text += &crate::undo::record_trash(&t.trashed, found);
+        app.notify(notice);
         if t.unsupported.is_empty() {
             return;
         }

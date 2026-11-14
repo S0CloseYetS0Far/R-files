@@ -1233,6 +1233,9 @@ impl App {
                     gdk::Key::x | gdk::Key::X if ctrl => "cut",
                     gdk::Key::v | gdk::Key::V if ctrl => "paste",
                     gdk::Key::a | gdk::Key::A if ctrl => "select-all",
+                    // Here and not an application shortcut, so text entries keep Ctrl+Z for their own undo
+                    gdk::Key::z | gdk::Key::Z if ctrl && !alt && shift => "redo",
+                    gdk::Key::z | gdk::Key::Z if ctrl && !alt => "undo",
                     gdk::Key::Escape => "select-none",
                     _ => return glib::Propagation::Proceed,
                 };
@@ -1586,6 +1589,16 @@ impl App {
 
     fn background_menu(&self) -> Vec<Option<MItem>> {
         let mut m = Vec::new();
+        // Left out when there is nothing to undo or redo
+        let undo = [(false, "win.undo", "Ctrl+Z"), (true, "win.redo", "Ctrl+Shift+Z")];
+        for (redo, action, accel) in undo {
+            if let Some(label) = crate::undo::label(redo) {
+                m.push(mi(label, action, accel));
+            }
+        }
+        if !m.is_empty() {
+            m.push(None);
+        }
         if self.in_trash() {
             m.push(mi("Empty Trash", "win.empty-trash", ""));
         } else if self.current_dir().is_some() {
@@ -3669,6 +3682,7 @@ impl App {
             let w = Rc::downgrade(a);
             if infos.len() > 1 {
                 crate::batch_rename::open(&a.window, &infos, move |renames| {
+                    crate::undo::record_renames(renames);
                     if let Some(a) = w.upgrade() {
                         a.note_renames(renames);
                     }
@@ -3683,8 +3697,10 @@ impl App {
                 let renamed = file
                     .set_display_name(&new, None::<&gio::Cancellable>)
                     .map_err(|e| e.message().to_string())?;
+                let pair = [(file.uri().to_string(), renamed.uri().to_string())];
+                crate::undo::record_renames(&pair);
                 if let Some(a) = w.upgrade() {
-                    a.note_renames(&[(file.uri().to_string(), renamed.uri().to_string())]);
+                    a.note_renames(&pair);
                 }
                 Ok(())
             });
@@ -3704,11 +3720,16 @@ impl App {
                 if let Some(p) = folder_name_problem(&name) {
                     return Err(p.to_string());
                 }
-                dir.child(&name)
-                    .make_directory(None::<&gio::Cancellable>)
-                    .map_err(|e| e.message().to_string())
+                let new = dir.child(&name);
+                new.make_directory(None::<&gio::Cancellable>).map_err(|e| e.message().to_string())?;
+                if let Some(p) = new.path() {
+                    crate::undo::record(crate::undo::Op::NewFolder(p));
+                }
+                Ok(())
             });
         }));
+        add("undo", Box::new(|a| crate::undo::run(a, false)));
+        add("redo", Box::new(|a| crate::undo::run(a, true)));
 
         let unpin = gio::SimpleAction::new("unpin", Some(glib::VariantTy::STRING));
         let a = Rc::downgrade(self);
@@ -4225,6 +4246,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Tab keys (tab focused)", "Left / Right / Home / End move, Enter or Space opens, Delete closes"),
     ("Preview / open", "Click / double-click or Enter"),
     ("Copy / cut / paste", "Ctrl+C / Ctrl+X / Ctrl+V"),
+    ("Undo / redo a file operation", "Ctrl+Z / Ctrl+Shift+Z"),
     ("Select several", "Ctrl+click, Shift+click, drag a box, Ctrl+A"),
     ("Rename / move to trash", "F2 (several selected = batch rename) / Delete"),
     ("Delete permanently", "Shift+Delete (asks first)"),
