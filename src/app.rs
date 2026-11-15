@@ -615,7 +615,8 @@ pub struct App {
     outer: gtk::Paned,
     inner: gtk::Paned,
     volumes: gio::VolumeMonitor,
-    config: RefCell<Config>,
+    /// The settings, shared with every other window of this process
+    config: Rc<RefCell<Config>>,
     search_gen: Cell<u64>,
     /// Set to stop the running deep search walk, if there is one
     search_cancel: RefCell<Option<Arc<AtomicBool>>>,
@@ -747,7 +748,8 @@ fn icon_toggle(icon: &str, tip: &str) -> gtk::ToggleButton {
 }
 
 pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
-    let config = Config::load();
+    let shared_config = crate::config::shared();
+    let config = shared_config.borrow();
     apply_folder_icon_setting(&config.folder_icon);
     ICON_SIZE.with(|s| s.set(config.icon_size));
 
@@ -986,6 +988,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     if config.maximized {
         window.maximize();
     }
+    drop(config);
 
     let app = Rc::new(App {
         window,
@@ -1032,7 +1035,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         outer,
         inner,
         volumes: gio::VolumeMonitor::get(),
-        config: RefCell::new(config),
+        config: shared_config,
         search_gen: Cell::new(0),
         search_cancel: RefCell::new(None),
         layout_ready: Cell::new(false),
@@ -1067,7 +1070,20 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     app.restore_layout(preview_width);
     app.window.present();
     app.grid.grab_focus();
+    // Told once, in the first window
+    let problems = std::mem::take(&mut app.config.borrow_mut().load_problems);
+    if !problems.is_empty() {
+        let text = "Couldn't read some settings files; changes to them won't be saved until RFiles is restarted";
+        app.notify(crate::banner::Notice { text: text.into(), errors: problems });
+    }
     app
+}
+
+/// Runs `f` for every shown window, including the one asking; a window being closed is left alone.
+fn for_each_window(f: impl Fn(&Rc<App>)) {
+    // A copy: `f` may open or close windows
+    let apps = OPEN.with(|o| o.borrow().clone());
+    apps.iter().filter(|a| a.window.is_visible()).for_each(f);
 }
 
 impl App {
@@ -1335,9 +1351,11 @@ impl App {
             return;
         }
         self.sorter.changed(gtk::SorterChange::Different);
-        let mut c = self.config.borrow_mut();
-        (c.sort, c.sort_desc) = state;
-        c.save();
+        {
+            let mut c = self.config.borrow_mut();
+            (c.sort, c.sort_desc) = state;
+        }
+        self.save_config();
     }
 
     /// Right-click (menu) and middle-click (open in new tab) on a file.
@@ -2608,15 +2626,14 @@ impl App {
             (Some(("place", s)), Some(("place", d))) => {
                 let mut order: Vec<String> = self.places().iter().map(|p| p.0.to_string()).collect();
                 if Self::move_in(&mut order, s, d, before) {
-                    let mut c = self.config.borrow_mut();
-                    c.places_order = order;
-                    c.save();
+                    self.config.borrow_mut().places_order = order;
+                    self.save_config();
                 }
             }
             (Some(("pin", s)), Some(("pin", d))) => {
-                let mut c = self.config.borrow_mut();
-                if Self::move_in(&mut c.pins, s, d, before) {
-                    c.save();
+                let moved = Self::move_in(&mut self.config.borrow_mut().pins, s, d, before);
+                if moved {
+                    self.save_config();
                 }
             }
             _ => {
@@ -2624,7 +2641,7 @@ impl App {
                 return;
             }
         }
-        self.rebuild_sidebar();
+        Self::pins_changed();
     }
 
     /// "Move Up" / "Move Down" from the sidebar's right-click menu.
@@ -2828,32 +2845,65 @@ impl App {
     }
 
     pub(crate) fn set_pinned(self: &Rc<Self>, uri: String, pinned: bool) {
+        if pinned && !crate::config::storable(&uri) {
+            self.status.set_text("Folders with a line break in their address can't be pinned");
+            return;
+        }
         {
             let mut c = self.config.borrow_mut();
             c.pins.retain(|u| u != &uri);
             if pinned {
                 c.pins.push(uri);
             }
-            c.save();
         }
-        self.rebuild_sidebar();
-        self.update_pin_button();
+        self.save_config();
+        Self::pins_changed();
     }
 
     /// Keeps pins and stars on items RFiles renamed: `renames` are (old URI, new URI).
     pub(crate) fn note_renames(self: &Rc<Self>, renames: &[(String, String)]) {
-        let changed = {
-            let mut c = self.config.borrow_mut();
-            let changed = c.apply_renames(renames);
-            if changed {
-                c.save();
-            }
-            changed
-        };
+        let changed = self.config.borrow_mut().apply_renames(renames);
         if changed {
-            self.rebuild_sidebar();
-            self.update_pin_button();
+            self.save_config();
+            Self::pins_changed();
+            Self::stars_changed();
         }
+    }
+
+    /// Saves the shared settings. A failure is shown once, until a save works again; the next change retries.
+    fn save_config(&self) {
+        let err = self.config.borrow_mut().save();
+        if let Some(e) = err {
+            self.notify(crate::banner::Notice { text: format!("Couldn't save settings — {e}"), errors: vec![e] });
+        }
+    }
+
+    /// Pins or the places order changed: every window shows them again.
+    fn pins_changed() {
+        for_each_window(|a| {
+            a.rebuild_sidebar();
+            a.update_pin_button();
+        });
+    }
+
+    /// Stars changed: windows showing Starred show the new list.
+    fn stars_changed() {
+        for_each_window(|a| {
+            if matches!(a.current_loc(), Loc::Starred) {
+                a.reload();
+            }
+        });
+    }
+
+    /// The folder icon or icon size changed (already applied process-wide): every window redraws its icons, and
+    /// the others' settings menus show the new choice.
+    fn icons_changed(self: &Rc<Self>) {
+        for_each_window(|a| {
+            if !Rc::ptr_eq(a, self) {
+                a.setup_settings_popover();
+            }
+            a.reload();
+        });
     }
 
     /// Dims pinned folders that aren't there, once a check off the UI thread says so.
@@ -3010,23 +3060,21 @@ impl App {
             let Some(a) = a.upgrade() else { return };
             let px = ICON_SIZES.get(dd.selected() as usize).map(|s| s.0).unwrap_or(40);
             ICON_SIZE.with(|s| s.set(px));
-            {
-                let mut c = a.config.borrow_mut();
-                c.icon_size = px;
-                c.save();
-            }
-            a.reload();
+            a.config.borrow_mut().icon_size = px;
+            a.save_config();
+            a.icons_changed();
         });
     }
 
     fn set_folder_icon(self: &Rc<Self>, setting: String) {
-        apply_folder_icon_setting(&setting);
-        {
-            let mut c = self.config.borrow_mut();
-            c.folder_icon = setting;
-            c.save();
+        if !crate::config::storable(&setting) {
+            self.status.set_text("Images with a line break in their path can't be used as the folder icon");
+            return;
         }
-        self.reload();
+        apply_folder_icon_setting(&setting);
+        self.config.borrow_mut().folder_icon = setting;
+        self.save_config();
+        self.icons_changed();
     }
 
     fn pick_image(&self, title: &str, f: impl FnOnce(Option<gio::File>) + 'static) {
@@ -3298,20 +3346,24 @@ impl App {
         if infos.is_empty() {
             return;
         }
+        let mut skipped = false;
         {
             let mut c = self.config.borrow_mut();
             for info in &infos {
                 let uri = item_file(info).uri().to_string();
                 if c.starred.contains(&uri) {
                     c.starred.retain(|u| u != &uri);
-                } else {
+                } else if crate::config::storable(&uri) {
                     c.starred.push(uri);
+                } else {
+                    skipped = true;
                 }
             }
-            c.save();
         }
-        if matches!(self.current_loc(), Loc::Starred) {
-            self.reload();
+        self.save_config();
+        Self::stars_changed();
+        if skipped {
+            self.status.set_text("Items with a line break in their address can't be starred");
         }
     }
 
@@ -3335,9 +3387,8 @@ impl App {
             if dead.is_empty() {
                 return;
             }
-            let mut c = a.config.borrow_mut();
-            c.starred.retain(|u| !dead.contains(u));
-            c.save();
+            a.config.borrow_mut().starred.retain(|u| !dead.contains(u));
+            a.save_config();
         });
     }
 
@@ -3401,11 +3452,10 @@ impl App {
         if self.layout_ready.get() {
             self.note_widths(&mut c);
         }
-        c.list_view = self.view_btn.is_active();
-        c.show_sidebar = self.sidebar_btn.is_active();
-        c.show_preview = self.preview_btn.is_active();
-        c.show_hidden = self.show_hidden.get();
-        c.save();
+        // List or grid, hidden files and the panes are saved when they are changed, so resizing or closing
+        // one window doesn't put back what another window last chose
+        drop(c);
+        self.save_config();
     }
 
     /// Puts the pane widths into `c`. A hidden pane keeps the width it had.
@@ -3431,11 +3481,13 @@ impl App {
 
     /// Saves the shown/hidden state of the panes, once the window is up.
     fn save_pane_state(&self) {
-        let mut c = self.config.borrow_mut();
-        c.show_sidebar = self.sidebar_btn.is_active();
-        c.show_preview = self.preview_btn.is_active();
+        {
+            let mut c = self.config.borrow_mut();
+            c.show_sidebar = self.sidebar_btn.is_active();
+            c.show_preview = self.preview_btn.is_active();
+        }
         if self.window.is_mapped() {
-            c.save();
+            self.save_config();
         }
     }
 
@@ -3937,12 +3989,17 @@ impl App {
             let Some(a) = a.upgrade() else { return };
             a.show_hidden.set(b.is_active());
             a.filter.changed(gtk::FilterChange::Different);
+            // The last window to change it sets what new windows start with
+            a.config.borrow_mut().show_hidden = b.is_active();
+            a.save_config();
         });
         let a = Rc::downgrade(self);
         self.view_btn.connect_toggled(move |b| {
             let Some(a) = a.upgrade() else { return };
             a.view_stack
                 .set_visible_child_name(if b.is_active() { "list" } else { "grid" });
+            a.config.borrow_mut().list_view = b.is_active();
+            a.save_config();
         });
         let a = Rc::downgrade(self);
         self.sidebar_btn.connect_toggled(move |b| {
