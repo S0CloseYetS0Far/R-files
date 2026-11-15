@@ -73,6 +73,19 @@ drag and drop and thumbnails are shared between them.
 
 ## Install (Ubuntu 24.04 or newer)
 
+### Option 1: the .deb package (no compiling)
+
+Download the `.deb` from the [Releases](https://github.com/S0CloseYetS0Far/R-files/releases) page and run:
+
+```bash
+sudo apt install ./rfiles_*.deb
+```
+
+Then open **RFiles** from the app grid, or run `rfiles`. To update, install the newer `.deb` the same way;
+to remove it: `sudo apt remove rfiles`.
+
+### Option 2: build from source with the script
+
 Open a terminal and run:
 
 ```bash
@@ -83,20 +96,25 @@ cd R-files
 
 The script installs the few packages needed to build, installs Rust if you
 don't have it, builds RFiles and adds it to your app grid. It asks for your
-password once (for `apt`).
+password once (for `apt`). It puts the program in `~/.local/bin`, which must be on your `PATH` for the
+`rfiles` command to work (on Ubuntu the folder is added to `PATH` at login, so log out and in once if
+`rfiles` is not found right after the first install). The app grid entry works either way.
 
 Then open **RFiles** from the app grid, or run `rfiles` (or `rfiles ~/Some/Folder`).
 
-To update, run `git pull` and `./install.sh` again; if RFiles is open, its windows keep running the
+With the script, to update run `git pull` and `./install.sh` again; if RFiles is open, its windows keep running the
 old version until you close them all (or press Ctrl+Q).
 
-To uninstall: `./install.sh uninstall`
+To uninstall the script install: `./install.sh uninstall`
 
 ### Make RFiles your default file manager
 
 ```bash
 ./install.sh set-default
 ```
+
+(Run it from a clone of this repository; it works for both the `.deb` and the script install.
+The `.deb` does not do this by itself.)
 
 This makes folders open in RFiles (desktop icons, "Open folder" in download
 notifications, other apps) and makes **"Show in folder"** from Firefox, Brave,
