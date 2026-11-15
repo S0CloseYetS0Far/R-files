@@ -1806,6 +1806,17 @@ fn terminal_candidates(
     out
 }
 
+/// The command that starts terminal `prog` in `dir`, without the variables RFiles set only for itself.
+pub fn terminal_command(prog: &str, args: &[String], dir: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(prog);
+    cmd.args(args).current_dir(dir);
+    // Else Vulkan in the terminal (and all it runs) can't see the sleeping graphics card
+    if let Some(var) = crate::gpu::set_here() {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Opens the user's terminal in `dir`.
 pub fn open_terminal(dir: &Path) -> Result<(), String> {
     // Absolute, so the flags still point at the folder and a leading "-" can't look like an option
@@ -1815,9 +1826,7 @@ pub fn open_terminal(dir: &Path) -> Result<(), String> {
     let installed = |prog: &str| glib::find_program_in_path(prog).is_some();
     // The working directory is also set on the process, which is enough for terminals not listed here.
     for (prog, args) in terminal_candidates(&d, &installed, alt.as_deref()) {
-        let mut cmd = std::process::Command::new(&prog);
-        cmd.args(&args).current_dir(&dir);
-        if let Ok(child) = cmd.spawn() {
+        if let Ok(child) = terminal_command(&prog, &args, &dir).spawn() {
             // GLib reaps it when it exits (no zombie, no parked thread per terminal)
             glib::child_watch_add(glib::Pid(child.id() as i32), |_, _| {});
             return Ok(());

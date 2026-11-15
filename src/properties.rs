@@ -595,7 +595,7 @@ fn free_space_row(grid: &gtk::Grid, row: &mut i32, path: PathBuf) {
 }
 
 /// Apps for a content type: the registered ones first, then the others.
-fn apps_for_type(ct: &str) -> Vec<gio::AppInfo> {
+pub fn apps_for_type(ct: &str) -> Vec<gio::AppInfo> {
     let mut seen = HashSet::new();
     let mut apps = gio::AppInfo::all_for_type(ct);
     apps.extend(gio::AppInfo::fallback_for_type(ct));

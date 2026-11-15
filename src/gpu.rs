@@ -9,6 +9,7 @@
 //! card's driver.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 const NVIDIA: u32 = 0x10de;
 const AMD: u32 = 0x1002;
@@ -79,23 +80,75 @@ fn read(p: &Path) -> Option<String> {
     std::fs::read_to_string(p).ok().map(|s| s.trim().to_string())
 }
 
-/// Must run first thing in `main`, before any thread exists (it changes
-/// the environment) and before GTK loads Vulkan. Does nothing when the
-/// user already chose Vulkan drivers or a renderer themselves.
-pub fn keep_sleeping_cards_asleep() {
-    const OWN_CHOICE: [&str; 5] = [
-        "VK_LOADER_DRIVERS_DISABLE",
-        "VK_LOADER_DRIVERS_SELECT",
-        "VK_DRIVER_FILES",
-        "VK_ICD_FILENAMES",
-        "GSK_RENDERER",
-    ];
-    if OWN_CHOICE.iter().any(|v| std::env::var_os(v).is_some()) {
-        return;
+const SELECT: &str = "VK_LOADER_DRIVERS_SELECT";
+
+/// The variable this process set for itself, so programs it starts can be
+/// given the environment without it (they may want the sleeping card).
+static SET_HERE: OnceLock<&'static str> = OnceLock::new();
+
+/// What to set: `(variable, value)`, or `None` when the user already chose
+/// Vulkan drivers or a renderer themselves (`is_set` says whether a
+/// variable is in the environment) or nothing needs choosing.
+/// `cards` is only asked for when needed (it reads /sys).
+fn choice(is_set: impl Fn(&str) -> bool, cards: impl FnOnce() -> Vec<Card>) -> Option<(&'static str, String)> {
+    const OWN_CHOICE: [&str; 5] =
+        ["VK_LOADER_DRIVERS_DISABLE", SELECT, "VK_DRIVER_FILES", "VK_ICD_FILENAMES", "GSK_RENDERER"];
+    if OWN_CHOICE.iter().any(|v| is_set(v)) {
+        return None;
     }
-    if let Some(only) = drivers_to_use(&cards()) {
+    drivers_to_use(&cards()).map(|only| (SELECT, only))
+}
+
+/// Must run first thing in `main`, before any thread exists (it changes
+/// the environment) and before GTK loads Vulkan. It stays set: GTK may
+/// create renderers again for later windows, and removing it once threads
+/// run isn't safe. Programs RFiles starts drop it, see `set_here`.
+pub fn keep_sleeping_cards_asleep() {
+    if let Some((var, only)) = choice(|v| std::env::var_os(v).is_some(), cards) {
         // SAFETY: called at the top of `main`, while this is the only thread.
-        unsafe { std::env::set_var("VK_LOADER_DRIVERS_SELECT", only) };
+        unsafe { std::env::set_var(var, only) };
+        remember(var);
+    }
+}
+
+pub(crate) fn remember(var: &'static str) {
+    let _ = SET_HERE.set(var);
+}
+
+/// The environment variable RFiles set for itself (not one the user set),
+/// to be removed from the environment of every program it starts.
+pub fn set_here() -> Option<&'static str> {
+    SET_HERE.get().copied()
+}
+
+#[cfg(test)]
+mod choice_tests {
+    use super::*;
+
+    fn laptop() -> Vec<Card> {
+        vec![Card { vendor: INTEL, asleep: false }, Card { vendor: NVIDIA, asleep: true }]
+    }
+
+    #[test]
+    fn sets_select_on_a_laptop_with_a_sleeping_card() {
+        assert_eq!(choice(|_| false, laptop), Some((SELECT, "*intel*".to_string())));
+        assert_eq!(choice(|_| false, || laptop()[..1].to_vec()), None);
+    }
+
+    #[test]
+    fn leaves_the_users_own_choice_alone() {
+        // Their value is theirs: not overwritten, and not remembered (so children keep it)
+        for own in [SELECT, "VK_ICD_FILENAMES", "GSK_RENDERER"] {
+            assert_eq!(choice(|v| v == own, || panic!("no need to look at the cards")), None, "{own}");
+        }
+        // Unrelated variables don't count
+        assert!(choice(|v| v == "VK_INSTANCE_LAYERS", laptop).is_some());
+    }
+
+    #[test]
+    fn nothing_remembered_unless_set() {
+        // Tests never call keep_sleeping_cards_asleep, so this process set nothing
+        assert_eq!(set_here(), None);
     }
 }
 
