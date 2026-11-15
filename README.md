@@ -30,7 +30,7 @@ Click once on a PDF to read it page by page, or on a folder to see what's inside
 - **Batch rename** several files at once: find & replace, or numbering like `Holiday ###`, with a live preview
 - **Open in Terminal** from any folder
 - **Custom icons**: light-blue folders by default, the system theme, your own image, or a different icon per file
-- **Search** at the top right: filters as you type, Enter searches subfolders too
+- **Search** at the top right: filters as you type, Enter searches subfolders too. The ⋯ button next to it has an opt-in "Also search inside text files" (text files under 2 MB and office documents; not PDFs)
 - **Sort** by name, size, modified date or type, folders always first: right-click empty space, or click a column header in the list view (click again to reverse)
 - **Hide the sidebar or the preview pane** for more room (F9 / F4); nothing is previewed while the preview is hidden
 - Remembers your window size, sidebar and preview widths
