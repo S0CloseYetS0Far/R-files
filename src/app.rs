@@ -645,6 +645,11 @@ thread_local! {
     static OPEN: RefCell<Vec<Rc<App>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// The windows that are open (not closing), for results whose own window is gone (`jobs::deliver`).
+pub(crate) fn open_windows() -> Vec<Rc<App>> {
+    OPEN.with(|o| o.borrow().iter().filter(|a| a.window.is_visible()).cloned().collect())
+}
+
 /// Screen-reader name for an icon-only button: the tooltip without its shortcut, "Back (Alt+Left)" -> "Back".
 fn accessible_name(tip: &str) -> &str {
     tip.split(" (").next().unwrap_or(tip)
@@ -2113,14 +2118,10 @@ impl App {
         }
     }
 
-    /// `notify` for code that has no `App`, holding the window weakly.
+    /// `notify` for code that has no `App`, holding the window weakly; see `jobs::deliver` for a closed window.
     fn notifier(self: &Rc<Self>) -> crate::archive::Notify {
         let w = Rc::downgrade(self);
-        Rc::new(move |n| {
-            if let Some(a) = w.upgrade() {
-                a.notify(n);
-            }
-        })
+        Rc::new(move |n| crate::jobs::deliver(&w, n))
     }
 
     fn update_status(&self) {
@@ -3331,13 +3332,18 @@ impl App {
                 (f, orig, i.file_type() == gio::FileType::Directory)
             })
             .collect();
-        self.status.set_text(&format!("Restoring {} item(s)…", items.len()));
-        let a = self.clone();
+        let busy = format!("Restoring {} item(s)…", items.len());
+        self.status.set_text(&busy);
+        // Runs on after the window closes; the result then goes elsewhere
+        let job = crate::jobs::start(&busy, None);
+        let a = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            match gio::spawn_blocking(move || crate::trash::restore(items)).await {
-                Ok(o) => a.notify(crate::banner::Notice { text: crate::trash::restore_message(&o), errors: o.errors }),
-                Err(_) => a.notify(crate::banner::Notice::stopped("Restore failed")),
-            }
+            let n = match gio::spawn_blocking(move || crate::trash::restore(items)).await {
+                Ok(o) => crate::banner::Notice { text: crate::trash::restore_message(&o), errors: o.errors },
+                Err(_) => crate::banner::Notice::stopped("Restore failed"),
+            };
+            crate::jobs::deliver(&a, n);
+            drop(job);
         });
     }
 
@@ -3644,13 +3650,10 @@ impl App {
             }
         }));
         let gw = gapp.downgrade();
-        add("quit", Box::new(move |_| {
-            let Some(g) = gw.upgrade() else { return };
-            // close(), not quit() alone: only close-request saves each window's layout
-            for w in g.windows() {
-                w.close();
+        add("quit", Box::new(move |a| {
+            if let Some(g) = gw.upgrade() {
+                crate::jobs::quit(&g, &a.window);
             }
-            g.quit();
         }));
         add("shortcuts", Box::new(|a| show_shortcuts(&a.window)));
         add("about", Box::new(|a| show_about(&a.window)));

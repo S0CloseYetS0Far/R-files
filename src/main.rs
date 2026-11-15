@@ -8,6 +8,7 @@ mod dnd;
 mod docs;
 mod fileops;
 mod gpu;
+mod jobs;
 mod pathbar;
 mod preview;
 mod properties;

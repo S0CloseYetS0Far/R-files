@@ -22,7 +22,7 @@ Click once on a PDF to read it page by page, or on a folder to see what's inside
 - **Live preview**: folders, images, video, audio, PDF, Word / LibreOffice / PowerPoint / Excel (text), zip archives, and any text or code file
 - **Sidebar** with Home, Recent, Starred, Documents, Downloads, Trash and more. Drag items to reorder them
 - **Pin folders** to the sidebar with one click (click again to unpin)
-- **Copy / cut / paste** (works together with GNOME Files)
+- **Copy / cut / paste** (works together with GNOME Files); copies, moves, deletes, compress and extract keep running after their window is closed, and Ctrl+Q asks before stopping them
 - **Drag and drop** files between folders, the sidebar and other apps (same drive moves, other drive copies; Ctrl copies, Shift moves)
 - **Thumbnails** for images and PDFs, made in the background for the files on screen and shared with GNOME Files. Files are decoded in a separate, time- and memory-limited process, inside a bubblewrap sandbox (no network, only that one file visible) where bwrap works
 - **Compress / extract**: .zip, .tar.gz and .tar.xz (Compress… and Extract Here in the right-click menu)

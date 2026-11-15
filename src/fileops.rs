@@ -1318,7 +1318,11 @@ fn run_transfer(
         glib::ControlFlow::Continue
     });
 
-    let hold = app.window.application().map(|g| g.hold());
+    // Keeps the process until the job and its result are done, however the windows are closed
+    let p = progress.clone();
+    let hold = crate::jobs::start(&progress_text(cut, n, 0, None), (!remote).then(|| -> Rc<dyn Fn()> {
+        Rc::new(move || p.cancel.store(true, Ordering::Relaxed))
+    }));
     let weak = Rc::downgrade(app);
     let wrow = row.downgrade();
     glib::spawn_future_local(async move {
@@ -1333,7 +1337,6 @@ fn run_transfer(
         })
         .await;
         finished.store(true, Ordering::Relaxed);
-        drop(hold);
         let cancelled = progress.stopped.load(Ordering::Relaxed);
         if let Ok(o) = &out {
             then(o, cancelled);
@@ -1343,15 +1346,16 @@ fn run_transfer(
             Ok(o) => crate::undo::record_transfer(cut, &o.items),
             Err(_) => String::new(),
         };
-        let Some(app) = weak.upgrade() else { return };
-        if let Some(row) = wrow.upgrade() {
+        if let (Some(app), Some(row)) = (weak.upgrade(), wrow.upgrade()) {
             app.transfers.remove(&row);
         }
         // In the result banner, so it survives the next click; Details lists every error
-        app.notify(match out {
+        crate::jobs::deliver(&weak, match out {
             Ok(o) => crate::banner::Notice { text: result_text(cut, &o, cancelled) + &note, errors: o.errors },
             Err(_) => crate::banner::Notice::stopped(if cut { "Move failed" } else { "Copy failed" }),
         });
+        drop(hold);
+        let Some(app) = weak.upgrade() else { return };
         // Folder views update themselves; Starred / search results don't
         if !matches!(app.current_loc(), Loc::Dir(_)) {
             app.reload();

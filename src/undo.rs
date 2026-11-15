@@ -627,11 +627,10 @@ pub fn run(app: &Rc<App>, redo: bool) {
     let what = op.describe();
     let total = op.len();
     app.status.set_text(&format!("{} {what}…", if redo { "Redoing" } else { "Undoing" }));
-    let hold = app.window.application().map(|g| g.hold());
+    let hold = crate::jobs::start(&format!("{} {what}", if redo { "Redoing" } else { "Undoing" }), None);
     let weak = Rc::downgrade(app);
     glib::spawn_future_local(async move {
         let res = gio::spawn_blocking(move || apply(op, redo)).await;
-        drop(hold);
         BUSY.set(false);
         let (notice, renames) = match res {
             Ok(a) => {
@@ -643,11 +642,12 @@ pub fn run(app: &Rc<App>, redo: bool) {
             }
             Err(_) => (crate::banner::Notice::stopped(if redo { "Redo failed" } else { "Undo failed" }), Vec::new()),
         };
-        let Some(app) = weak.upgrade() else { return };
-        if !renames.is_empty() {
+        if let Some(app) = weak.upgrade().filter(|_| !renames.is_empty()) {
             app.note_renames(&renames);
         }
-        app.notify(notice);
+        crate::jobs::deliver(&weak, notice);
+        drop(hold);
+        let Some(app) = weak.upgrade() else { return };
         // Folder views update themselves; Starred / search results don't
         if !matches!(app.current_loc(), Loc::Dir(_)) {
             app.reload();

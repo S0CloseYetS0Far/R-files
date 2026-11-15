@@ -10,7 +10,7 @@ use gtk::{gio, glib};
 use std::ffi::{CStr, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -444,27 +444,27 @@ fn empty_all() -> Outcome {
     out
 }
 
-/// Runs `work` on a worker thread, saying so in the status bar, then hands its result to `then`. The window is
-/// held weakly; the application is kept running until the work is done, so closing the window doesn't cut it
-/// short.
+/// Runs `work` on a worker thread, saying so in the status bar, then hands its result to `then`, with the
+/// window held weakly (results go through `jobs::deliver`, which copes with a closed window). The application
+/// is kept running until the work is done, so closing the window doesn't cut it short.
 fn spawn_job<T: Send + 'static>(
     app: &Rc<App>,
     job: Job,
     n: usize,
     work: impl FnOnce() -> T + Send + 'static,
-    then: impl FnOnce(&Rc<App>, T) + 'static,
+    then: impl FnOnce(&Weak<App>, T) + 'static,
 ) {
     app.status.set_text(&job.running(n));
-    let hold = app.window.application().map(|g| g.hold());
+    let hold = crate::jobs::start(&job.running(n), None);
     let weak = Rc::downgrade(app);
     glib::spawn_future_local(async move {
         let res = gio::spawn_blocking(work).await;
+        match res {
+            Ok(v) => then(&weak, v),
+            Err(_) => crate::jobs::deliver(&weak, crate::banner::Notice::stopped(job.failed())),
+        }
         drop(hold);
         let Some(app) = weak.upgrade() else { return };
-        match res {
-            Ok(v) => then(&app, v),
-            Err(_) => app.notify(crate::banner::Notice::stopped(job.failed())),
-        }
         // Folder views update themselves; Starred, search results, Recent and the trash may not
         let watched = match app.current_loc() {
             Loc::Dir(d) => !crate::util::is_trash(&d) && !d.uri().starts_with("recent:"),
@@ -489,13 +489,12 @@ pub fn move_to_trash(app: &Rc<App>, items: Vec<(gio::File, String)>) {
         let found = crate::undo::find_trash_items(&t.trashed, &since);
         (t, found)
     };
-    spawn_job(app, Job::Trash, n, work, |app, (t, found)| {
+    spawn_job(app, Job::Trash, n, work, |weak, (t, found)| {
         let mut notice = job_notice(Job::Trash, t.out);
         notice.text += &crate::undo::record_trash(&t.trashed, found);
-        app.notify(notice);
-        if t.unsupported.is_empty() {
-            return;
-        }
+        crate::jobs::deliver(weak, notice);
+        // Nothing is deleted without asking in that window
+        let Some(ref app) = weak.upgrade().filter(|_| !t.unsupported.is_empty()) else { return };
         let dlg = gtk::AlertDialog::builder()
             .message(format!("{} item(s) can't be moved to the trash. Delete permanently?", t.unsupported.len()))
             .detail("This can't be undone.")
@@ -536,7 +535,7 @@ pub fn confirm_delete(app: &Rc<App>, items: Vec<(gio::File, String)>) {
 
 fn delete_files(app: &Rc<App>, items: Vec<(gio::File, String)>) {
     spawn_job(app, Job::Delete, items.len(), move || delete_all(items), |app, o| {
-        app.notify(job_notice(Job::Delete, o));
+        crate::jobs::deliver(app, job_notice(Job::Delete, o));
     });
 }
 
@@ -553,7 +552,7 @@ pub fn empty_trash(app: &Rc<App>) {
     dlg.choose(Some(&app.window), None::<&gio::Cancellable>, move |r| {
         if let (Ok(1), Some(app)) = (r, weak.upgrade()) {
             spawn_job(&app, Job::EmptyTrash, 0, empty_all, |app, o| {
-                app.notify(job_notice(Job::EmptyTrash, o));
+                crate::jobs::deliver(app, job_notice(Job::EmptyTrash, o));
             });
         }
     });
@@ -565,7 +564,7 @@ pub fn forget_recent(app: &Rc<App>, items: Vec<(gio::File, String)>) {
         return;
     }
     spawn_job(app, Job::ForgetRecent, items.len(), move || delete_all(items), |app, o| {
-        app.notify(job_notice(Job::ForgetRecent, o));
+        crate::jobs::deliver(app, job_notice(Job::ForgetRecent, o));
     });
 }
 

@@ -671,8 +671,10 @@ pub(crate) fn extract(archive: &Path, dest: &Path, p: &Progress) -> io::Result<(
 pub type Notify = std::rc::Rc<dyn Fn(Notice)>;
 
 /// Runs `work` on a worker thread, showing `busy` plus progress in the
-/// status bar, then hands the result to `notify`.
+/// status bar, then hands the result to `notify`. Keeps the process running
+/// until then, however the windows are closed.
 fn run_job(status: &gtk::Label, busy: String, notify: Notify, work: impl FnOnce(&Progress) -> Notice + Send + 'static) {
+    let job = crate::jobs::start(&busy, None);
     let progress = Arc::new(Progress::default());
     status.set_text(&busy);
     let (st, p) = (status.clone(), progress.clone());
@@ -684,6 +686,7 @@ fn run_job(status: &gtk::Label, busy: String, notify: Notify, work: impl FnOnce(
         let res = gio::spawn_blocking(move || work(&progress)).await;
         timer.remove();
         notify(res.unwrap_or_else(|_| Notice::stopped("Archive operation failed")));
+        drop(job);
     });
 }
 
