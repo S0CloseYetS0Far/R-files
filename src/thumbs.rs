@@ -672,28 +672,56 @@ fn sandbox(exe: &Path) -> Option<&'static Path> {
     BWRAP.get_or_init(|| find_bwrap().filter(|b| sandbox_works(b, exe))).as_deref()
 }
 
-/// Renders `path` in a helper process (sandboxed when bwrap works) and reads back its thumbnail.
+/// Renders `path` in a helper process (sandboxed when bwrap works) and reads back its thumbnail. Types RFiles
+/// can't render itself go to the system's thumbnailer for them, if there is one.
 fn render_in_helper(path: &Path, mime: &str, px: i32) -> Helper {
     let Ok(exe) = std::env::current_exe() else { return Helper::Unavailable };
     // Replaced by an update: shows as "… (deleted)"
     if !exe.is_file() {
         return Helper::Unavailable;
     }
+    let tn = Some(mime).filter(|m| !renders_itself(m)).and_then(thumbnailer_for);
+    let run = |bwrap: Option<&Path>| match tn {
+        Some(tn) => run_thumbnailer(&exe, bwrap, tn, path, px),
+        None => run_helper(&exe, bwrap, path, mime, px),
+    };
     match sandbox(&exe) {
-        Some(bwrap) => match run_helper(&exe, Some(bwrap), path, mime, px) {
+        Some(bwrap) => match run(Some(bwrap)) {
             Helper::Unavailable if !bwrap.is_file() => {
                 // bwrap went away: carry on without it for this session
                 SANDBOX_OFF.store(true, Ordering::Relaxed);
-                run_helper(&exe, None, path, mime, px)
+                run(None)
             }
             done => done,
         },
-        None => run_helper(&exe, None, path, mime, px),
+        None => run(None),
     }
 }
 
 /// Runs the helper `exe` on one file, inside `bwrap` if given, in a private temp folder.
 fn run_helper(exe: &Path, bwrap: Option<&Path>, path: &Path, mime: &str, px: i32) -> Helper {
+    run_in_private_dir(px, |tmp, out| {
+        let mut cmd = match bwrap {
+            Some(bwrap) => {
+                let mut cmd = limited(bwrap);
+                cmd.args(bwrap_args(exe, Some(&glib::home_dir()), &root_entries(), Some((path, tmp))));
+                cmd.arg("--thumbnail").arg(box_input(path)).arg(BOX_OUT);
+                cmd
+            }
+            None => {
+                let mut cmd = limited(exe);
+                cmd.arg("--thumbnail").arg(path).arg(out);
+                cmd
+            }
+        };
+        cmd.arg(px.to_string()).arg(mime);
+        Some(cmd)
+    })
+}
+
+/// Makes a private folder, runs the command `make` builds for it (given the folder and the PNG path in it) under
+/// the time limit, and reads back and checks the PNG.
+fn run_in_private_dir(px: i32, make: impl FnOnce(&Path, &Path) -> Option<std::process::Command>) -> Helper {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = std::env::temp_dir().join(format!(
         "rfiles-thumb-{}-{}",
@@ -705,24 +733,10 @@ fn run_helper(exe: &Path, bwrap: Option<&Path>, path: &Path, mime: &str, px: i32
         return Helper::Unavailable;
     }
     let out = tmp.join("thumb.png");
-    let mut cmd = match bwrap {
-        Some(bwrap) => {
-            let mut cmd = limited(bwrap);
-            cmd.args(bwrap_args(exe, Some(&glib::home_dir()), &root_entries(), Some((path, &tmp))));
-            cmd.arg("--thumbnail").arg(box_input(path)).arg(BOX_OUT);
-            cmd
-        }
-        None => {
-            let mut cmd = limited(exe);
-            cmd.arg("--thumbnail").arg(path).arg(&out);
-            cmd
-        }
-    };
-    cmd.arg(px.to_string()).arg(mime);
-    let result = match run_limited(cmd) {
-        Err(_) => Helper::Unavailable,
-        Ok(false) => Helper::Failed,
-        Ok(true) => {
+    let result = match make(&tmp, &out).map(run_limited) {
+        None | Some(Ok(false)) => Helper::Failed,
+        Some(Err(_)) => Helper::Unavailable,
+        Some(Ok(true)) => {
             let mut data = Vec::new();
             let read = std::fs::File::open(&out).and_then(|f| f.take(MAX_THUMB_FILE).read_to_end(&mut data));
             match read.ok().and_then(|_| load_helper_png(&data, px)) {
@@ -733,6 +747,364 @@ fn run_helper(exe: &Path, bwrap: Option<&Path>, path: &Path, mime: &str, px: i32
     };
     let _ = std::fs::remove_dir_all(&tmp);
     result
+}
+
+// ======================= system thumbnailers =======================
+//
+// For types RFiles can't draw (videos, fonts, e-books, ...) it runs the program an installed `.thumbnailer` file
+// names, the way GNOME Files does, with the same sandbox, limits and PNG check as its own helper.
+
+/// One `.thumbnailer` file.
+#[derive(Clone, Debug, PartialEq)]
+struct Thumbnailer {
+    try_exec: Option<String>,
+    exec: String,
+}
+
+/// Where the thumbnailer files are. Only /usr is visible inside the sandbox, so programs elsewhere couldn't run.
+const THUMBNAILER_DIR: &str = "/usr/share/thumbnailers";
+
+/// Reads a `.thumbnailer` file: the keys of its `[Thumbnailer Entry]` group, and the MIME types it lists.
+fn parse_thumbnailer(text: &str) -> Option<(Thumbnailer, Vec<String>)> {
+    let (mut in_group, mut exec, mut try_exec, mut mimes) = (false, None, None, Vec::new());
+    for line in text.lines().map(str::trim) {
+        if let Some(group) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_group = group == "Thumbnailer Entry";
+        } else if in_group && !line.starts_with('#') {
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let value = value.trim();
+            match key.trim() {
+                "Exec" if !value.is_empty() => exec = Some(value.to_string()),
+                "TryExec" if !value.is_empty() => try_exec = Some(value.to_string()),
+                "MimeType" => {
+                    mimes = value.split(';').map(str::trim).filter(|m| !m.is_empty()).map(String::from).collect()
+                }
+                _ => {}
+            }
+        }
+    }
+    if mimes.is_empty() {
+        return None;
+    }
+    Some((Thumbnailer { try_exec, exec: exec? }, mimes))
+}
+
+/// Splits an `Exec` line into arguments as the Desktop Entry spec does: spaces separate them, double quotes keep
+/// one together (with backslash escapes inside). `None` for an unclosed quote or an empty line.
+fn split_exec(line: &str) -> Option<Vec<String>> {
+    let (mut args, mut cur, mut started, mut quoted) = (Vec::new(), String::new(), false, false);
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            '\\' if quoted => cur.push(chars.next()?),
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    args.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if quoted {
+        return None;
+    }
+    if started {
+        args.push(cur);
+    }
+    (!args.is_empty()).then_some(args)
+}
+
+/// The command line for `exec` with %i (input path), %u (input URI), %o (output path), %s (size) and %% filled
+/// in. Each argument stays one argument whatever the values contain; other codes are dropped.
+fn expand_exec(exec: &str, input: &str, uri: &str, out: &str, px: i32) -> Option<Vec<String>> {
+    let size = px.to_string();
+    let args = split_exec(exec)?.into_iter().map(|arg| {
+        let mut res = String::new();
+        let mut chars = arg.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                res.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('i') => res.push_str(input),
+                Some('u') => res.push_str(uri),
+                Some('o') => res.push_str(out),
+                Some('s') => res.push_str(&size),
+                Some('%') => res.push('%'),
+                _ => {}
+            }
+        }
+        res
+    });
+    Some(args.collect())
+}
+
+/// True when `TryExec` names a program that exists (an absolute path, or a name found in PATH).
+fn try_exec_exists(name: &str) -> bool {
+    if name.starts_with('/') {
+        return Path::new(name).is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+}
+
+/// MIME type -> thumbnailer from every `*.thumbnailer` in `dirs`. Files are read in name order and the first one
+/// to list a type keeps it; ones whose `TryExec` program is missing are left out.
+fn load_thumbnailers(dirs: &[PathBuf]) -> HashMap<String, Thumbnailer> {
+    let mut map = HashMap::new();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let mut files: Vec<PathBuf> =
+            rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "thumbnailer")).collect();
+        files.sort();
+        for file in files {
+            let Ok(f) = std::fs::File::open(&file) else { continue };
+            let mut text = String::new();
+            if f.take(64 * 1024).read_to_string(&mut text).is_err() {
+                continue;
+            }
+            let Some((tn, mimes)) = parse_thumbnailer(&text) else { continue };
+            if tn.try_exec.as_deref().is_some_and(|t| !try_exec_exists(t)) {
+                continue;
+            }
+            for mime in mimes {
+                map.entry(mime).or_insert_with(|| tn.clone());
+            }
+        }
+    }
+    map
+}
+
+/// The installed thumbnailer for a MIME type. The files are read once per session.
+fn thumbnailer_for(mime: &str) -> Option<&'static Thumbnailer> {
+    static ALL: OnceLock<HashMap<String, Thumbnailer>> = OnceLock::new();
+    ALL.get_or_init(|| load_thumbnailers(&[PathBuf::from(THUMBNAILER_DIR)])).get(mime)
+}
+
+/// MIME types RFiles' own helper draws: what gdk-pixbuf loads, and PDF.
+fn renders_itself(mime: &str) -> bool {
+    static OWN: OnceLock<HashSet<String>> = OnceLock::new();
+    mime == "application/pdf"
+        || OWN
+            .get_or_init(|| {
+                Pixbuf::formats()
+                    .iter()
+                    .filter(|f| !f.is_disabled())
+                    .flat_map(|f| f.mime_types())
+                    .map(|m| m.to_string())
+                    .collect()
+            })
+            .contains(mime)
+}
+
+/// Runs a system thumbnailer on one file like `run_helper` does: in `bwrap` if given, in a private temp folder,
+/// then the PNG it wrote is checked by `load_helper_png`.
+fn run_thumbnailer(exe: &Path, bwrap: Option<&Path>, tn: &Thumbnailer, path: &Path, px: i32) -> Helper {
+    run_in_private_dir(px, |tmp, out| {
+        // Inside the sandbox the file is at a fixed, plain name
+        let (input, out) = match bwrap {
+            Some(_) => (PathBuf::from(box_input(path)), PathBuf::from(BOX_OUT)),
+            None => (path.to_path_buf(), out.to_path_buf()),
+        };
+        let uri = glib::filename_to_uri(&input, None).ok()?;
+        let args = expand_exec(&tn.exec, &input.to_string_lossy(), uri.as_str(), &out.to_string_lossy(), px)?;
+        let (program, rest) = args.split_first()?;
+        Some(match bwrap {
+            Some(bwrap) => {
+                let mut cmd = limited(bwrap);
+                let mut a = bwrap_args(exe, Some(&glib::home_dir()), &root_entries(), Some((path, tmp)));
+                // The last argument is RFiles' own binary; the thumbnailer runs instead
+                a.pop();
+                cmd.args(a).arg(program).args(rest);
+                cmd
+            }
+            None => {
+                let mut cmd = limited(Path::new(program));
+                cmd.args(rest);
+                cmd
+            }
+        })
+    })
+}
+
+#[cfg(test)]
+mod system_thumbnailer_tests {
+    use super::*;
+
+    const GST: &str = "[Thumbnailer Entry]\n# a comment\nTryExec=/usr/bin/true\n\
+        Exec=/usr/bin/gst-video-thumbnailer --input-uri %u --output %o --size %s\n\
+        MimeType=video/mp4; video/ogg;;video/webm;\n[Other]\nExec=/bin/other\nMimeType=x/y\n";
+
+    fn args(v: &[&str]) -> Option<Vec<String>> {
+        Some(v.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn thumbnailer_file_parsing() {
+        let (tn, mimes) = parse_thumbnailer(GST).unwrap();
+        assert_eq!(tn.try_exec.as_deref(), Some("/usr/bin/true"));
+        assert_eq!(tn.exec, "/usr/bin/gst-video-thumbnailer --input-uri %u --output %o --size %s");
+        assert_eq!(mimes, ["video/mp4", "video/ogg", "video/webm"]);
+        // Keys outside the group, or no MIME types, or no Exec: not usable
+        assert!(parse_thumbnailer("[Other]\nExec=/bin/x\nMimeType=a/b;\n").is_none());
+        assert!(parse_thumbnailer("[Thumbnailer Entry]\nExec=/bin/x\n").is_none());
+        assert!(parse_thumbnailer("[Thumbnailer Entry]\nMimeType=a/b;\n").is_none());
+        assert!(parse_thumbnailer("[Thumbnailer Entry]\nExec=\nMimeType=a/b;\n").is_none());
+        let (tn, _) = parse_thumbnailer("[Thumbnailer Entry]\nExec=/bin/x %i\nMimeType=a/b\n").unwrap();
+        assert_eq!(tn.try_exec, None);
+    }
+
+    #[test]
+    fn exec_expansion() {
+        let line = "/usr/bin/t --uri %u -i %i --out=%o -s %s 100%% %z";
+        assert_eq!(
+            expand_exec(line, "/a/b.mp4", "file:///a/b.mp4", "/o/t.png", 256),
+            args(&["/usr/bin/t", "--uri", "file:///a/b.mp4", "-i", "/a/b.mp4", "--out=/o/t.png", "-s", "256", "100%", ""])
+        );
+        // Spaces, quotes and percent signs in the values never split or re-expand
+        let (i, u) = ("/my dir/a \"b\" %o.mp4", "file:///my%20dir/a%20b.mp4");
+        assert_eq!(
+            expand_exec("t %i %u", i, u, "/o", 64),
+            args(&["t", "/my dir/a \"b\" %o.mp4", "file:///my%20dir/a%20b.mp4"])
+        );
+        // Quotes in the Exec line itself group words
+        assert_eq!(expand_exec("\"/opt/my tool/t\" -x \"a \\\"b\\\" %i\"", "/f", "u", "o", 1), args(&["/opt/my tool/t", "-x", "a \"b\" /f"]));
+        assert_eq!(expand_exec("t \"\" x", "/f", "u", "o", 1), args(&["t", "", "x"]));
+        assert_eq!(expand_exec("t \"unclosed", "/f", "u", "o", 1), None);
+        assert_eq!(expand_exec("   ", "/f", "u", "o", 1), None);
+    }
+
+    struct Dir(PathBuf);
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn dir(tag: &str) -> Dir {
+        let d = std::env::temp_dir().join(format!("rfiles-thumbnailers-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Dir(d)
+    }
+
+    #[test]
+    fn loading_thumbnailer_folders() {
+        let d = dir("load");
+        let w = |name: &str, text: &str| std::fs::write(d.0.join(name), text).unwrap();
+        w("b.thumbnailer", "[Thumbnailer Entry]\nExec=/bin/b %i %o\nMimeType=video/mp4;video/webm;\n");
+        w("a.thumbnailer", "[Thumbnailer Entry]\nExec=/bin/a %i %o\nMimeType=video/mp4;\n");
+        w("gone.thumbnailer", "[Thumbnailer Entry]\nTryExec=/nonexistent/prog\nExec=/bin/g\nMimeType=font/ttf;\n");
+        w("notes.txt", "[Thumbnailer Entry]\nExec=/bin/t\nMimeType=text/x-test;\n");
+        w("bad.thumbnailer", "garbage");
+        let map = load_thumbnailers(&[d.0.clone(), d.0.join("missing")]);
+        assert_eq!(map.len(), 2);
+        // Name order: a.thumbnailer wins video/mp4
+        assert_eq!(map["video/mp4"].exec, "/bin/a %i %o");
+        assert_eq!(map["video/webm"].exec, "/bin/b %i %o");
+    }
+
+    /// A 200x100 PNG named with a space in it, and a fake thumbnailer that copies its input to its output.
+    fn setup(tag: &str) -> (Dir, PathBuf) {
+        let d = dir(tag);
+        let input = d.0.join("my clip.png");
+        let pb = Pixbuf::new(Colorspace::Rgb, false, 8, 200, 100).unwrap();
+        pb.fill(0x2266aaff);
+        pb.savev(&input, "png", &[]).unwrap();
+        (d, input)
+    }
+
+    fn fake(exec: &str) -> Thumbnailer {
+        Thumbnailer { try_exec: None, exec: exec.to_string() }
+    }
+
+    fn check_fake(exe: &Path, bwrap: Option<&Path>, input: &Path) {
+        let copy = fake("/usr/bin/sh -c \"cp \\\"$1\\\" \\\"$2\\\"\" sh %i %o");
+        match run_thumbnailer(exe, bwrap, &copy, input, 256) {
+            Helper::Done(pb, dims) => assert_eq!((pb.width(), pb.height(), dims), (200, 100, None)),
+            _ => panic!("the copy thumbnailer should give a thumbnail"),
+        }
+        // Too big for the size asked: refused
+        assert!(matches!(run_thumbnailer(exe, bwrap, &copy, input, 150), Helper::Failed));
+        // Exit status, no output, and output that isn't a PNG
+        assert!(matches!(run_thumbnailer(exe, bwrap, &fake("/usr/bin/false"), input, 256), Helper::Failed));
+        assert!(matches!(run_thumbnailer(exe, bwrap, &fake("/usr/bin/true"), input, 256), Helper::Failed));
+        let text = fake("/usr/bin/sh -c \"echo hi > \\\"$1\\\"\" sh %o");
+        assert!(matches!(run_thumbnailer(exe, bwrap, &text, input, 256), Helper::Failed));
+        // A program that isn't there: nothing to show, not a retry later
+        let r = run_thumbnailer(exe, bwrap, &fake("/nonexistent/prog %i"), input, 256);
+        assert!(matches!(r, Helper::Failed | Helper::Unavailable));
+    }
+
+    #[test]
+    fn fake_thumbnailer_without_sandbox() {
+        let (_d, input) = setup("direct");
+        check_fake(Path::new("/nonexistent"), None, &input);
+    }
+
+    fn sandbox_for_tests() -> Option<(PathBuf, PathBuf)> {
+        let exe = std::env::current_exe().ok()?.parent()?.parent()?.join("rfiles");
+        if !exe.is_file() {
+            eprintln!("SKIPPED: the rfiles binary isn't built next to the tests");
+            return None;
+        }
+        let Some(bwrap) = find_bwrap() else {
+            eprintln!("SKIPPED: bwrap is not installed");
+            return None;
+        };
+        if !sandbox_works(&bwrap, &exe) {
+            eprintln!("SKIPPED: bwrap can't create a sandbox here (user namespaces restricted?)");
+            return None;
+        }
+        Some((exe, bwrap))
+    }
+
+    #[test]
+    fn fake_thumbnailer_in_sandbox() {
+        let Some((exe, bwrap)) = sandbox_for_tests() else { return };
+        let (_d, input) = setup("bwrap");
+        check_fake(&exe, Some(&bwrap), &input);
+    }
+
+    /// A real video through the system's video thumbnailer, if one is installed and gst-launch can make a clip.
+    #[test]
+    fn real_video() {
+        let Some(tn) = thumbnailer_for("video/ogg") else {
+            eprintln!("SKIPPED: no thumbnailer for video/ogg is installed");
+            return;
+        };
+        let d = dir("video");
+        let clip = d.0.join("my clip.ogv");
+        let made = std::process::Command::new("gst-launch-1.0")
+            .args(["-q", "videotestsrc", "num-buffers=30", "!", "video/x-raw,width=320,height=240", "!", "theoraenc"])
+            .args(["!", "oggmux", "!", "filesink"])
+            .arg(format!("location={}", clip.display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !made.is_ok_and(|s| s.success()) || !clip.is_file() {
+            eprintln!("SKIPPED: gst-launch-1.0 can't make a test clip");
+            return;
+        }
+        let ok = |h: Helper| match h {
+            Helper::Done(pb, _) => (1..=256).contains(&pb.width()) && (1..=256).contains(&pb.height()),
+            _ => false,
+        };
+        assert!(ok(run_thumbnailer(Path::new("/nonexistent"), None, tn, &clip, 256)), "without sandbox");
+        if let Some((exe, bwrap)) = sandbox_for_tests() {
+            assert!(ok(run_thumbnailer(&exe, Some(&bwrap), tn, &clip, 256)), "in the sandbox");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1087,8 +1459,6 @@ struct Ui {
     dirty: bool,
     /// Files that failed or were skipped this session
     skip: HashSet<String>,
-    /// MIME types gdk-pixbuf can load (filled on first use)
-    mimes: Option<HashSet<String>>,
 }
 
 thread_local! {
@@ -1111,19 +1481,7 @@ impl Ui {
     }
 
     fn supported(&mut self, mime: &str) -> bool {
-        if mime == "application/pdf" {
-            return true;
-        }
-        self.mimes
-            .get_or_insert_with(|| {
-                Pixbuf::formats()
-                    .iter()
-                    .filter(|f| !f.is_disabled())
-                    .flat_map(|f| f.mime_types())
-                    .map(|m| m.to_string())
-                    .collect()
-            })
-            .contains(mime)
+        renders_itself(mime) || thumbnailer_for(mime).is_some()
     }
 
     fn schedule_pump(&mut self) {
