@@ -195,6 +195,10 @@ pub struct CopyProgress {
     /// Tests: acts as if Cancel was pressed once this many bytes are done (0: never)
     #[cfg(test)]
     cancel_at: AtomicU64,
+    /// Tests: fails with "already exists" once this many bytes are done (0: never), as a case-insensitive drive does
+    /// for a second "README.TXT" next to "Readme.txt"
+    #[cfg(test)]
+    exists_at: AtomicU64,
 }
 
 impl CopyProgress {
@@ -204,6 +208,10 @@ impl CopyProgress {
             let at = self.cancel_at.load(Ordering::Relaxed);
             if at > 0 && self.done.load(Ordering::Relaxed) >= at {
                 self.cancel.store(true, Ordering::Relaxed);
+            }
+            let at = self.exists_at.load(Ordering::Relaxed);
+            if at > 0 && self.done.load(Ordering::Relaxed) >= at {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
         }
         if self.cancel.load(Ordering::Relaxed) {
@@ -528,12 +536,9 @@ fn copy_into_place(
     skipped: &mut usize,
 ) -> io::Result<()> {
     let tmp = temp_name(target.parent().unwrap_or(Path::new(".")), "new");
-    if let Err(e) = copy_recursive(src, &tmp, progress, skipped) {
-        // Everything below `tmp` is in a folder this job just made, so "already exists" can only be `tmp` itself:
-        // someone else's (`temp_name`'s counter makes that practically impossible), so it is never deleted
-        return Err(if e.kind() == io::ErrorKind::AlreadyExists { e } else { remove_temp(&tmp, e) });
-    }
-    let res = (|| {
+    // `tmp` is ours whatever the error: `temp_name` has just found it free, and its pid and counter keep other jobs and
+    // processes off it. "Already exists" can come from inside it too (two names that differ only in case on FAT)
+    let res = copy_recursive(src, &tmp, progress, skipped).and_then(|()| {
         let Ok(md) = tmp.symlink_metadata() else {
             return if replacing { Err(io::Error::other("is a pipe, socket or device, not copied")) } else { Ok(()) };
         };
@@ -544,7 +549,7 @@ fn copy_into_place(
             return Err(io::Error::other("holds pipes, sockets or devices that can't be copied; not replaced"));
         }
         if md.is_dir() { swap_dir(&tmp, target) } else { std::fs::rename(&tmp, target) }
-    })();
+    });
     // After a successful rename `tmp` is gone, so a later error (the old folder not deleted) removes nothing
     res.map_err(|e| remove_temp(&tmp, e))
 }
@@ -649,6 +654,22 @@ mod partial_copy_tests {
         assert_eq!((out.done, out.errors.len()), (0, 0), "{:?}", out.errors);
         assert!(names(&dest).is_empty(), "{:?}", names(&dest));
         assert_eq!(std::fs::read(src.join("big.bin")).unwrap(), data);
+        done(&d);
+    }
+
+    #[test]
+    fn already_exists_inside_the_copy_is_cleaned_up() {
+        let d = base("exists");
+        let (src, dest) = (d.join("src/f"), d.join("dest"));
+        write(&src.join("a.txt"), b"0123456789");
+        write(&src.join("b.txt"), b"0123456789");
+        write(&src.join("sub/c.txt"), b"0123456789");
+        // After the first file, the next create fails as on a case-insensitive drive
+        let p = CopyProgress { exists_at: AtomicU64::new(10), ..Default::default() };
+        let out = transfer(vec![src.clone()], dest.clone(), false, &p);
+        assert_eq!((out.done, out.errors.len()), (0, 1), "{:?}", out.errors);
+        assert!(out.errors[0].starts_with("f: "), "{:?}", out.errors);
+        assert!(names(&dest).is_empty(), "{:?}", names(&dest));
         done(&d);
     }
 
