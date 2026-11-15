@@ -236,6 +236,9 @@ fn pixels(pb: &Pixbuf) -> Pixels {
 
 fn process(job: &Job) -> Outcome {
     if let Some(thumb) = &job.load {
+        if std::fs::metadata(thumb).map_or(true, |m| m.len() > MAX_THUMB_FILE) {
+            return Outcome::Skipped;
+        }
         return match Pixbuf::from_file(thumb) {
             Ok(pb) => Outcome::Ready(thumb.clone(), pixels(&pb)),
             Err(_) => Outcome::Skipped,
@@ -306,7 +309,7 @@ mod thumb_bench {
                 let data = std::fs::read(&path).unwrap_or_default();
                 let (mime, _) = gio::content_type_guess(Some(&path), &data[..data.len().min(4096)]);
                 let uri = gio::File::for_path(&path).uri().to_string();
-                Job { id: 0, uri, path, mime: mime.to_string(), size: Size::Normal }
+                Job { id: 0, uri, path, mime: mime.to_string(), size: Size::Normal, load: None }
             })
             .collect();
         let n = jobs.len();
