@@ -292,7 +292,7 @@ fn is_dir(p: &Path) -> bool {
 
 /// rename(2) that fails instead of replacing an item at `to`. Drives that can't do that (some FAT and network
 /// ones) get a plain rename; the caller has just checked that `to` is free.
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     use std::ffi::{c_char, c_int, c_uint, CString};
     use std::os::unix::ffi::OsStrExt;
     extern "C" {
