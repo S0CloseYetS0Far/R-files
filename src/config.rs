@@ -1,6 +1,8 @@
 use crate::util::SortKey;
 use gtk::glib;
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 /// Small plain-text settings in ~/.config/rfiles/.
 pub struct Config {
@@ -26,16 +28,50 @@ pub struct Config {
     /// Whether the sidebar and the preview pane are shown
     pub show_sidebar: bool,
     pub show_preview: bool,
+    /// What each of `FILES` held when last read or written (None: missing), so unchanged files aren't rewritten
+    on_disk: [Option<String>; 3],
+    /// Files that exist but couldn't be read: never written, so their entries aren't replaced by empty lists
+    locked: [bool; 3],
+    /// A save failed and was reported; cleared by the next save that works, so it is reported once
+    save_failed: bool,
+    /// Files that couldn't be read and why, to tell the user once
+    pub load_problems: Vec<String>,
+}
+
+/// The settings files, in the order of `Config::contents`.
+const FILES: [&str; 3] = ["pins", "starred", "settings"];
+
+thread_local! {
+    /// The one `Config` of this process, shared by all windows (see `shared`).
+    static SHARED: std::cell::OnceCell<Rc<RefCell<Config>>> = const { std::cell::OnceCell::new() };
+}
+
+/// The settings every window shares. Loaded from disk on first use only, so a later window sees the
+/// changes made in the others instead of an older copy that it would write back.
+pub fn shared() -> Rc<RefCell<Config>> {
+    SHARED.with(|s| s.get_or_init(|| Rc::new(RefCell::new(Config::load()))).clone())
+}
+
+/// Whether `entry` fits the one-entry-per-line files: a line break would split it in two.
+pub fn storable(entry: &str) -> bool {
+    !entry.contains(['\n', '\r'])
 }
 
 fn dir() -> PathBuf {
     glib::user_config_dir().join("rfiles")
 }
 
-fn read_lines(dir: &std::path::Path, name: &str) -> Vec<String> {
-    std::fs::read_to_string(dir.join(name))
-        .unwrap_or_default()
-        .lines()
+/// A settings file's text: Ok(None) when it doesn't exist, Err when it exists but can't be read.
+fn read_file(dir: &std::path::Path, name: &str) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(dir.join(name)) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_lines(text: &str) -> Vec<String> {
+    text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(String::from)
@@ -49,9 +85,22 @@ impl Config {
 
     /// `load` from a given folder, so tests can use a temp dir.
     fn load_from(dir: &std::path::Path) -> Self {
+        let mut on_disk = [None, None, None];
+        let mut locked = [false; 3];
+        let mut problems = Vec::new();
+        for (i, name) in FILES.iter().enumerate() {
+            match read_file(dir, name) {
+                Ok(t) => on_disk[i] = t,
+                Err(e) => {
+                    locked[i] = true;
+                    problems.push(format!("{}: {e}", dir.join(name).display()));
+                }
+            }
+        }
+        let text = |i: usize| on_disk[i].clone().unwrap_or_default();
         let mut c = Config {
-            pins: read_lines(dir, "pins"),
-            starred: read_lines(dir, "starred"),
+            pins: read_lines(&text(0)),
+            starred: read_lines(&text(1)),
             width: 1300,
             height: 820,
             sidebar_pos: 220,
@@ -67,8 +116,12 @@ impl Config {
             sort_desc: false,
             show_sidebar: true,
             show_preview: true,
+            on_disk: on_disk.clone(),
+            locked,
+            save_failed: false,
+            load_problems: problems,
         };
-        for line in read_lines(dir, "settings") {
+        for line in read_lines(&text(2)) {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k.trim() {
                 "folder_icon" => {
@@ -106,17 +159,40 @@ impl Config {
         c
     }
 
-    pub fn save(&self) {
-        self.save_to(&dir())
+    /// Writes the files whose content changed. Returns what went wrong when this save failed and the last one
+    /// didn't, to report once; a failed file is tried again on the next save.
+    pub fn save(&mut self) -> Option<String> {
+        let res = self.save_to(&dir());
+        self.report_once(res)
     }
 
-    /// `save` into a given folder, so tests can use a temp dir.
-    fn save_to(&self, d: &std::path::Path) {
-        let _ = std::fs::create_dir_all(d);
-        let _ = std::fs::write(d.join("pins"), self.pins.join("\n"));
-        let _ = std::fs::write(d.join("starred"), self.starred.join("\n"));
-        let _ = std::fs::write(
-            d.join("settings"),
+    /// The error of a save to show, unless the save before it failed too (and was shown).
+    fn report_once(&mut self, err: Option<String>) -> Option<String> {
+        let first = !std::mem::replace(&mut self.save_failed, err.is_some());
+        err.filter(|_| first)
+    }
+
+    /// `save` into a given folder, so tests can use a temp dir. Returns what went wrong, if anything did.
+    fn save_to(&mut self, d: &std::path::Path) -> Option<String> {
+        let mut errors = Vec::new();
+        for (i, text) in self.contents().into_iter().enumerate() {
+            if self.locked[i] || self.on_disk[i].as_deref() == Some(text.as_str()) {
+                continue;
+            }
+            let path = d.join(FILES[i]);
+            match std::fs::create_dir_all(d).and_then(|_| write_atomic(&path, &text)) {
+                Ok(()) => self.on_disk[i] = Some(text),
+                Err(e) => errors.push(format!("{}: {e}", path.display())),
+            }
+        }
+        (!errors.is_empty()).then(|| errors.join("; "))
+    }
+
+    /// The text of each of `FILES`.
+    fn contents(&self) -> [String; 3] {
+        [
+            self.pins.join("\n"),
+            self.starred.join("\n"),
             format!(
                 "width={}\nheight={}\nmaximized={}\nsidebar={}\npreview={}\nfiles={}\nlist_view={}\nshow_hidden={}\nfolder_icon={}\nicon_size={}\nplaces={}\nsort={}\nsort_desc={}\n{}",
                 self.width,
@@ -134,7 +210,165 @@ impl Config {
                 self.sort_desc as i32,
                 pane_settings(self.show_sidebar, self.show_preview)
             ),
-        );
+        ]
+    }
+}
+
+/// Replaces `path` with `text` so that it holds either the old or the new text, never a mix or nothing, even
+/// after a crash or a full disk: written next to it, flushed to disk, then renamed over it.
+fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.rfiles-{}.tmp", std::process::id()));
+    let res = std::fs::File::create(&tmp)
+        .and_then(|mut f| f.write_all(text.as_bytes()).and_then(|_| f.sync_all()))
+        .and_then(|_| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    } else if let Some(dir) = path.parent() {
+        // Makes the rename itself survive a power loss
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
+    res
+}
+
+#[cfg(test)]
+mod atomic_save_tests {
+    use super::{storable, Config, FILES};
+    use std::cell::RefCell;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("rfiles-atomic-save-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Tmp(d)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn read(d: &Path, name: &str) -> String {
+        std::fs::read_to_string(d.join(name)).unwrap()
+    }
+
+    fn inodes(d: &Path) -> Vec<u64> {
+        FILES.iter().map(|n| std::fs::metadata(d.join(n)).unwrap().ino()).collect()
+    }
+
+    #[test]
+    fn failed_write_keeps_the_old_file_and_retries() {
+        let t = Tmp::new("readonly");
+        std::fs::write(t.0.join("pins"), "file:///old").unwrap();
+        let mut c = Config::load_from(&t.0);
+        c.pins = vec!["file:///new".into()];
+        std::fs::set_permissions(&t.0, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(t.0.join("probe")).is_ok() {
+            eprintln!("skipped: running as root, a read-only folder can still be written");
+            return;
+        }
+        let err = c.save_to(&t.0);
+        assert!(err.as_deref().is_some_and(|e| e.contains("pins")), "{err:?}");
+        assert_eq!(read(&t.0, "pins"), "file:///old");
+        let names: Vec<_> = std::fs::read_dir(&t.0).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("pins")], "no temp file is left behind");
+        // Reported once, not on every save that keeps failing
+        assert!(c.report_once(err).is_some());
+        let err = c.save_to(&t.0);
+        assert!(err.is_some());
+        assert!(c.report_once(err).is_none());
+
+        // The next save writes what the failed one couldn't
+        std::fs::set_permissions(&t.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = c.save_to(&t.0);
+        assert!(c.report_once(err).is_none());
+        assert_eq!(read(&t.0, "pins"), "file:///new");
+        // A new failure after one that worked is reported again
+        assert!(c.report_once(Some("x".into())).is_some());
+    }
+
+    #[test]
+    fn unchanged_files_are_not_rewritten() {
+        let t = Tmp::new("unchanged");
+        let mut c = Config::load_from(&t.0);
+        c.pins = vec!["file:///a".into()];
+        c.starred = vec!["file:///b".into()];
+        assert!(c.save_to(&t.0).is_none());
+        let before = inodes(&t.0);
+        assert!(c.save_to(&t.0).is_none());
+        assert_eq!(inodes(&t.0), before, "nothing changed, nothing written");
+
+        // A layout change rewrites only the settings file
+        c.width = 1111;
+        assert!(c.save_to(&t.0).is_none());
+        let after = inodes(&t.0);
+        assert_eq!(after[..2], before[..2]);
+        assert_ne!(after[2], before[2]);
+
+        // What was read counts as written too
+        let mut r = Config::load_from(&t.0);
+        assert!(r.save_to(&t.0).is_none());
+        assert_eq!(inodes(&t.0), after);
+    }
+
+    #[test]
+    fn unreadable_file_is_kept_and_reported() {
+        let t = Tmp::new("unreadable");
+        let bad = [b'f', b':', 0xff, 0xfe, b'\n'];
+        std::fs::write(t.0.join("pins"), bad).unwrap();
+        std::fs::write(t.0.join("starred"), "file:///s").unwrap();
+        let mut c = Config::load_from(&t.0);
+        // Defaults for that file only
+        assert!(c.pins.is_empty());
+        assert_eq!(c.starred, vec!["file:///s".to_string()]);
+        assert_eq!(c.load_problems.len(), 1);
+        assert!(c.load_problems[0].contains("pins"));
+        c.pins.push("file:///p".into());
+        c.starred.push("file:///t".into());
+        assert!(c.save_to(&t.0).is_none());
+        assert_eq!(std::fs::read(t.0.join("pins")).unwrap(), bad);
+        assert_eq!(read(&t.0, "starred"), "file:///s\nfile:///t");
+        assert!(t.0.join("settings").exists());
+    }
+
+    #[test]
+    fn empty_and_half_written_files_load() {
+        let t = Tmp::new("half");
+        std::fs::write(t.0.join("pins"), "").unwrap();
+        std::fs::write(t.0.join("settings"), "width=900\nicon_size=9").unwrap();
+        let c = Config::load_from(&t.0);
+        assert!(c.pins.is_empty() && c.starred.is_empty() && c.load_problems.is_empty());
+        assert_eq!((c.width, c.icon_size), (900, 40));
+    }
+
+    #[test]
+    fn two_windows_share_one_config() {
+        let t = Tmp::new("shared");
+        let shared = Rc::new(RefCell::new(Config::load_from(&t.0)));
+        let (a, b) = (shared.clone(), shared.clone());
+        a.borrow_mut().pins.push("file:///pinned-in-a".into());
+        assert!(a.borrow_mut().save_to(&t.0).is_none());
+        // B sees the pin at once, and its layout save doesn't drop it
+        assert_eq!(b.borrow().pins, vec!["file:///pinned-in-a".to_string()]);
+        b.borrow_mut().width = 999;
+        assert!(b.borrow_mut().save_to(&t.0).is_none());
+        let r = Config::load_from(&t.0);
+        assert_eq!((r.pins, r.width), (vec!["file:///pinned-in-a".to_string()], 999));
+    }
+
+    #[test]
+    fn line_breaks_are_not_storable() {
+        assert!(storable("file:///a%0Ab"));
+        assert!(!storable("custom:/home/u/a\nb.png"));
+        assert!(!storable("file:///a\rb"));
     }
 }
 
