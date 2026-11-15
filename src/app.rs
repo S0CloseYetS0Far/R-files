@@ -3302,6 +3302,12 @@ impl App {
         let cur_size = self.config.borrow().icon_size;
         size.set_selected(ICON_SIZES.iter().position(|s| s.0 == cur_size).unwrap_or(0) as u32);
 
+        let h3 = gtk::Label::new(Some("Theme"));
+        h3.set_xalign(0.0);
+        h3.add_css_class("heading");
+        let theme = gtk::DropDown::from_strings(&crate::theme::THEME_NAMES);
+        theme.set_selected(self.config.borrow().theme.index());
+
         let hint = gtk::Label::new(Some("Tip: right-click any file or folder\n→ Change Icon… to give just that one\nits own icon."));
         hint.set_xalign(0.0);
         hint.add_css_class("dim");
@@ -3312,6 +3318,8 @@ impl App {
         bx.append(&choose);
         bx.append(&h2);
         bx.append(&size);
+        bx.append(&h3);
+        bx.append(&theme);
         bx.append(&hint);
         bx.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         let pop = gtk::Popover::new();
@@ -3381,6 +3389,14 @@ impl App {
             a.config.borrow_mut().icon_size = px;
             a.save_config();
             a.icons_changed();
+        });
+        let a = Rc::downgrade(self);
+        theme.connect_selected_notify(move |dd| {
+            let Some(a) = a.upgrade() else { return };
+            a.config.borrow_mut().theme = crate::theme::Theme::from_index(dd.selected());
+            a.save_config();
+            // One style sheet is shared, so every open window changes at once
+            crate::theme::apply();
         });
     }
 

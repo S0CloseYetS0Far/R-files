@@ -55,6 +55,7 @@ on a laptop with Intel + NVIDIA graphics; numbers vary with the graphics driver)
 | Tabs | ✅ | ✅ |
 | Pin folders to the sidebar | ✅ one-click toggle | ✅ bookmarks |
 | Reorder built-in places (Home, Trash, …) | ✅ | ❌ bookmarks only |
+| Theme: Black, Light or follow the system (with its accent colour) | ✅ gear menu, Black by default | ✅ follows the system |
 | Custom folder icons and size | ✅ light blue, system, or your own image | icon size only |
 | Open in Terminal | ✅ built in | needs an extension |
 | Search | file names, Enter includes subfolders | ✅ faster, also searches inside documents |
@@ -165,7 +166,7 @@ Keep GNOME Files installed; Ubuntu uses it in a few places. To switch back:
 
 Right-click anything for more (star, change icon, open with, etc.).
 Right-click a sidebar item to move it up or down or open it in a new tab.
-The gear button at the right of the path bar sets the folder icon style and icon size.
+The gear button at the right of the path bar sets the folder icon style, icon size and theme (Black, Light, or follow the system).
 `rfiles --version` prints the version; the desktop entry also has a *New Window* action.
 
 Settings, pins and stars are stored in `~/.config/rfiles/`.
