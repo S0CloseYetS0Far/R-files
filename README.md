@@ -55,7 +55,7 @@ on a laptop with Intel + NVIDIA graphics; numbers vary with the graphics driver)
 | Tabs | ✅ | ✅ |
 | Pin folders to the sidebar | ✅ one-click toggle | ✅ bookmarks |
 | Reorder built-in places (Home, Trash, …) | ✅ | ❌ bookmarks only |
-| Theme: Black, Light or follow the system (with its accent colour) | ✅ gear menu, Black by default | no |
+| Theme: Black, Light or follow the system (with its accent colour) | ✅ gear menu, Black by default | ✅ follows the system |
 | Custom folder icons and size | ✅ light blue, system, or your own image | icon size only |
 | Open in Terminal | ✅ built in | needs an extension |
 | Search | file names, Enter includes subfolders | ✅ faster, also searches inside documents |
