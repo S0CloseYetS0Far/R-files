@@ -11,8 +11,8 @@
 //! - Nothing is overwritten. The archive is unpacked into a hidden scratch
 //!   folder next to it, then moved to a free name; on failure the scratch
 //!   folder is removed, so no partial output is left behind.
-//! - Unpacking stops when it writes far more than the archive could sensibly hold (zip bomb), and is refused up
-//!   front when the free space can't take it.
+//! - Unpacking stops before it fills the drive: it may write at most the free space measured at the start, minus a
+//!   small reserve, and a zip that declares more than the free space is refused up front.
 
 use crate::banner::Notice;
 use gtk::prelude::*;
@@ -518,7 +518,7 @@ struct Extractor {
     dirs: Vec<(PathBuf, u32, Option<SystemTime>)>,
     buf: Vec<u8>,
     skipped: usize,
-    /// Most file bytes this run may write, and how many it has written (zip bomb guard).
+    /// Most file bytes this run may write, and how many it has written (keeps the drive from filling up).
     limit: u64,
     written: u64,
 }
@@ -581,7 +581,10 @@ impl Extractor {
             };
             self.written += n as u64;
             if self.written > self.limit {
-                return Err(err(format!("it unpacks to more than {}, so it looks like a zip bomb", glib::format_size(self.limit))));
+                return Err(err(format!(
+                    "stopped: the archive unpacks to more than the free space on this drive ({})",
+                    glib::format_size(self.limit)
+                )));
             }
             f.write_all(&self.buf[..n]).map_err(at(rel))?;
         }
@@ -639,10 +642,12 @@ impl Extractor {
     }
 }
 
-/// The most an archive of `len` bytes may unpack to: 20 times its size, but never above 50 GB. Small archives get
-/// at least 64 MiB so that ordinary text-heavy ones aren't refused.
-fn bomb_limit(len: u64) -> u64 {
-    len.saturating_mul(20).clamp(64 << 20, 50_000_000_000)
+/// Free space kept back when extracting, so the drive isn't left completely full.
+const RESERVE: u64 = 100 << 20;
+
+/// The most one extraction may write: the free space minus the reserve (no limit when it isn't known).
+fn write_limit(free: Option<u64>) -> u64 {
+    free.map_or(u64::MAX, |f| f.saturating_sub(RESERVE))
 }
 
 /// Whether `needed` bytes fit into `free` (`None`: the file system didn't say, so go ahead).
@@ -700,9 +705,6 @@ fn extract_zip(file: File, ex: &mut Extractor, p: &Progress, free: Option<u64>) 
     let declared = z.decompressed_size().and_then(|s| u64::try_from(s).ok());
     p.reset(declared.unwrap_or(0));
     if let Some(d) = declared {
-        if d > ex.limit {
-            return Err(err(format!("it claims to unpack to {}, so it looks like a zip bomb", glib::format_size(d))));
-        }
         check_space(d, free)?;
     }
     for i in 0..z.len() {
@@ -759,22 +761,21 @@ fn place(tmp: &Path, dest: &Path, stem: &OsStr) -> io::Result<(PathBuf, Option<O
 /// Extracts `archive` into `dest`. Returns the created folder and the
 /// number of skipped special entries. Runs on a worker thread.
 pub(crate) fn extract(archive: &Path, dest: &Path, p: &Progress) -> io::Result<(PathBuf, usize)> {
-    let limit = bomb_limit(fs::metadata(archive)?.len());
-    extract_limited(archive, dest, p, limit)
+    extract_limited(archive, dest, p, None)
 }
 
-/// `extract` with the most it may write given (tests use a low one).
-fn extract_limited(archive: &Path, dest: &Path, p: &Progress, limit: u64) -> io::Result<(PathBuf, usize)> {
+/// `extract` with the most it may write given (tests use a low one); `None` means the free space rule.
+fn extract_limited(archive: &Path, dest: &Path, p: &Progress, limit: Option<u64>) -> io::Result<(PathBuf, usize)> {
     let name = archive.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let (stem, _, fmt) = split_archive_name(name).ok_or_else(|| err("not a supported archive"))?;
     let stem = if stem.is_empty() { "Extracted" } else { stem };
     let file = File::open(archive)?;
     let len = file.metadata()?.len();
     let free = free_space(dest);
-    if fmt != Format::Zip {
-        // Streams don't say what they hold: a plain tar is its own size, compressed ones guess 10 times
-        let guess = if fmt == Format::Tar { len } else { len.saturating_mul(10) };
-        check_space(guess.min(limit), free)?;
+    let limit = limit.unwrap_or_else(|| write_limit(free));
+    if fmt == Format::Tar {
+        // A plain tar holds about its own size; compressed streams don't say, so the write limit guards those
+        check_space(len, free)?;
     }
     let tmp = create_unique_dir(dest, OsStr::new(&format!(".{name}.extracting")))?;
     let mut ex = Extractor::new(tmp.clone());
@@ -859,8 +860,8 @@ mod more_formats_tests {
     }
 
     #[test]
-    fn bomb_is_stopped_and_cleaned_up() {
-        let d = scratch("bomb");
+    fn write_limit_stops_and_cleans_up() {
+        let d = scratch("limit");
         let src = d.join("zeros");
         fs::create_dir(&src).unwrap();
         fs::write(src.join("z.bin"), vec![0u8; 5_000_000]).unwrap();
@@ -870,11 +871,12 @@ mod more_formats_tests {
         for (ext, fmt) in [(".zip", Format::Zip), (".tar.gz", Format::TarGz), (".tar.bz2", Format::TarBz2)] {
             let a = compress(&[src.clone()], &d, "zeros", ext, fmt, &p).unwrap();
             assert!(fs::metadata(&a).unwrap().len() < 100_000, "{ext} should be small");
-            let e = extract_limited(&a, &dest, &p, 1_000_000).unwrap_err();
-            assert!(e.to_string().contains("zip bomb"), "{ext}: {e}");
+            let e = extract_limited(&a, &dest, &p, Some(1_000_000)).unwrap_err();
+            assert!(e.to_string().contains("more than the free space"), "{ext}: {e}");
             assert_eq!(fs::read_dir(&dest).unwrap().count(), 0, "{ext}: partial output left");
-            // The same archive is fine under its normal limit
-            assert!(extract(&a, &dest, &p).is_ok(), "{ext}");
+            // A limit above its content, however well it compresses (5 MB from under 100 KB), is fine
+            assert!(extract_limited(&a, &dest, &p, Some(6_000_000)).is_ok(), "{ext}");
+            assert!(extract(&a, &dest, &p).is_ok(), "{ext}"); // and under the free space rule
             fs::remove_dir_all(&dest).unwrap();
             fs::create_dir(&dest).unwrap();
         }
@@ -883,10 +885,9 @@ mod more_formats_tests {
 
     #[test]
     fn limits_and_space_decisions() {
-        assert_eq!(bomb_limit(1 << 30), 20 << 30);
-        assert_eq!(bomb_limit(10 << 30), 50_000_000_000);
-        assert_eq!(bomb_limit(u64::MAX), 50_000_000_000);
-        assert_eq!(bomb_limit(10), 64 << 20);
+        assert_eq!(write_limit(Some(10 << 30)), (10 << 30) - RESERVE);
+        assert_eq!(write_limit(Some(RESERVE / 2)), 0);
+        assert_eq!(write_limit(None), u64::MAX);
         assert!(check_space(100, Some(100)).is_ok());
         assert!(check_space(101, Some(100)).unwrap_err().to_string().contains("not enough free space"));
         assert!(check_space(u64::MAX, None).is_ok());
