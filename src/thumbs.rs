@@ -24,7 +24,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 const MAX_FILE_SIZE: i64 = 50 * 1024 * 1024;
 /// Formats that can't decode at reduced size are skipped above this many
 /// pixels, so one huge PNG can't spike memory by hundreds of MB.
-const MAX_FULL_DECODE_PIXELS: i64 = 40_000_000;
+pub(crate) const MAX_FULL_DECODE_PIXELS: i64 = 40_000_000;
 /// Jobs handed to the workers at a time. The rest wait on the UI side,
 /// where it is known which tiles are on screen.
 const MAX_OUTSTANDING: usize = 3;

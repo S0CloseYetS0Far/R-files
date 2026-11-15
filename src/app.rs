@@ -2089,7 +2089,7 @@ impl App {
                 // same single file is still selected
                 if self.previewed.borrow().as_deref() != Some(key.as_str()) {
                     *self.previewed.borrow_mut() = Some(key);
-                    self.preview.show(&infos[0]);
+                    self.preview.show(&infos[0], self.show_hidden.get());
                 }
             }
             n => {

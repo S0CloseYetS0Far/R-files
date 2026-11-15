@@ -15,6 +15,8 @@ use std::time::Duration;
 
 const TEXT_LIMIT: usize = 256 * 1024;
 const IMAGE_MAX: i32 = 2048;
+/// Entries shown in a folder preview; the rest is summed up in one line
+const FOLDER_PREVIEW_MAX: u32 = 500;
 /// Touchpad scroll distance, in pixels, that turns one PDF page.
 const PDF_SCROLL_PX: f64 = 100.0;
 /// Largest side, in device pixels, a PDF page is rendered at, so a huge pane can't take hundreds of MB.
@@ -138,7 +140,7 @@ impl Preview {
         }
     }
 
-    pub fn show(self: &Rc<Self>, info: &gio::FileInfo) {
+    pub fn show(self: &Rc<Self>, info: &gio::FileInfo, show_hidden: bool) {
         self.clear_body();
         let g = self.gen.get() + 1;
         self.gen.set(g);
@@ -156,7 +158,7 @@ impl Preview {
             .set_label(if is_dir_like(info) { "Open folder" } else { "Open" });
 
         if is_dir_like(info) {
-            self.folder_preview(info, &file);
+            self.folder_preview(info, &file, show_hidden);
             return;
         }
         let Some(path) = path else {
@@ -227,20 +229,22 @@ impl Preview {
     }
 
     // ---------- folders ----------
-    fn folder_preview(self: &Rc<Self>, info: &gio::FileInfo, file: &gio::File) {
+    fn folder_preview(self: &Rc<Self>, info: &gio::FileInfo, file: &gio::File, show_hidden: bool) {
         let dl = gtk::DirectoryList::new(
             Some("standard::name,standard::display-name,standard::icon,standard::type,standard::is-hidden,standard::is-backup,thumbnail::path,standard::target-uri,standard::content-type,standard::size,time::modified,metadata::custom-icon"),
             Some(file),
         );
         dl.set_monitored(false);
-        let filter = gtk::CustomFilter::new(|o| {
+        let filter = gtk::CustomFilter::new(move |o| {
             o.downcast_ref::<gio::FileInfo>()
-                .map(|i| !i.is_hidden() && !i.is_backup())
+                .map(|i| show_hidden || (!i.is_hidden() && !i.is_backup()))
                 .unwrap_or(false)
         });
         let fm = gtk::FilterListModel::new(Some(dl.clone()), Some(filter));
         let sm = gtk::SortListModel::new(Some(fm), Some(gtk::CustomSorter::new(sort_infos)));
-        let sel = gtk::NoSelection::new(Some(sm.clone()));
+        // Only the first FOLDER_PREVIEW_MAX entries (after sorting) are shown
+        let shown = gtk::SliceListModel::new(Some(sm.clone()), 0, FOLDER_PREVIEW_MAX);
+        let sel = gtk::NoSelection::new(Some(shown));
 
         let factory = gtk::SignalListItemFactory::new();
         factory.connect_setup(|_, obj| {
@@ -297,19 +301,30 @@ impl Preview {
         stack.add_named(&scroll, Some("grid"));
         stack.set_vexpand(true);
         self.body.append(&stack);
+        let more = gtk::Label::new(None);
+        more.add_css_class("dim");
+        more.set_visible(false);
+        self.body.append(&more);
 
         // Everything here is held weakly: these handlers live on the models,
         // which the widgets below keep alive.
         let p = Rc::downgrade(self);
-        let (stack, empty) = (stack.downgrade(), empty.downgrade());
+        let (stack, empty, more) = (stack.downgrade(), empty.downgrade(), more.downgrade());
         let info = info.clone();
         let file = file.clone();
         let g = self.gen.get();
         let update = move |dl: &gtk::DirectoryList, n: u32| {
-            let (Some(p), Some(stack), Some(empty)) = (p.upgrade(), stack.upgrade(), empty.upgrade()) else { return };
+            let (Some(p), Some(stack), Some(empty), Some(more)) =
+                (p.upgrade(), stack.upgrade(), empty.upgrade(), more.upgrade())
+            else {
+                return;
+            };
             if p.gen.get() != g {
                 return;
             }
+            let rest = folder_more_text(n);
+            more.set_visible(rest.is_some());
+            more.set_text(&rest.unwrap_or_default());
             if n > 0 {
                 stack.set_visible_child_name("grid");
             } else if !dl.is_loading() {
@@ -366,7 +381,12 @@ impl Preview {
                 }
                 _ => {
                     p.body.remove(&pic);
-                    p.icon_placeholder(&info, "Can't preview this image");
+                    let msg = if image_too_large(&item_file(&info).path().unwrap_or_default()) {
+                        "Image too large to preview"
+                    } else {
+                        "Can't preview this image"
+                    };
+                    p.icon_placeholder(&info, msg);
                 }
             }
         });
@@ -542,8 +562,29 @@ impl Preview {
 /// because a Pixbuf can't cross threads; the texture is made on the UI side.
 type Pixels = (glib::Bytes, i32, i32, i32, bool, (i32, i32));
 
+/// True when decoding this image would need the whole picture in memory (not JPEG or SVG, which decode
+/// at reduced size) and it is bigger than the thumbnail code allows.
+fn full_decode_refused(reduced_decode: bool, w: i32, h: i32) -> bool {
+    !reduced_decode && (w as i64) * (h as i64) > crate::thumbs::MAX_FULL_DECODE_PIXELS
+}
+
+fn image_too_large(path: &Path) -> bool {
+    match gdk_pixbuf::Pixbuf::file_info(path) {
+        Some((fmt, w, h)) => full_decode_refused(fmt.is_scalable() || fmt.name().as_deref() == Some("jpeg"), w, h),
+        None => false,
+    }
+}
+
+/// Text under a capped folder preview, if entries were left out.
+fn folder_more_text(total: u32) -> Option<String> {
+    (total > FOLDER_PREVIEW_MAX).then(|| format!("…and {} more", total - FOLDER_PREVIEW_MAX))
+}
+
 fn load_scaled(path: &Path) -> Option<Pixels> {
-    let (_, w, h) = gdk_pixbuf::Pixbuf::file_info(path)?;
+    let (fmt, w, h) = gdk_pixbuf::Pixbuf::file_info(path)?;
+    if full_decode_refused(fmt.is_scalable() || fmt.name().as_deref() == Some("jpeg"), w, h) {
+        return None;
+    }
     let pb = if w > IMAGE_MAX || h > IMAGE_MAX {
         gdk_pixbuf::Pixbuf::from_file_at_scale(path, IMAGE_MAX, IMAGE_MAX, true).ok()?
     } else {
@@ -571,19 +612,109 @@ fn read_text(path: &Path) -> Result<String, String> {
     if buf.is_empty() {
         return Ok("(empty file)".into());
     }
-    if buf.iter().take(8192).any(|&b| b == 0) {
-        return Err("binary".into());
-    }
-    let mut s = String::from_utf8_lossy(&buf).into_owned();
-    // Too many replacement chars means it isn't really text
-    let bad = s.chars().take(4096).filter(|&c| c == '\u{FFFD}').count();
-    if bad > 32 {
-        return Err("binary".into());
-    }
+    let mut s = if let Some(s) = decode_utf16(&buf) {
+        s
+    } else {
+        if buf.iter().take(8192).any(|&b| b == 0) {
+            return Err("binary".into());
+        }
+        match std::str::from_utf8(&buf) {
+            Ok(s) => s.to_string(),
+            // Cut off in the middle of a character by the size limit: not an encoding problem
+            Err(e) if truncated && e.error_len().is_none() => String::from_utf8_lossy(&buf).into_owned(),
+            Err(_) => {
+                // Many control bytes mean it isn't really text
+                let ctrl = buf.iter().take(4096).filter(|&&b| is_odd_control(b)).count();
+                if ctrl > 32 {
+                    return Err("binary".into());
+                }
+                decode_windows_1252(&buf)
+            }
+        }
+    };
     if truncated {
         s.push_str("\n\n… (preview truncated)");
     }
     Ok(s)
+}
+
+/// Decodes UTF-16 when the data starts with a byte order mark.
+fn decode_utf16(buf: &[u8]) -> Option<String> {
+    let (rest, le) = match buf {
+        [0xFF, 0xFE, rest @ ..] => (rest, true),
+        [0xFE, 0xFF, rest @ ..] => (rest, false),
+        _ => return None,
+    };
+    let units = (0..rest.len() / 2).map(|i| {
+        let pair = [rest[2 * i], rest[2 * i + 1]];
+        if le { u16::from_le_bytes(pair) } else { u16::from_be_bytes(pair) }
+    });
+    Some(char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')).collect())
+}
+
+/// Control bytes that plain text rarely has (tab, newline, form feed, carriage return and escape are fine).
+fn is_odd_control(b: u8) -> bool {
+    (b < 0x20 && !matches!(b, b'\t' | b'\n' | 0x0c | b'\r' | 0x1b)) || b == 0x7f
+}
+
+/// Windows-1252 for the 0x80..=0x9F range; the five unassigned bytes stay as the Latin-1 control characters.
+const CP1252_HIGH: [char; 32] = [
+    '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8D}', 'Ž', '\u{8F}', '\u{90}', '‘', '’',
+    '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9D}', 'ž', 'Ÿ',
+];
+
+/// Text that isn't valid UTF-8 is most often Windows-1252 (Latin-1 plus printable characters in 0x80..=0x9F).
+fn decode_windows_1252(buf: &[u8]) -> String {
+    buf.iter()
+        .map(|&b| if (0x80..0xA0).contains(&b) { CP1252_HIGH[(b - 0x80) as usize] } else { b as char })
+        .collect()
+}
+
+#[cfg(test)]
+mod preview_gap_tests {
+    use super::*;
+
+    #[test]
+    fn utf16_with_bom() {
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain("hé €\n".encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain("hé €\n".encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        assert_eq!(decode_utf16(&le).unwrap(), "hé €\n");
+        assert_eq!(decode_utf16(&be).unwrap(), "hé €\n");
+        assert!(decode_utf16(b"plain").is_none());
+        // A lone surrogate and an odd trailing byte don't panic
+        assert_eq!(decode_utf16(&[0xFF, 0xFE, 0x00, 0xD8, 0x41]).unwrap(), "\u{FFFD}");
+    }
+
+    #[test]
+    fn legacy_fallback() {
+        assert_eq!(decode_windows_1252(b"caf\xe9"), "café");
+        assert_eq!(decode_windows_1252(b"\x93hi\x94 \x80 \x92"), "“hi” € ’");
+        let dir = std::env::temp_dir().join(format!("rfiles-preview-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("latin"), dir.join("utf16"));
+        std::fs::write(&a, b"na\xefve \x93q\x94").unwrap();
+        let mut u = vec![0xFF, 0xFE];
+        u.extend("ok".encode_utf16().flat_map(|u| u.to_le_bytes()));
+        std::fs::write(&b, u).unwrap();
+        let (ra, rb) = (read_text(&a), read_text(&b));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(ra.unwrap(), "naïve “q”");
+        assert_eq!(rb.unwrap(), "ok");
+    }
+
+    #[test]
+    fn size_refusal_and_folder_cap() {
+        let limit = crate::thumbs::MAX_FULL_DECODE_PIXELS as i32;
+        assert!(full_decode_refused(false, 20_000, 20_000));
+        assert!(!full_decode_refused(false, 6_000, 6_000));
+        assert!(!full_decode_refused(false, 1, limit));
+        assert!(full_decode_refused(false, 2, limit));
+        // JPEG and SVG decode at reduced size, so they are not refused
+        assert!(!full_decode_refused(true, 20_000, 20_000));
+        assert_eq!(folder_more_text(500), None);
+        assert_eq!(folder_more_text(501).as_deref(), Some("…and 1 more"));
+        assert_eq!(folder_more_text(12_500).as_deref(), Some("…and 12000 more"));
+    }
 }
 
 #[cfg(test)]
@@ -629,10 +760,10 @@ mod read_text_tests {
         let mut late = vec![b'x'; 8192];
         late.push(0);
         assert!(read_text(&t.file("late", &late)).is_ok());
-        // Up to 32 invalid UTF-8 bytes are shown as replacement characters; more means binary.
-        let some: Vec<u8> = (0..32).flat_map(|_| [b'a', 0xff]).collect();
-        assert_eq!(read_text(&t.file("some", &some)).unwrap().matches('\u{FFFD}').count(), 32);
-        let many: Vec<u8> = (0..33).flat_map(|_| [b'a', 0xff]).collect();
+        // Invalid UTF-8 is read as Windows-1252; more than 32 odd control bytes means binary.
+        let some: Vec<u8> = (0..32).flat_map(|_| [b'a', 0xff, 1]).collect();
+        assert_eq!(read_text(&t.file("some", &some)).unwrap().matches('ÿ').count(), 32);
+        let many: Vec<u8> = (0..33).flat_map(|_| [b'a', 0xff, 1]).collect();
         assert_eq!(read_text(&t.file("many", &many)), Err("binary".into()));
     }
 
