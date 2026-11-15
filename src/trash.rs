@@ -5,6 +5,7 @@
 
 use crate::app::{App, Loc};
 use crate::fileops::Outcome;
+use crate::i18n::{ntr, tr};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use std::ffi::{CStr, OsStr};
@@ -106,8 +107,9 @@ pub fn restore(items: Vec<(gio::File, PathBuf, bool)>) -> RestoreOutcome {
 
 /// The banner line after a restore: how many worked and failed, and any new names.
 pub fn restore_message(o: &RestoreOutcome) -> String {
-    let none = |n| format!("Couldn't restore {n} item(s)");
-    let mut s = crate::banner::outcome_text(&format!("Restored {} item(s)", o.done), none, o.done, &o.errors);
+    let none = |n| ntr(n, "Couldn't restore {n} item", "Couldn't restore {n} items");
+    let done = ntr(o.done, "Restored {n} item", "Restored {n} items");
+    let mut s = crate::banner::outcome_text(&done, none, o.done, &o.errors);
     match o.renamed.as_slice() {
         [] => {}
         [one] => s += &format!("; the name was taken, so it was restored as “{one}”"),
@@ -215,14 +217,14 @@ mod restore_tests {
             renamed: renamed.iter().map(|s| s.to_string()).collect(),
             errors: errors.iter().map(|s| s.to_string()).collect(),
         };
-        assert_eq!(restore_message(&o(2, &[], &[])), "Restored 2 item(s)");
+        assert_eq!(restore_message(&o(2, &[], &[])), "Restored 2 items");
         assert_eq!(
             restore_message(&o(1, &["a (restored).txt"], &[])),
-            "Restored 1 item(s); the name was taken, so it was restored as “a (restored).txt”"
+            "Restored 1 item; the name was taken, so it was restored as “a (restored).txt”"
         );
         assert_eq!(
             restore_message(&o(2, &["a (restored)", "b (restored)"], &["c: No space"])),
-            "Restored 2 item(s), 1 failed — c: No space; 2 names were taken, so “(restored)” was added to them"
+            "Restored 2 items, 1 failed — c: No space; 2 names were taken, so “(restored)” was added to them"
         );
     }
 
@@ -300,19 +302,19 @@ pub enum Job {
 impl Job {
     fn running(self, n: usize) -> String {
         match self {
-            Job::Trash => format!("Moving {n} item(s) to the trash…"),
-            Job::Delete => format!("Deleting {n} item(s)…"),
-            Job::EmptyTrash => "Emptying the trash…".into(),
-            Job::ForgetRecent => format!("Removing {n} item(s) from Recent…"),
+            Job::Trash => ntr(n, "Moving {n} item to the trash…", "Moving {n} items to the trash…"),
+            Job::Delete => ntr(n, "Deleting {n} item…", "Deleting {n} items…"),
+            Job::EmptyTrash => tr("Emptying the trash…"),
+            Job::ForgetRecent => ntr(n, "Removing {n} item from Recent…", "Removing {n} items from Recent…"),
         }
     }
 
-    fn failed(self) -> &'static str {
+    fn failed(self) -> String {
         match self {
-            Job::Trash => "Couldn't move to the trash",
-            Job::Delete => "Couldn't delete",
-            Job::EmptyTrash => "Couldn't empty the trash",
-            Job::ForgetRecent => "Couldn't remove from Recent",
+            Job::Trash => tr("Couldn't move to the trash"),
+            Job::Delete => tr("Couldn't delete"),
+            Job::EmptyTrash => tr("Couldn't empty the trash"),
+            Job::ForgetRecent => tr("Couldn't remove from Recent"),
         }
     }
 }
@@ -320,17 +322,19 @@ impl Job {
 /// The banner line after a job: how many items worked and how many failed. Every error is in `o.errors`.
 pub fn job_message(job: Job, o: &Outcome) -> String {
     let done = match job {
-        Job::Trash => format!("Moved {} item(s) to the trash", o.done),
-        Job::Delete => format!("Deleted {} item(s)", o.done),
-        Job::EmptyTrash if o.errors.is_empty() => "Emptied the trash".into(),
-        Job::EmptyTrash => format!("Deleted {} item(s) from the trash", o.done),
-        Job::ForgetRecent => format!("Removed {} item(s) from Recent", o.done),
+        Job::Trash => ntr(o.done, "Moved {n} item to the trash", "Moved {n} items to the trash"),
+        Job::Delete => ntr(o.done, "Deleted {n} item", "Deleted {n} items"),
+        Job::EmptyTrash if o.errors.is_empty() => tr("Emptied the trash"),
+        Job::EmptyTrash => ntr(o.done, "Deleted {n} item from the trash", "Deleted {n} items from the trash"),
+        Job::ForgetRecent => ntr(o.done, "Removed {n} item from Recent", "Removed {n} items from Recent"),
     };
     let none = |n| match job {
-        Job::Trash => format!("Couldn't move {n} item(s) to the trash"),
-        Job::Delete => format!("Couldn't delete {n} item(s)"),
-        Job::EmptyTrash => format!("Couldn't delete {n} item(s) from the trash"),
-        Job::ForgetRecent => format!("Couldn't remove {n} item(s) from Recent"),
+        Job::Trash => ntr(n, "Couldn't move {n} item to the trash", "Couldn't move {n} items to the trash"),
+        Job::Delete => ntr(n, "Couldn't delete {n} item", "Couldn't delete {n} items"),
+        Job::EmptyTrash => {
+            ntr(n, "Couldn't delete {n} item from the trash", "Couldn't delete {n} items from the trash")
+        }
+        Job::ForgetRecent => ntr(n, "Couldn't remove {n} item from Recent", "Couldn't remove {n} items from Recent"),
     };
     crate::banner::outcome_text(&done, none, o.done, &o.errors)
 }
@@ -461,7 +465,7 @@ fn spawn_job<T: Send + 'static>(
         let res = gio::spawn_blocking(work).await;
         match res {
             Ok(v) => then(&weak, v),
-            Err(_) => crate::jobs::deliver(&weak, crate::banner::Notice::stopped(job.failed())),
+            Err(_) => crate::jobs::deliver(&weak, crate::banner::Notice::stopped(&job.failed())),
         }
         drop(hold);
         let Some(app) = weak.upgrade() else { return };
@@ -636,18 +640,18 @@ mod delete_tests {
             errors: errors.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         };
-        assert_eq!(job_message(Job::Trash, &o(3, &[])), "Moved 3 item(s) to the trash");
+        assert_eq!(job_message(Job::Trash, &o(3, &[])), "Moved 3 items to the trash");
         assert_eq!(
             job_message(Job::Trash, &o(2, &["a: Permission denied", "b: x", "c: y"])),
-            "Moved 2 item(s) to the trash, 3 failed"
+            "Moved 2 items to the trash, 3 failed"
         );
-        assert_eq!(job_message(Job::Delete, &o(0, &["a: Busy"])), "Couldn't delete 1 item(s) — a: Busy");
+        assert_eq!(job_message(Job::Delete, &o(0, &["a: Busy"])), "Couldn't delete 1 item — a: Busy");
         assert_eq!(job_message(Job::EmptyTrash, &o(4, &[])), "Emptied the trash");
         assert_eq!(
             job_message(Job::EmptyTrash, &o(4, &["x/y: No", "z: No"])),
-            "Deleted 4 item(s) from the trash, 2 failed"
+            "Deleted 4 items from the trash, 2 failed"
         );
-        assert_eq!(job_message(Job::ForgetRecent, &o(1, &[])), "Removed 1 item(s) from Recent");
+        assert_eq!(job_message(Job::ForgetRecent, &o(1, &[])), "Removed 1 item from Recent");
     }
 
     #[test]

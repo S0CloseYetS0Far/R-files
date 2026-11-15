@@ -3,6 +3,7 @@
 //! Successes go away by themselves after a few seconds; results with errors stay, with "Details…" listing
 //! every error line. The status bar below keeps item counts and short hints.
 
+use crate::i18n::tr;
 use gtk::prelude::*;
 use gtk::{gdk, glib, pango};
 use std::cell::{Cell, RefCell};
@@ -46,7 +47,7 @@ pub fn outcome_text(
     let s = match (done, errors.len()) {
         (_, 0) => return done_text.to_string(),
         (0, n) => none_text(n),
-        (_, n) => format!("{done_text}, {n} failed"),
+        (_, n) => format!("{done_text}, {}", tr("{n} failed").replace("{n}", &n.to_string())),
     };
     match errors {
         [one] => format!("{s} — {one}"),
@@ -152,12 +153,12 @@ impl Banner {
         label.set_xalign(0.0);
         label.set_hexpand(true);
         label.set_ellipsize(pango::EllipsizeMode::End);
-        let details = gtk::Button::with_label("Details…");
+        let details = gtk::Button::with_label(&tr("Details…"));
         details.add_css_class("flat");
         let close = gtk::Button::from_icon_name("window-close-symbolic");
         close.add_css_class("flat");
-        close.set_tooltip_text(Some("Dismiss"));
-        close.update_property(&[gtk::accessible::Property::Label("Dismiss")]);
+        close.set_tooltip_text(Some(&tr("Dismiss")));
+        close.update_property(&[gtk::accessible::Property::Label(&tr("Dismiss"))]);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         row.add_css_class("banner");
         row.append(&label);
@@ -246,8 +247,8 @@ fn show_details(parent: Option<&gtk::Window>, n: &Notice) {
     view.add_css_class("details-text");
     view.buffer().set_text(&text);
     let scroll = gtk::ScrolledWindow::builder().child(&view).vexpand(true).build();
-    let copy = gtk::Button::with_label("Copy");
-    let close = gtk::Button::with_label("Close");
+    let copy = gtk::Button::with_label(&tr("Copy"));
+    let close = gtk::Button::with_label(&tr("Close"));
     let btns = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     btns.set_halign(gtk::Align::End);
     btns.append(&copy);
@@ -260,7 +261,7 @@ fn show_details(parent: Option<&gtk::Window>, n: &Notice) {
     bx.append(&scroll);
     bx.append(&btns);
     let win = gtk::Window::builder()
-        .title("Details")
+        .title(tr("Details"))
         .default_width(560)
         .default_height(360)
         .destroy_with_parent(true)

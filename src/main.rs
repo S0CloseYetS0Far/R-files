@@ -8,6 +8,7 @@ mod dnd;
 mod docs;
 mod fileops;
 mod gpu;
+mod i18n;
 mod jobs;
 mod launch;
 mod pathbar;
@@ -302,6 +303,7 @@ fn main() -> glib::ExitCode {
         println!("{line}");
         return glib::ExitCode::SUCCESS;
     }
+    i18n::init();
     // Before anything else: see gpu.rs
     gpu::keep_sleeping_cards_asleep();
 

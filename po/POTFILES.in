@@ -1,0 +1,4 @@
+# Source files with strings to translate (see po/README.md)
+src/app.rs
+src/banner.rs
+src/trash.rs

@@ -382,9 +382,32 @@ pub fn set_icon(img: &gtk::Image, info: &gio::FileInfo, thumbs: bool) {
 pub fn format_time(info: &gio::FileInfo) -> String {
     info.modification_date_time()
         .and_then(|d| d.to_local().ok())
-        .and_then(|d| d.format("%Y-%m-%d  %H:%M").ok())
+        .and_then(|d| d.format(DATE_TIME_FORMAT).ok())
         .map(|s| s.to_string())
         .unwrap_or_default()
+}
+
+/// Date and time the way the user's region writes them (strftime's locale-dependent %x and %X).
+pub const DATE_TIME_FORMAT: &str = "%x  %X";
+
+#[cfg(test)]
+mod date_format_tests {
+    use super::*;
+
+    #[test]
+    fn dates_follow_the_locale() {
+        let c = std::ffi::CString::new("en_GB.utf8").unwrap();
+        // SAFETY: only this test changes the locale; it is put back below
+        let old = unsafe { libc::setlocale(libc::LC_TIME, std::ptr::null()) };
+        let old = unsafe { std::ffi::CStr::from_ptr(old) }.to_owned();
+        if unsafe { libc::setlocale(libc::LC_TIME, c.as_ptr()) }.is_null() {
+            return; // locale not installed here
+        }
+        let dt = glib::DateTime::from_local(2026, 11, 15, 14, 30, 5.0).unwrap();
+        let text = dt.format(DATE_TIME_FORMAT).unwrap().to_string();
+        unsafe { libc::setlocale(libc::LC_TIME, old.as_ptr()) };
+        assert!(text.starts_with("15/11/"), "{text}");
+    }
 }
 
 pub fn format_size(info: &gio::FileInfo) -> String {
