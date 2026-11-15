@@ -73,18 +73,7 @@ drag and drop and thumbnails are shared between them.
 
 ## Install (Ubuntu 24.04 or newer)
 
-### Option 1: the .deb package (no compiling)
-
-Download the `.deb` from the [Releases](https://github.com/S0CloseYetS0Far/R-files/releases) page and run:
-
-```bash
-sudo apt install ./rfiles_*.deb
-```
-
-Then open **RFiles** from the app grid, or run `rfiles`. To update, install the newer `.deb` the same way;
-to remove it: `sudo apt remove rfiles`.
-
-### Option 2: build from source with the script
+### Option 1: build from source with the script
 
 Open a terminal and run:
 
@@ -106,6 +95,18 @@ With the script, to update run `git pull` and `./install.sh` again; if RFiles is
 old version until you close them all (or press Ctrl+Q).
 
 To uninstall the script install: `./install.sh uninstall`
+
+### Option 2: the .deb package (no compiling)
+
+If the [Releases](https://github.com/S0CloseYetS0Far/R-files/releases) page has a `.deb` for your version,
+download it and run:
+
+```bash
+sudo apt install ./rfiles_*.deb
+```
+
+Then open **RFiles** from the app grid, or run `rfiles`. To update, install the newer `.deb` the same way;
+to remove it: `sudo apt remove rfiles`.
 
 ### Make RFiles your default file manager
 
@@ -176,3 +177,9 @@ sudo apt install libgtk-4-dev libpoppler-glib-dev build-essential pkg-config
 cargo build --release
 ./target/release/rfiles
 ```
+
+## Making a release
+
+Push a tag named `vX.Y.Z` (for example `git tag v0.2.0 && git push origin v0.2.0`). The
+`Release` workflow then builds the `.deb` on Ubuntu 24.04 and attaches it to a GitHub Release.
+Set `version` in `Cargo.toml` to match first.
