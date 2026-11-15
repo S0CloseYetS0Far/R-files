@@ -1064,7 +1064,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
 
     app.hidden_btn.set_active(show_hidden);
     app.view_btn.set_active(list_view);
-    app.view_stack.set_visible_child_name(if list_view { "list" } else { "grid" });
+    app.show_view(list_view);
     // Applied before the buttons, so their toggled handlers find nothing to change or save
     app.side_scroll.set_visible(show_sidebar);
     app.preview.root.set_visible(show_preview);
@@ -1343,6 +1343,31 @@ impl App {
             .find(|c| c.id().as_deref() == Some(key.as_str()));
         let order = if desc { gtk::SortType::Descending } else { gtk::SortType::Ascending };
         self.list.sort_by_column(col.as_ref(), order);
+    }
+
+    /// Shows one view and gives only that one the model: a view in a hidden stack page
+    /// still builds a few hundred rows or tiles, which cost about 4 MB (#55).
+    fn show_view(&self, list: bool) {
+        self.view_stack.set_visible_child_name(if list { "list" } else { "grid" });
+        let model = Some(&self.selection);
+        let (grid_model, list_model) = if list { (None, model) } else { (model, None) };
+        self.grid.set_model(grid_model);
+        self.list.set_model(list_model);
+        // The view that was hidden did not follow the selection: bring it into view
+        let sel = self.selection.selection();
+        if !sel.is_empty() {
+            self.scroll_views(sel.minimum(), gtk::ListScrollFlags::NONE, gtk::ListScrollFlags::NONE);
+        }
+    }
+
+    /// Scrolls the view that has the model (the hidden one has none).
+    fn scroll_views(&self, pos: u32, grid_flags: gtk::ListScrollFlags, list_flags: gtk::ListScrollFlags) {
+        if self.grid.model().is_some() {
+            self.grid.scroll_to(pos, grid_flags, None);
+        }
+        if self.list.model().is_some() {
+            self.list.scroll_to(pos, None::<&gtk::ColumnViewColumn>, list_flags, None);
+        }
     }
 
     /// A header click or `set_sort`: re-sorts the model in place (no reload; the
@@ -1845,8 +1870,7 @@ impl App {
                     let (none, focus) = (gtk::ListScrollFlags::NONE, gtk::ListScrollFlags::FOCUS);
                     let list = self.view_btn.is_active();
                     let (grid_flags, list_flags) = if list { (none, focus) } else { (focus, none) };
-                    self.grid.scroll_to(pos[0], grid_flags, None);
-                    self.list.scroll_to(pos[0], None::<&gtk::ColumnViewColumn>, list_flags, None);
+                    self.scroll_views(pos[0], grid_flags, list_flags);
                 }
             }
         }
@@ -2045,8 +2069,7 @@ impl App {
                 let flags = gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT;
                 let none = gtk::ListScrollFlags::NONE;
                 let (grid_flags, list_flags) = if self.view_btn.is_active() { (none, flags) } else { (flags, none) };
-                self.grid.scroll_to(pos, grid_flags, None);
-                self.list.scroll_to(pos, None::<&gtk::ColumnViewColumn>, list_flags, None);
+                self.scroll_views(pos, grid_flags, list_flags);
                 break;
             }
         }
@@ -3994,8 +4017,7 @@ impl App {
         let a = Rc::downgrade(self);
         self.view_btn.connect_toggled(move |b| {
             let Some(a) = a.upgrade() else { return };
-            a.view_stack
-                .set_visible_child_name(if b.is_active() { "list" } else { "grid" });
+            a.show_view(b.is_active());
             a.config.borrow_mut().list_view = b.is_active();
             a.save_config();
         });
