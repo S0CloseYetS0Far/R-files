@@ -570,6 +570,8 @@ pub struct App {
     pub window: gtk::ApplicationWindow,
     tabs: RefCell<Vec<Tab>>,
     current: Cell<usize>,
+    /// Tabs closed in this window, newest last, for Ctrl+Shift+T
+    closed_tabs: RefCell<ClosedStack<ClosedTab>>,
     tab_strip: gtk::Box,
     tab_scroll: gtk::ScrolledWindow,
     plus: gtk::Button,
@@ -700,6 +702,145 @@ fn current_after_close(n: usize, cur: usize, i: usize) -> usize {
         i.min(n - 2)
     } else {
         cur
+    }
+}
+
+/// Most closed tabs remembered for reopening.
+const CLOSED_TABS_MAX: usize = 10;
+
+/// A closed tab: where it was and how to get back and forward from there.
+struct ClosedTab {
+    loc: Loc,
+    view: Option<ViewState>,
+    back: Vec<(Loc, Option<ViewState>)>,
+    fwd: Vec<(Loc, Option<ViewState>)>,
+}
+
+/// The last `CLOSED_TABS_MAX` items pushed; the oldest is forgotten first.
+struct ClosedStack<T>(Vec<T>);
+
+impl<T> Default for ClosedStack<T> {
+    fn default() -> Self {
+        ClosedStack(Vec::new())
+    }
+}
+
+impl<T> ClosedStack<T> {
+    fn push(&mut self, item: T) {
+        if self.0.len() >= CLOSED_TABS_MAX {
+            self.0.remove(0);
+        }
+        self.0.push(item);
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.0.pop()
+    }
+}
+
+/// Where tab `from` ends up (of `n`) when dropped before or after tab `over`; `None` when it stays put.
+fn tab_move_to(n: usize, from: usize, over: usize, before: bool) -> Option<usize> {
+    if from >= n || over >= n {
+        return None;
+    }
+    // The gap it goes into, counted in the list as it is now
+    let slot = if before { over } else { over + 1 };
+    let to = if slot > from { slot - 1 } else { slot };
+    (to != from).then_some(to)
+}
+
+/// The current tab's index after tab `from` moved to `to`.
+fn current_after_move(cur: usize, from: usize, to: usize) -> usize {
+    if cur == from {
+        to
+    } else if from < cur && to >= cur {
+        cur - 1
+    } else if from > cur && to <= cur {
+        cur + 1
+    } else {
+        cur
+    }
+}
+
+/// Tab titles with the parent folder added to any that share a title: "src — app".
+/// Each entry is (title, parent folder's title if it has one).
+fn tab_titles(items: &[(String, Option<String>)]) -> Vec<String> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, (title, parent))| {
+            let clash = items.iter().enumerate().any(|(j, (t, _))| j != i && t == title);
+            match parent {
+                Some(p) if clash => format!("{title} — {p}"),
+                _ => title.clone(),
+            }
+        })
+        .collect()
+}
+
+thread_local! {
+    /// The tab widget being dragged along the strip.
+    static TAB_DRAG: RefCell<Option<glib::WeakRef<gtk::Box>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod tab_extras_tests {
+    use super::*;
+
+    #[test]
+    fn closed_stack_keeps_the_newest_ten() {
+        let mut s = ClosedStack::default();
+        for i in 0..13 {
+            s.push(i);
+        }
+        assert_eq!(s.0.len(), CLOSED_TABS_MAX);
+        assert_eq!(s.pop(), Some(12));
+        assert_eq!(s.pop(), Some(11));
+        assert_eq!(s.0.first(), Some(&3));
+        let mut empty: ClosedStack<u8> = ClosedStack::default();
+        assert_eq!(empty.pop(), None);
+    }
+
+    #[test]
+    fn move_target() {
+        assert_eq!(tab_move_to(3, 0, 2, false), Some(2));
+        assert_eq!(tab_move_to(3, 0, 2, true), Some(1));
+        assert_eq!(tab_move_to(3, 2, 0, true), Some(0));
+        assert_eq!(tab_move_to(3, 2, 0, false), Some(1));
+        assert_eq!(tab_move_to(3, 1, 2, true), None);
+        assert_eq!(tab_move_to(3, 1, 0, false), None);
+        assert_eq!(tab_move_to(3, 1, 1, true), None);
+        assert_eq!(tab_move_to(3, 5, 0, true), None);
+    }
+
+    #[test]
+    fn current_follows_the_move() {
+        // 0 1 2 3 with tab 0 moved to 2 gives 1 2 0 3
+        assert_eq!(current_after_move(0, 0, 2), 2);
+        assert_eq!(current_after_move(1, 0, 2), 0);
+        assert_eq!(current_after_move(2, 0, 2), 1);
+        assert_eq!(current_after_move(3, 0, 2), 3);
+        // tab 3 moved to 1 gives 0 3 1 2
+        assert_eq!(current_after_move(1, 3, 1), 2);
+        assert_eq!(current_after_move(2, 3, 1), 3);
+        assert_eq!(current_after_move(0, 3, 1), 0);
+        assert_eq!(current_after_move(3, 3, 1), 1);
+    }
+
+    fn item(t: &str, p: Option<&str>) -> (String, Option<String>) {
+        (t.to_string(), p.map(str::to_string))
+    }
+
+    #[test]
+    fn same_titles_get_the_parent() {
+        let items = [item("src", Some("app")), item("docs", Some("app")), item("src", Some("lib"))];
+        assert_eq!(tab_titles(&items), ["src — app", "docs", "src — lib"]);
+    }
+
+    #[test]
+    fn same_titles_without_a_parent_stay_plain() {
+        let items = [item("Starred", None), item("Starred", None), item("x", Some("y"))];
+        assert_eq!(tab_titles(&items), ["Starred", "Starred", "x"]);
     }
 }
 
@@ -1015,6 +1156,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         window,
         tabs: RefCell::new(Vec::new()),
         current: Cell::new(0),
+        closed_tabs: RefCell::new(ClosedStack::default()),
         tab_strip,
         tab_scroll,
         plus,
@@ -1995,6 +2137,7 @@ impl App {
             }));
             (t.loc.clone(), !t.back.is_empty(), !t.fwd.is_empty())
         };
+        self.refresh_tab_titles();
         self.search_gen.set(self.search_gen.get() + 1);
         self.cancel_search();
         self.back_btn.set_sensitive(can_back);
@@ -2221,6 +2364,28 @@ impl App {
 
     // ================= tabs =================
     pub fn new_tab(self: &Rc<Self>, loc: Loc) {
+        self.open_tab(ClosedTab { loc, view: None, back: vec![], fwd: vec![] });
+    }
+
+    /// Ctrl+Shift+T: brings back the most recently closed tab with its history.
+    fn reopen_tab(self: &Rc<Self>) {
+        let closed = self.closed_tabs.borrow_mut().pop();
+        match closed {
+            Some(c) => self.open_tab(c),
+            None => self.status.set_text("No closed tab to reopen"),
+        }
+    }
+
+    /// Ctrl+W: closes the tab; the last tab closes the window.
+    fn close_tab_or_window(self: &Rc<Self>) {
+        if self.tabs.borrow().len() <= 1 {
+            self.window.close();
+        } else {
+            self.close_tab(self.current.get());
+        }
+    }
+
+    fn open_tab(self: &Rc<Self>, closed: ClosedTab) {
         // Focusable so the keyboard and screen readers can reach it; every tab is in the Tab order (no roving focus)
         let bx = gtk::Box::builder()
             .spacing(6)
@@ -2272,6 +2437,8 @@ impl App {
             a.tab_key(i, key)
         });
         bx.add_controller(keys);
+        self.attach_tab_drag(&bx);
+        crate::dnd::attach_tab(self, &bx);
         let a = Rc::downgrade(self);
         let w = bx.downgrade();
         close.connect_clicked(move |_| {
@@ -2287,7 +2454,8 @@ impl App {
         self.save_view();
         let idx = {
             let mut tabs = self.tabs.borrow_mut();
-            tabs.push(Tab { loc, view: None, back: vec![], fwd: vec![], widget: bx, label, icon, close });
+            let ClosedTab { loc, view, back, fwd } = closed;
+            tabs.push(Tab { loc, view, back, fwd, widget: bx, label, icon, close });
             tabs.len() - 1
         };
         self.show_tab(idx);
@@ -2324,6 +2492,108 @@ impl App {
 
     fn tab_index(&self, w: &gtk::Box) -> Option<usize> {
         self.tabs.borrow().iter().position(|t| &t.widget == w)
+    }
+
+    /// The place shown by the tab widget `w`.
+    pub(crate) fn tab_loc_of(&self, w: &gtk::Box) -> Option<Loc> {
+        self.tabs.borrow().iter().find(|t| &t.widget == w).map(|t| t.loc.clone())
+    }
+
+    /// Whether `w` is the tab widget currently shown.
+    pub(crate) fn is_current_tab(&self, w: &gtk::Box) -> bool {
+        self.tab_index(w) == Some(self.current.get())
+    }
+
+    /// Switches to the tab widget `w` (used while hovering it during a file drag).
+    pub(crate) fn switch_to_tab(self: &Rc<Self>, w: &gtk::Box) {
+        if let Some(i) = self.tab_index(w) {
+            self.switch_to(i);
+        }
+    }
+
+    /// Titles every tab, adding the parent folder's name where two tabs would look alike.
+    fn refresh_tab_titles(&self) {
+        let tabs = self.tabs.borrow();
+        let items: Vec<(String, Option<String>)> = tabs
+            .iter()
+            .map(|t| {
+                let parent = match &t.loc {
+                    Loc::Dir(f) => f.parent().map(|p| file_title(&p)),
+                    _ => None,
+                };
+                (t.loc.title(), parent)
+            })
+            .collect();
+        for (t, title) in tabs.iter().zip(tab_titles(&items)) {
+            set_tab_title(&t.widget, &t.label, &title);
+        }
+    }
+
+    /// Drag a tab to move it along the strip.
+    fn attach_tab_drag(self: &Rc<Self>, bx: &gtk::Box) {
+        let src = gtk::DragSource::new();
+        src.set_actions(gdk::DragAction::MOVE);
+        // A number type, so the sidebar's text drop targets and file targets never see it
+        src.connect_prepare(|_, _, _| Some(gdk::ContentProvider::for_value(&0u32.to_value())));
+        let w = bx.downgrade();
+        src.connect_drag_begin(move |s, _| {
+            if let Some(w) = w.upgrade() {
+                s.set_icon(Some(&gtk::WidgetPaintable::new(Some(&w))), 20, 16);
+                TAB_DRAG.with(|d| *d.borrow_mut() = Some(w.downgrade()));
+            }
+        });
+        src.connect_drag_end(|_, _, _| TAB_DRAG.with(|d| *d.borrow_mut() = None));
+        bx.add_controller(src);
+
+        let drop = gtk::DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
+        // The tab being dragged, if it belongs to this window and isn't the one under the pointer
+        let dragged = |a: &App, over: &gtk::Box| {
+            let src = TAB_DRAG.with(|d| d.borrow().as_ref().and_then(|w| w.upgrade()))?;
+            let (from, to) = (a.tab_index(&src)?, a.tab_index(over)?);
+            (from != to).then_some((from, to))
+        };
+        let (a, w) = (Rc::downgrade(self), bx.downgrade());
+        drop.connect_motion(move |_, x, _| {
+            let (Some(a), Some(w)) = (a.upgrade(), w.upgrade()) else { return gdk::DragAction::empty() };
+            if dragged(&a, &w).is_none() {
+                return gdk::DragAction::empty();
+            }
+            let before = x < w.width() as f64 / 2.0;
+            w.remove_css_class(if before { "drop-after" } else { "drop-before" });
+            w.add_css_class(if before { "drop-before" } else { "drop-after" });
+            gdk::DragAction::MOVE
+        });
+        let w = bx.downgrade();
+        drop.connect_leave(move |_| {
+            if let Some(w) = w.upgrade() {
+                w.remove_css_class("drop-before");
+                w.remove_css_class("drop-after");
+            }
+        });
+        let (a, w) = (Rc::downgrade(self), bx.downgrade());
+        drop.connect_drop(move |_, _, x, _| {
+            let (Some(a), Some(w)) = (a.upgrade(), w.upgrade()) else { return false };
+            w.remove_css_class("drop-before");
+            w.remove_css_class("drop-after");
+            let Some((from, over)) = dragged(&a, &w) else { return false };
+            let before = x < w.width() as f64 / 2.0;
+            // Move after the drop finishes, not while GTK is still using these widgets
+            glib::idle_add_local_once(move || a.move_tab(from, over, before));
+            true
+        });
+        bx.add_controller(drop);
+    }
+
+    fn move_tab(self: &Rc<Self>, from: usize, over: usize, before: bool) {
+        let Some(to) = tab_move_to(self.tabs.borrow().len(), from, over, before) else { return };
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            let t = tabs.remove(from);
+            tabs.insert(to, t);
+            let after = to.checked_sub(1).map(|i| tabs[i].widget.clone());
+            self.tab_strip.reorder_child_after(&tabs[to].widget, after.as_ref());
+        }
+        self.current.set(current_after_move(self.current.get(), from, to));
     }
 
     fn switch_to(self: &Rc<Self>, i: usize) {
@@ -2368,6 +2638,7 @@ impl App {
             let t = tabs.remove(i);
             let had_focus = t.widget.has_focus();
             self.tab_strip.remove(&t.widget);
+            self.closed_tabs.borrow_mut().push(ClosedTab { loc: t.loc, view: t.view, back: t.back, fwd: t.fwd });
             (current_after_close(n, self.current.get(), i), had_focus)
         };
         self.show_tab(new_cur);
@@ -2870,6 +3141,7 @@ impl App {
         if leave_current {
             self.navigate(Loc::Dir(home()));
         }
+        self.refresh_tab_titles();
     }
 
     fn highlight_sidebar(&self, loc: &Loc) {
@@ -3631,7 +3903,8 @@ impl App {
             self.window.add_action(&act);
         };
         add("new-tab", Box::new(|a| a.new_tab(Loc::Dir(home()))));
-        add("close-tab", Box::new(|a| a.close_tab(a.current.get())));
+        add("close-tab", Box::new(|a| a.close_tab_or_window()));
+        add("reopen-tab", Box::new(|a| a.reopen_tab()));
         add("next-tab", Box::new(|a| a.cycle_tab(1)));
         add("prev-tab", Box::new(|a| a.cycle_tab(-1)));
         add("back", Box::new(|a| a.go_back()));
@@ -3889,6 +4162,7 @@ impl App {
             ("win.quit", &["<Control>q"]),
             ("win.shortcuts", &["<Control>question", "<Control><Shift>slash", "F1"]),
             ("win.close-tab", &["<Control>w"]),
+            ("win.reopen-tab", &["<Control><Shift>t"]),
             ("win.next-tab", &["<Control>Page_Down", "<Control>Tab"]),
             ("win.prev-tab", &["<Control>Page_Up", "<Control><Shift>Tab"]),
             ("win.back", &["<Alt>Left"]),
@@ -4352,7 +4626,9 @@ impl App {
 
 /// Every shortcut, shown in the shortcuts window. Keep in step with the README table.
 const SHORTCUTS: &[(&str, &str)] = &[
-    ("New tab / close tab", "Ctrl+T / Ctrl+W"),
+    ("New tab / close tab", "Ctrl+T / Ctrl+W (the last tab closes the window)"),
+    ("Reopen closed tab", "Ctrl+Shift+T"),
+    ("Reorder tabs / drop files on a tab", "Drag a tab / drag files onto it (hover to switch)"),
     ("New window", "Ctrl+N"),
     ("Quit", "Ctrl+Q"),
     ("Switch tabs", "Ctrl+PageDown / Ctrl+PageUp"),

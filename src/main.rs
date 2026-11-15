@@ -43,6 +43,9 @@ button.new-tab:hover { background: #262626; color: #ffffff; }
 }
 .tab:hover { background: #232323; color: #ddd; }
 .tab:focus-visible { outline: 2px solid #3584e4; outline-offset: 1px; }
+.tab.drop-before { box-shadow: inset 3px 0 #3584e4; }
+.tab.drop-after { box-shadow: inset -3px 0 #3584e4; }
+.tab.dnd-hover { background: rgba(53, 132, 228, 0.30); border-color: #3584e4; }
 .tab.active { background: #2e2e2e; color: #ffffff; border-color: #3584e4; }
 button.tab-close { min-width: 22px; min-height: 22px; padding: 0; border-radius: 6px; }
 

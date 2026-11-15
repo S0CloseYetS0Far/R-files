@@ -21,6 +21,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
+/// How long a file drag must rest on a tab before that tab is shown.
+const TAB_HOVER_SWITCH: std::time::Duration = std::time::Duration::from_millis(600);
+
 /// CSS class put on the widget under the pointer while it would accept a drop.
 const HOVER_CLASS: &str = "dnd-hover";
 
@@ -370,6 +373,44 @@ pub(crate) fn attach_view(app: &Rc<App>, scroll: &gtk::ScrolledWindow) {
 pub(crate) fn attach_folder_row(app: &Rc<App>, row: &gtk::ListBoxRow, folder: &gio::File) {
     let Some(d) = dest_for_folder(folder) else { return };
     add_target(row, move || Some(d.clone()), |w| w, Rc::downgrade(app));
+}
+
+/// A tab: files dropped on it go into its folder, and hovering it during a file drag switches to it.
+pub(crate) fn attach_tab(app: &Rc<App>, tab: &gtk::Box) {
+    let (wa, wt) = (Rc::downgrade(app), tab.downgrade());
+    let dest = move || match wa.upgrade()?.tab_loc_of(&wt.upgrade()?)? {
+        Loc::Dir(f) => dest_for_folder(&f),
+        _ => None,
+    };
+    add_target(tab, dest, |w| w, Rc::downgrade(app));
+
+    let hover = gtk::DropControllerMotion::new();
+    let timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let (wa, wt, t) = (Rc::downgrade(app), tab.downgrade(), timer.clone());
+    hover.connect_enter(move |c, _, _| {
+        if !c.drop().is_some_and(|d| is_file_drag(&d)) {
+            return;
+        }
+        if let Some(id) = t.borrow_mut().take() {
+            id.remove();
+        }
+        let (wa, wt, t2, wc) = (wa.clone(), wt.clone(), t.clone(), c.downgrade());
+        let id = glib::timeout_add_local_once(TAB_HOVER_SWITCH, move || {
+            // This source is spent; forget it so leave() doesn't remove it again
+            t2.borrow_mut().take();
+            let (Some(a), Some(w), Some(c)) = (wa.upgrade(), wt.upgrade(), wc.upgrade()) else { return };
+            if c.drop().is_some() && !a.is_current_tab(&w) {
+                a.switch_to_tab(&w);
+            }
+        });
+        *t.borrow_mut() = Some(id);
+    });
+    hover.connect_leave(move |_| {
+        if let Some(id) = timer.borrow_mut().take() {
+            id.remove();
+        }
+    });
+    tab.add_controller(hover);
 }
 
 /// The "Pinned" header (the last row added to `sidebar`): dropped folders
