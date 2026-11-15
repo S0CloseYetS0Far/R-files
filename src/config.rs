@@ -20,6 +20,8 @@ pub struct Config {
     /// "blue", "system" or "custom:/path/to/image"
     pub folder_icon: String,
     pub icon_size: i32,
+    /// Black, Light or follow the system
+    pub theme: crate::theme::Theme,
     /// Order of the built-in sidebar places, by key
     pub places_order: Vec<String>,
     /// What the file views are sorted by, and whether reversed
@@ -111,6 +113,7 @@ impl Config {
             show_hidden: false,
             folder_icon: "blue".into(),
             icon_size: 40,
+            theme: crate::theme::Theme::Black,
             places_order: Vec::new(),
             sort: SortKey::Name,
             sort_desc: false,
@@ -130,6 +133,10 @@ impl Config {
                 }
                 "places" => {
                     c.places_order = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    continue;
+                }
+                "theme" => {
+                    c.theme = crate::theme::Theme::parse(v);
                     continue;
                 }
                 "sort" => {
@@ -194,7 +201,7 @@ impl Config {
             self.pins.join("\n"),
             self.starred.join("\n"),
             format!(
-                "width={}\nheight={}\nmaximized={}\nsidebar={}\npreview={}\nfiles={}\nlist_view={}\nshow_hidden={}\nfolder_icon={}\nicon_size={}\nplaces={}\nsort={}\nsort_desc={}\n{}",
+                "width={}\nheight={}\nmaximized={}\nsidebar={}\npreview={}\nfiles={}\nlist_view={}\nshow_hidden={}\nfolder_icon={}\nicon_size={}\ntheme={}\nplaces={}\nsort={}\nsort_desc={}\n{}",
                 self.width,
                 self.height,
                 self.maximized as i32,
@@ -205,6 +212,7 @@ impl Config {
                 self.show_hidden as i32,
                 self.folder_icon,
                 self.icon_size,
+                self.theme.as_str(),
                 self.places_order.join(","),
                 self.sort.as_str(),
                 self.sort_desc as i32,
@@ -825,5 +833,28 @@ mod dead_star_tests {
         assert!(pin_is_missing(&dir_uri));
         // A file on a drive that isn't mounted is kept
         assert!(!star_is_dead("file:///media/no-such-user-rfiles/Disk/file.txt"));
+    }
+}
+
+#[cfg(test)]
+mod theme_setting_tests {
+    use super::Config;
+    use crate::theme::Theme;
+
+    #[test]
+    fn theme_is_saved_read_back_and_defaults_to_black() {
+        let d = std::env::temp_dir().join(format!("rfiles-theme-setting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(Config::load_from(&d).theme, Theme::Black);
+        std::fs::write(d.join("settings"), "width=900\ntheme=light\n").unwrap();
+        let mut c = Config::load_from(&d);
+        assert_eq!(c.theme, Theme::Light);
+        c.theme = Theme::Follow;
+        assert!(c.save_to(&d).is_none());
+        assert_eq!(Config::load_from(&d).theme, Theme::Follow);
+        std::fs::write(d.join("settings"), "theme=nonsense\n").unwrap();
+        assert_eq!(Config::load_from(&d).theme, Theme::Black);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
