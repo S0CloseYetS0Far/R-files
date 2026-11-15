@@ -481,6 +481,14 @@ pub fn infos_store(files: impl Iterator<Item = gio::File>) -> gio::ListStore {
     store
 }
 
+/// gvfs crashes (in g_mount_spec_to_dbus_with_path) when several threads first use its trash:/// and recent:///
+/// files at once. Tests that build such files take this lock; the app only does it from one thread at a time.
+#[cfg(test)]
+pub(crate) fn gvfs_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod location_tests {
     use super::*;
@@ -491,6 +499,7 @@ mod location_tests {
 
     #[test]
     fn display_paths() {
+        let _gvfs = crate::util::gvfs_lock();
         let home = glib::home_dir();
         assert_eq!(display_path(&path(&home)), "~");
         assert_eq!(display_path(&path(&home.join("Pictures/2024"))), "~/Pictures/2024");
@@ -505,6 +514,7 @@ mod location_tests {
 
     #[test]
     fn titles_and_icons() {
+        let _gvfs = crate::util::gvfs_lock();
         let home = glib::home_dir();
         let cases = [
             (path(&home), "Home", "user-home-symbolic"),
@@ -521,6 +531,7 @@ mod location_tests {
 
     #[test]
     fn trash_uris() {
+        let _gvfs = crate::util::gvfs_lock();
         assert!(is_trash(&gio::File::for_uri("trash:///")));
         assert!(is_trash(&gio::File::for_uri("trash:///a%20b")));
         assert!(!is_trash(&path(std::path::Path::new("/tmp/trash"))));
