@@ -236,6 +236,7 @@ mod compare_infos_tests {
     }
 
     fn make(x: &F) -> gio::FileInfo {
+        super::tests::english_locale();
         let i = gio::FileInfo::new();
         i.set_name(x.name);
         i.set_display_name(x.name);
@@ -308,6 +309,7 @@ mod compare_infos_tests {
 
     #[test]
     fn by_type() {
+        super::tests::english_locale();
         let png = gio::content_type_get_description("image/png").to_string();
         let txt = gio::content_type_get_description("text/plain").to_string();
         // No content type has an empty description, so it comes first.
@@ -479,6 +481,14 @@ pub fn infos_store(files: impl Iterator<Item = gio::File>) -> gio::ListStore {
     store
 }
 
+/// gvfs crashes (in g_mount_spec_to_dbus_with_path) when several threads first use its trash:/// and recent:///
+/// files at once. Tests that build such files take this lock; the app only does it from one thread at a time.
+#[cfg(test)]
+pub(crate) fn gvfs_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod location_tests {
     use super::*;
@@ -489,6 +499,7 @@ mod location_tests {
 
     #[test]
     fn display_paths() {
+        let _gvfs = crate::util::gvfs_lock();
         let home = glib::home_dir();
         assert_eq!(display_path(&path(&home)), "~");
         assert_eq!(display_path(&path(&home.join("Pictures/2024"))), "~/Pictures/2024");
@@ -503,6 +514,7 @@ mod location_tests {
 
     #[test]
     fn titles_and_icons() {
+        let _gvfs = crate::util::gvfs_lock();
         let home = glib::home_dir();
         let cases = [
             (path(&home), "Home", "user-home-symbolic"),
@@ -519,6 +531,7 @@ mod location_tests {
 
     #[test]
     fn trash_uris() {
+        let _gvfs = crate::util::gvfs_lock();
         assert!(is_trash(&gio::File::for_uri("trash:///")));
         assert!(is_trash(&gio::File::for_uri("trash:///a%20b")));
         assert!(!is_trash(&path(std::path::Path::new("/tmp/trash"))));
@@ -535,6 +548,7 @@ mod location_tests {
 
     #[test]
     fn sizes_and_types() {
+        super::tests::english_locale();
         // Folders and folder-like items have no size; a negative size counts as zero.
         assert_eq!(format_size(&info("d", gio::FileType::Directory, 4096)), "");
         assert_eq!(format_size(&info("m", gio::FileType::Mountable, 1)), "");
@@ -576,7 +590,10 @@ mod tests {
 
     /// The app gets the user's locale from gtk_init; tests have to ask for one. Returns false
     /// when no English UTF-8 locale is installed, so locale-dependent checks can be skipped.
-    fn english_locale() -> bool {
+    /// setlocale is not thread-safe (a call racing with strcoll or gettext in another test
+    /// thread can crash or change its result), so every test that sorts, collates or looks up
+    /// a type description calls this first: the OnceLock makes all of them wait for the one call.
+    pub(super) fn english_locale() -> bool {
         extern "C" {
             fn setlocale(category: i32, locale: *const std::ffi::c_char) -> *mut std::ffi::c_char;
         }

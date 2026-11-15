@@ -482,6 +482,7 @@ mod tests {
 
     #[test]
     fn folder_destinations() {
+        let _gvfs = crate::util::gvfs_lock();
         assert_eq!(dest_for_folder(&gio::File::for_path("/tmp")), Some(Dest::Dir("/tmp".into())));
         assert_eq!(dest_for_folder(&gio::File::for_uri("trash:///")), Some(Dest::Trash));
         assert_eq!(dest_for_folder(&gio::File::for_uri("trash:///x")), None);

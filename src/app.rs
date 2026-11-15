@@ -113,6 +113,7 @@ mod loc_grid_tests {
 
     #[test]
     fn loc_keys_and_titles() {
+        let _gvfs = crate::util::gvfs_lock();
         let tmp = Loc::Dir(gio::File::for_uri("file:///tmp/a%20b/"));
         assert_eq!((tmp.key(), tmp.title()), ("file:///tmp/a%20b".to_string(), "a b".to_string()));
         // With and without a trailing slash is the same place.
