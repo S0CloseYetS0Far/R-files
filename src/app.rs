@@ -1704,16 +1704,11 @@ impl App {
     }
 
     fn launch(&self, file: &gio::File, ask: bool) {
-        let l = gtk::FileLauncher::new(Some(file));
-        l.set_always_ask(ask);
-        let status = self.status.clone();
-        l.launch(Some(&self.window), None::<&gio::Cancellable>, move |r| {
-            if let Err(e) = r {
-                if !e.matches(gtk::DialogError::Dismissed) {
-                    status.set_text(&format!("Couldn't open: {}", e.message()));
-                }
-            }
-        });
+        if ask {
+            crate::launch::choose(self.window.upcast_ref(), file, &self.status);
+        } else {
+            crate::launch::open(self.window.upcast_ref(), file, &self.status);
+        }
     }
 
     fn open_terminal(&self, dir: Option<gio::File>) {

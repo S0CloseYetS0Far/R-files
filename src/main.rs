@@ -9,6 +9,7 @@ mod docs;
 mod fileops;
 mod gpu;
 mod jobs;
+mod launch;
 mod pathbar;
 mod preview;
 mod properties;
