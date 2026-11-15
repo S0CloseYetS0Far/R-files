@@ -452,15 +452,18 @@ fn clashes(src: &Path, target: &Path) -> bool {
     target.symlink_metadata().is_ok() && !same_item(src, target)
 }
 
-/// A free hidden name in `dir` for a half-done replace. Short, so a long item name can't make it too long.
+/// A free hidden name in `dir` for a half-done copy or replace. Short, so a long item name can't make it too long.
+/// The counter is shared by all jobs, so two jobs running at once into the same folder never pick the same name.
+/// Old leftovers (from a crash) are skipped, never deleted: one may hold the only copy of something.
 fn temp_name(dir: &Path, tag: &str) -> PathBuf {
-    for i in 0.. {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let i = NEXT.fetch_add(1, Ordering::Relaxed);
         let p = dir.join(format!(".rfiles-{tag}-{}-{i}", std::process::id()));
         if p.symlink_metadata().is_err() {
             return p;
         }
     }
-    unreachable!()
 }
 
 pub(crate) fn remove_any(p: &Path) -> io::Result<()> {
@@ -469,6 +472,275 @@ pub(crate) fn remove_any(p: &Path) -> io::Result<()> {
         Ok(_) => std::fs::remove_file(p),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+/// Removes `tmp`, a temporary this job created, after `e` stopped the copy into it; returns the error to report.
+/// Folders in it are made writable first: a copied read-only folder can't be emptied otherwise. Symlinks are
+/// neither followed nor changed. If it can't all be removed, the error says where the rest is.
+fn remove_temp(tmp: &Path, e: io::Error) -> io::Error {
+    fn open_up(p: &Path) {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // O_NOFOLLOW | O_DIRECTORY: only ever a real folder, so a symlink can't send the chmod elsewhere
+        let flags = libc::O_NOFOLLOW | libc::O_DIRECTORY;
+        let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(p) else {
+            // Not a folder, or one we can't even open (mode 000): make it readable through its path
+            if p.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+                if std::fs::OpenOptions::new().read(true).custom_flags(flags).open(p).is_ok() {
+                    open_up(p);
+                }
+            }
+            return;
+        };
+        if f.metadata().is_ok_and(|m| m.permissions().mode() & 0o700 != 0o700) {
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for c in rd.flatten() {
+                if c.file_type().is_ok_and(|t| t.is_dir()) {
+                    open_up(&c.path());
+                }
+            }
+        }
+    }
+    open_up(tmp);
+    // `remove_dir_all` doesn't follow symlinks; it removes the link, not what it points at
+    match remove_any(tmp) {
+        Ok(()) => e,
+        Err(r) => {
+            let at = tmp.display();
+            io::Error::other(format!("{e}; the partial copy couldn't be deleted ({r}), it is at {at}"))
+        }
+    }
+}
+
+/// Copies `src` to `target` through a new hidden temporary next to it, so `target` only ever appears complete: a
+/// failure or Cancel part-way removes the temporary and leaves nothing under `target`, and after a crash only a hidden
+/// `.rfiles-new-…` item can remain. With `replacing`, the item at `target` is swapped out once the copy is done
+/// (and kept if something had to be left out); otherwise `target` must be free and is never overwritten.
+/// When `src` itself is a pipe, socket or device nothing is made; without `replacing` that is Ok, see `skipped`.
+fn copy_into_place(
+    src: &Path,
+    target: &Path,
+    replacing: bool,
+    progress: &CopyProgress,
+    skipped: &mut usize,
+) -> io::Result<()> {
+    let tmp = temp_name(target.parent().unwrap_or(Path::new(".")), "new");
+    if let Err(e) = copy_recursive(src, &tmp, progress, skipped) {
+        // Everything below `tmp` is in a folder this job just made, so "already exists" can only be `tmp` itself:
+        // someone else's (`temp_name`'s counter makes that practically impossible), so it is never deleted
+        return Err(if e.kind() == io::ErrorKind::AlreadyExists { e } else { remove_temp(&tmp, e) });
+    }
+    let res = (|| {
+        let Ok(md) = tmp.symlink_metadata() else {
+            return if replacing { Err(io::Error::other("is a pipe, socket or device, not copied")) } else { Ok(()) };
+        };
+        if !replacing {
+            return crate::undo::rename_noreplace(&tmp, target);
+        }
+        if *skipped > 0 {
+            return Err(io::Error::other("holds pipes, sockets or devices that can't be copied; not replaced"));
+        }
+        if md.is_dir() { swap_dir(&tmp, target) } else { std::fs::rename(&tmp, target) }
+    })();
+    // After a successful rename `tmp` is gone, so a later error (the old folder not deleted) removes nothing
+    res.map_err(|e| remove_temp(&tmp, e))
+}
+
+#[cfg(test)]
+mod partial_copy_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, SystemTime};
+
+    fn base(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rfiles-partial-{tag}-{}", std::process::id()));
+        unlock(&d);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::create_dir_all(d.join("dest")).unwrap();
+        d
+    }
+
+    fn write(p: &Path, data: &[u8]) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, data).unwrap();
+    }
+
+    fn chmod(p: &Path, m: u32) {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    /// Makes a test tree removable again, whatever a failed test left locked
+    fn unlock(p: &Path) {
+        if p.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+            for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
+                unlock(&e.path());
+            }
+        }
+    }
+
+    fn done(d: &Path) {
+        unlock(d);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The names in `dir`, sorted
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    /// Root reads anything, so a locked file can't make a copy fail
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn failed_folder_copy_leaves_nothing_behind() {
+        if is_root() {
+            return;
+        }
+        let d = base("fail");
+        let (src, dest) = (d.join("src/f"), d.join("dest"));
+        write(&src.join("a.txt"), b"a");
+        write(&src.join("deep/er/ok.txt"), b"ok");
+        write(&src.join("deep/er/secret"), b"s");
+        chmod(&src.join("deep/er/secret"), 0o000);
+        // Similar names already there, a crash leftover among them: none may be touched
+        write(&dest.join("f/old.txt"), b"old");
+        write(&dest.join("f (copy) other"), b"x");
+        write(&dest.join(".rfiles-new-1-0/only-copy"), b"keep");
+        let before = names(&dest);
+
+        // Twice: the first failure mustn't leave anything that changes the second
+        for _ in 0..2 {
+            let out = transfer(vec![src.clone()], dest.clone(), false, &CopyProgress::default());
+            assert_eq!((out.done, out.errors.len()), (0, 1), "{:?}", out.errors);
+            assert!(out.errors[0].starts_with("f: "), "{:?}", out.errors);
+            assert!(out.items.is_empty());
+            assert_eq!(names(&dest), before);
+        }
+        assert_eq!(std::fs::read(dest.join("f/old.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dest.join(".rfiles-new-1-0/only-copy")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(src.join("a.txt")).unwrap(), b"a");
+        done(&d);
+    }
+
+    #[test]
+    fn cancel_mid_folder_leaves_nothing_behind() {
+        let d = base("cancel");
+        let (src, dest) = (d.join("src/f"), d.join("dest"));
+        let data: Vec<u8> = (0..2 * CHUNK as usize + 5).map(|i| i as u8).collect();
+        write(&src.join("a.txt"), b"a");
+        write(&src.join("ro/b.txt"), b"b");
+        write(&src.join("big.bin"), &data);
+        chmod(&src.join("ro"), 0o555);
+        // Past the small files, whichever order the folder lists them in, but inside big.bin
+        let p = CopyProgress { cancel_at: AtomicU64::new(3), ..Default::default() };
+        let out = transfer(vec![src.clone()], dest.clone(), false, &p);
+        assert!(p.stopped.load(Ordering::Relaxed));
+        assert_eq!((out.done, out.errors.len()), (0, 0), "{:?}", out.errors);
+        assert!(names(&dest).is_empty(), "{:?}", names(&dest));
+        assert_eq!(std::fs::read(src.join("big.bin")).unwrap(), data);
+        done(&d);
+    }
+
+    #[test]
+    fn cleanup_opens_locked_folders_and_never_follows_links() {
+        let d = base("cleanup");
+        let outside = d.join("src/outside");
+        write(&outside.join("keep.txt"), b"keep");
+        chmod(&outside, 0o555);
+        let tmp = d.join("dest/.rfiles-new-test");
+        write(&tmp.join("ro/sub/file"), b"x");
+        write(&tmp.join("locked/file"), b"x");
+        std::os::unix::fs::symlink(&outside, tmp.join("ro/link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("keep.txt"), tmp.join("file-link")).unwrap();
+        chmod(&tmp.join("ro/sub"), 0o555);
+        chmod(&tmp.join("ro"), 0o500);
+        chmod(&tmp.join("locked"), 0o000);
+
+        let e = remove_temp(&tmp, io::Error::other("disk full"));
+        assert_eq!(e.to_string(), "disk full");
+        assert!(tmp.symlink_metadata().is_err());
+        assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(outside.metadata().unwrap().permissions().mode() & 0o777, 0o555);
+        // Nothing there: nothing to do
+        assert_eq!(remove_temp(&tmp, io::Error::other("x")).to_string(), "x");
+        done(&d);
+    }
+
+    #[test]
+    fn leftover_that_cant_be_deleted_is_reported() {
+        if is_root() {
+            return;
+        }
+        let d = base("leftover");
+        let dest = d.join("dest");
+        let tmp = dest.join(".rfiles-new-test");
+        write(&tmp.join("file"), b"x");
+        // The destination itself turned read-only: the temporary can't go, so the message says where it is
+        chmod(&dest, 0o555);
+        let e = remove_temp(&tmp, io::Error::other("disk full"));
+        chmod(&dest, 0o755);
+        assert!(e.to_string().starts_with("disk full; the partial copy couldn't be deleted ("), "{e}");
+        assert!(e.to_string().ends_with(&format!("it is at {}", tmp.display())), "{e}");
+        done(&d);
+    }
+
+    #[test]
+    fn complete_copy_is_the_same_as_before() {
+        let d = base("ok");
+        let (src, dest) = (d.join("src/f"), d.join("dest"));
+        write(&src.join("sub/run.sh"), b"#!/bin/sh");
+        std::os::unix::fs::symlink("sub/run.sh", src.join("link")).unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::new(1_000_000_000, 0);
+        std::fs::File::open(src.join("sub/run.sh")).unwrap().set_modified(old).unwrap();
+        chmod(&src.join("sub/run.sh"), 0o750);
+        chmod(&src.join("sub"), 0o555);
+        write(&dest.join("f/old.txt"), b"old");
+
+        let out = transfer(vec![src.clone()], dest.clone(), false, &CopyProgress::default());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let copy = dest.join("f (copy)");
+        assert_eq!(out.items, vec![Transferred { source: src.clone(), target: copy.clone(), replaced: false }]);
+        assert_eq!(names(&dest), ["f", "f (copy)"]);
+        let mode = |p: &Path| p.symlink_metadata().unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&copy.join("sub/run.sh")), 0o750);
+        assert_eq!(mode(&copy.join("sub")), 0o555);
+        assert_eq!(copy.join("sub/run.sh").metadata().unwrap().modified().unwrap(), old);
+        assert_eq!(std::fs::read_link(copy.join("link")).unwrap(), Path::new("sub/run.sh"));
+
+        // Replace takes the same way and ends at the same name
+        let out = transfer_with(vec![src.clone()], dest.clone(), false, Clash::Replace, &CopyProgress::default());
+        assert_eq!(out.items, vec![Transferred { source: src.clone(), target: dest.join("f"), replaced: true }]);
+        assert_eq!(names(&dest), ["f", "f (copy)"]);
+        assert_eq!(mode(&dest.join("f/sub")), 0o555);
+        done(&d);
+    }
+
+    #[test]
+    fn special_files_are_left_out_and_the_rest_kept() {
+        let d = base("special");
+        let (src, dest) = (d.join("src/f"), d.join("dest"));
+        write(&src.join("a.txt"), b"a");
+        let ok = std::process::Command::new("mkfifo").arg(src.join("pipe")).status().unwrap().success();
+        assert!(ok, "mkfifo failed");
+        let out = transfer(vec![src.clone(), src.join("pipe")], dest.clone(), false, &CopyProgress::default());
+        assert_eq!(out.done, 0);
+        let errors = ["f: copied without 1 pipe, socket or device", "pipe: is a pipe, socket or device, not copied"];
+        assert_eq!(out.errors, errors);
+        assert!(out.items.is_empty());
+        assert_eq!(names(&dest), ["f"]);
+        assert_eq!(names(&dest.join("f")), ["a.txt"]);
+        done(&d);
     }
 }
 
@@ -508,22 +780,7 @@ fn replace(src: &Path, target: &Path, cut: bool, progress: &CopyProgress, skippe
             r => return r,
         }
     }
-    let tmp = temp_name(target.parent().unwrap_or(Path::new(".")), "new");
-    let res = copy_recursive(src, &tmp, progress, skipped).and_then(|()| {
-        if *skipped > 0 {
-            let why = if tmp.symlink_metadata().is_err() {
-                "is a pipe, socket or device, not copied"
-            } else {
-                "holds pipes, sockets or devices that can't be copied; not replaced"
-            };
-            return Err(io::Error::other(why));
-        }
-        if new_dir { swap_dir(&tmp, target) } else { std::fs::rename(&tmp, target) }
-    });
-    if res.is_err() {
-        let _ = remove_any(&tmp);
-        return res;
-    }
+    copy_into_place(src, target, true, progress, skipped)?;
     if cut {
         remove_any(src)?;
     }
@@ -591,7 +848,7 @@ fn transfer_with(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, policy: Clash,
                 // Different drive: copy, then remove the original. If something was left out, the
                 // original is kept so nothing is lost; a cancelled copy fails here and keeps it too.
                 Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-                    copy_recursive(&src, &target, progress, &mut skipped).and_then(|_| {
+                    copy_into_place(&src, &target, false, progress, &mut skipped).and_then(|_| {
                         if skipped > 0 {
                             Ok(())
                         } else if src.symlink_metadata()?.is_dir() {
@@ -604,7 +861,7 @@ fn transfer_with(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, policy: Clash,
                 Err(e) => Err(e),
             }
         } else {
-            copy_recursive(&src, &target, progress, &mut skipped)
+            copy_into_place(&src, &target, false, progress, &mut skipped)
         };
         match res {
             Ok(()) if skipped == 0 => {
@@ -616,7 +873,11 @@ fn transfer_with(sources: Vec<PathBuf>, dest: PathBuf, cut: bool, policy: Clash,
                 let top_level = target.symlink_metadata().is_err();
                 out.errors.push(skipped_msg(&label, skipped, top_level, cut));
             }
-            Err(_) if progress.cancel.load(Ordering::Relaxed) => {
+            Err(e) if progress.cancel.load(Ordering::Relaxed) => {
+                // Only Cancel's own error goes unsaid: a partial copy that couldn't be deleted is reported
+                if e.kind() != io::ErrorKind::Interrupted {
+                    out.errors.push(format!("{label}: {e}"));
+                }
                 progress.stopped.store(true, Ordering::Relaxed);
                 break;
             }
