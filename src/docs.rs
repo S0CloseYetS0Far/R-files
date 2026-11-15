@@ -38,10 +38,19 @@ pub fn extract_text(path: &Path) -> Result<String, String> {
     let mut out = String::new();
     for (i, name) in parts.iter().enumerate() {
         let Ok(mut entry) = zip.by_name(name) else { continue };
-        let mut xml = String::new();
-        if entry.by_ref().take(8 * 1024 * 1024).read_to_string(&mut xml).is_err() {
+        let mut bytes = Vec::new();
+        if entry.by_ref().take(8 * 1024 * 1024).read_to_end(&mut bytes).is_err() {
             continue;
         }
+        // The size cap can cut a character in half; keep everything before it. Other bad bytes still drop the part.
+        let xml = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) if e.utf8_error().error_len().is_none() => {
+                let n = e.utf8_error().valid_up_to();
+                String::from_utf8_lossy(&e.as_bytes()[..n]).into_owned()
+            }
+            Err(_) => continue,
+        };
         if ext == "pptx" {
             out.push_str(&format!("── Slide {} ──\n", i + 1));
         }
@@ -121,6 +130,10 @@ fn xml_to_text(xml: &str) -> String {
         } else if matches!(name, "w:tab" | "text:tab") {
             out.push('\t');
         }
+    }
+    // A part cut by the size cap ends in text with no closing tag; keep it.
+    if in_body {
+        out.push_str(&decode_entities(&xml[text_start..]));
     }
     out
 }
@@ -397,7 +410,6 @@ mod extract_tests {
     }
 
     #[test]
-    #[ignore = "bug: a part over 8 MiB cut inside a character fails read_to_string and the document shows no text"]
     fn huge_part_cut_inside_a_character() {
         let t = TempDir::new("huge");
         // Over the 8 MiB read limit per part, with the limit falling inside a two-byte 'é'.
