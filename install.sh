@@ -11,6 +11,7 @@ APP_DIR="$HOME/.local/share/applications"
 ICON_FILE="$HOME/.local/share/icons/hicolor/scalable/apps/io.github.rfiles.Files.svg"
 DBUS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dbus-1/services"
 DBUS_FILE="$DBUS_DIR/org.freedesktop.FileManager1.service"
+LOCALE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/locale"
 cd "$(dirname "$0")"
 
 reload_dbus() {
@@ -144,6 +145,13 @@ install -m644 data/io.github.rfiles.Files.svg "$ICON_FILE"
 # Two Exec lines: the main entry (with %U) and the "New Window" action (without)
 sed -e "s|^Exec=rfiles %U\$|Exec=$BIN_DIR/rfiles %U|" -e "s|^Exec=rfiles\$|Exec=$BIN_DIR/rfiles|" rfiles.desktop > "$APP_DIR/rfiles.desktop"
 update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
+# Compiled translations: po/<language>.mo (none yet) go to the user's locale folder
+for mo in po/*.mo; do
+    [[ -f "$mo" ]] || continue
+    lang="$(basename "$mo" .mo)"
+    mkdir -p "$LOCALE_DIR/$lang/LC_MESSAGES"
+    install -m644 "$mo" "$LOCALE_DIR/$lang/LC_MESSAGES/rfiles.mo"
+done
 switch_running_rfiles
 
 echo

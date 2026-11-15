@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::fileops;
+use crate::i18n::{ntr, tr};
 use crate::preview::Preview;
 use crate::util::*;
 use gtk::prelude::*;
@@ -1325,7 +1326,7 @@ impl App {
         col.set_expand(expand);
         col.set_resizable(true);
         if !expand {
-            col.set_fixed_width(if kind == 3 { 170 } else { 140 });
+            col.set_fixed_width(if kind == 3 { 170 } else if kind == 2 { 190 } else { 140 });
         }
         col.set_id(Some(SortKey::ALL[kind as usize].as_str()));
         // Only makes the header clickable and show the arrow: the model is sorted by
@@ -1536,77 +1537,78 @@ impl App {
         // Only top-level trash items know where they came from
         let origs: Vec<Option<PathBuf>> = self.selected_infos().iter().map(crate::trash::orig_path).collect();
         if trash && crate::trash::can_restore(&origs) {
-            m.push(mi("Restore", "win.restore", ""));
+            m.push(mi(tr("Restore"), "win.restore", ""));
             m.push(None);
         }
         if !many {
-            m.push(mi("Open", "win.open", "Enter"));
+            m.push(mi(tr("Open"), "win.open", "Enter"));
             if dir {
-                m.push(mi("Open in New Tab", "win.open-tab", "Middle-click"));
+                m.push(mi(tr("Open in New Tab"), "win.open-tab", "Middle-click"));
                 if !trash {
-                    m.push(mi("Open in Terminal", "win.terminal-selected", ""));
+                    m.push(mi(tr("Open in Terminal"), "win.terminal-selected", ""));
                 }
             } else {
-                m.push(mi("Open With…", "win.open-with", ""));
+                m.push(mi(tr("Open With…"), "win.open-with", ""));
             }
             m.push(None);
         }
         if !trash {
-            m.push(mi("Cut", "win.cut", "Ctrl+X"));
+            m.push(mi(tr("Cut"), "win.cut", "Ctrl+X"));
         }
-        m.push(mi("Copy", "win.copy", "Ctrl+C"));
+        m.push(mi(tr("Copy"), "win.copy", "Ctrl+C"));
         if dir && !many && !trash {
-            m.push(mi("Paste Into Folder", "win.paste-into", ""));
+            m.push(mi(tr("Paste Into Folder"), "win.paste-into", ""));
         }
         if !trash {
             m.push(None);
-            m.push(mi("Compress…", "win.compress", ""));
+            m.push(mi(tr("Compress…"), "win.compress", ""));
             let sel = self.selected_infos();
             if sel.iter().all(|i| !is_dir_like(i) && crate::archive::is_archive(&i.name().to_string_lossy())) {
-                m.push(mi("Extract Here", "win.extract-here", ""));
+                m.push(mi(tr("Extract Here"), "win.extract-here", ""));
             }
         }
         m.push(None);
         if !many {
             let starred = cfg.starred.contains(&uri);
-            m.push(mi(if starred { "Unstar" } else { "Star" }, "win.star", ""));
+            m.push(mi(if starred { tr("Unstar") } else { tr("Star") }, "win.star", ""));
             if dir {
                 let pinned = cfg.pins.contains(&uri);
-                m.push(mi(if pinned { "Unpin from Sidebar" } else { "Pin to Sidebar" }, "win.pin-selected", ""));
+                let label = if pinned { tr("Unpin from Sidebar") } else { tr("Pin to Sidebar") };
+                m.push(mi(label, "win.pin-selected", ""));
             }
             if !trash {
-                m.push(mi("Change Icon…", "win.change-icon", ""));
+                m.push(mi(tr("Change Icon…"), "win.change-icon", ""));
                 let has_custom = info
                     .attribute_string("metadata::custom-icon")
                     .map(|s| !s.is_empty())
                     .unwrap_or(false);
                 if has_custom {
-                    m.push(mi("Reset Icon", "win.reset-icon", ""));
+                    m.push(mi(tr("Reset Icon"), "win.reset-icon", ""));
                 }
             }
             m.push(None);
             if !trash {
-                m.push(mi("Rename…", "win.rename", "F2"));
+                m.push(mi(tr("Rename…"), "win.rename", "F2"));
             }
         } else {
-            m.push(mi("Star / Unstar", "win.star", ""));
+            m.push(mi(tr("Star / Unstar"), "win.star", ""));
             m.push(None);
             if !trash {
-                m.push(mi("Rename…", "win.rename", "F2"));
+                m.push(mi(tr("Rename…"), "win.rename", "F2"));
             }
         }
-        m.push(mi("Copy Path", "win.copy-path", ""));
+        m.push(mi(tr("Copy Path"), "win.copy-path", ""));
         if trash {
-            m.push(mi("Delete Permanently", "win.trash", "Delete"));
+            m.push(mi(tr("Delete Permanently"), "win.trash", "Delete"));
         } else {
             if self.in_recent() {
-                m.push(mi("Remove from Recent", "win.forget-recent", ""));
+                m.push(mi(tr("Remove from Recent"), "win.forget-recent", ""));
             }
-            m.push(mi("Move to Trash", "win.trash", "Delete"));
-            m.push(mi("Delete Permanently…", "win.delete-permanently", "Shift+Delete"));
+            m.push(mi(tr("Move to Trash"), "win.trash", "Delete"));
+            m.push(mi(tr("Delete Permanently…"), "win.delete-permanently", "Shift+Delete"));
         }
         m.push(None);
-        m.push(mi("Properties", "win.properties", "Alt+Enter"));
+        m.push(mi(tr("Properties"), "win.properties", "Alt+Enter"));
         m
     }
 
@@ -1623,39 +1625,40 @@ impl App {
             m.push(None);
         }
         if self.in_trash() {
-            m.push(mi("Empty Trash", "win.empty-trash", ""));
+            m.push(mi(tr("Empty Trash"), "win.empty-trash", ""));
         } else if self.current_dir().is_some() {
-            m.push(mi("New Folder…", "win.new-folder", "Ctrl+Shift+N"));
-            m.push(mi("Paste", "win.paste", "Ctrl+V"));
-            m.push(mi("Open in Terminal", "win.terminal-here", "Ctrl+Alt+T"));
+            m.push(mi(tr("New Folder…"), "win.new-folder", "Ctrl+Shift+N"));
+            m.push(mi(tr("Paste"), "win.paste", "Ctrl+V"));
+            m.push(mi(tr("Open in Terminal"), "win.terminal-here", "Ctrl+Alt+T"));
         }
         m.push(None);
-        m.push(mi("Select All", "win.select-all", "Ctrl+A"));
+        m.push(mi(tr("Select All"), "win.select-all", "Ctrl+A"));
         if self.current_dir().is_some() {
             let pinned = self.current_dir().map(|f| self.is_pinned(&f)).unwrap_or(false);
-            m.push(mi(if pinned { "Unpin This Folder" } else { "Pin This Folder" }, "win.pin-current", "Ctrl+D"));
+            let label = if pinned { tr("Unpin This Folder") } else { tr("Pin This Folder") };
+            m.push(mi(label, "win.pin-current", "Ctrl+D"));
         }
         m.push(mi(
-            if self.show_hidden.get() { "Hide Hidden Files" } else { "Show Hidden Files" },
+            if self.show_hidden.get() { tr("Hide Hidden Files") } else { tr("Show Hidden Files") },
             "win.toggle-hidden",
             "Ctrl+H",
         ));
-        m.push(mi("Reload", "win.refresh", "F5"));
+        m.push(mi(tr("Reload"), "win.refresh", "F5"));
         m.push(None);
         let (key, desc) = self.sort.get();
         for (k, label) in [
-            (SortKey::Name, "Sort by Name"),
-            (SortKey::Size, "Sort by Size"),
-            (SortKey::Modified, "Sort by Modified"),
-            (SortKey::Type, "Sort by Type"),
+            (SortKey::Name, tr("Sort by Name")),
+            (SortKey::Size, tr("Sort by Size")),
+            (SortKey::Modified, tr("Sort by Modified")),
+            (SortKey::Type, tr("Sort by Type")),
         ] {
             let accel = if k == key { "✓" } else { "" };
-            m.push(Some(MItem { label: label.into(), action: "win.sort-by", target: Some(k.as_str().to_variant()), accel }));
+            m.push(Some(MItem { label, action: "win.sort-by", target: Some(k.as_str().to_variant()), accel }));
         }
-        m.push(mi("Reversed Order", "win.sort-reversed", if desc { "✓" } else { "" }));
+        m.push(mi(tr("Reversed Order"), "win.sort-reversed", if desc { "✓" } else { "" }));
         if self.current_dir().is_some() {
             m.push(None);
-            m.push(mi("Properties", "win.properties", "Alt+Enter"));
+            m.push(mi(tr("Properties"), "win.properties", "Alt+Enter"));
         }
         m
     }
@@ -2342,11 +2345,11 @@ impl App {
 
     // ================= sidebar =================
     /// Built-in places: (key, icon, name, location)
-    fn places(&self) -> Vec<(&'static str, &'static str, &'static str, Loc)> {
+    fn places(&self) -> Vec<(&'static str, &'static str, String, Loc)> {
         let mut v = vec![
-            ("home", "user-home-symbolic", "Home", Loc::Dir(home())),
-            ("recent", "document-open-recent-symbolic", "Recent", Loc::Dir(gio::File::for_uri("recent:///"))),
-            ("starred", "starred-symbolic", "Starred", Loc::Starred),
+            ("home", "user-home-symbolic", "Home".into(), Loc::Dir(home())),
+            ("recent", "document-open-recent-symbolic", "Recent".into(), Loc::Dir(gio::File::for_uri("recent:///"))),
+            ("starred", "starred-symbolic", "Starred".into(), Loc::Starred),
         ];
         let specials = [
             ("desktop", glib::UserDirectory::Desktop, "user-desktop-symbolic", "Desktop"),
@@ -2359,11 +2362,13 @@ impl App {
         for (key, d, icon, name) in specials {
             if let Some(p) = glib::user_special_dir(d) {
                 if p != glib::home_dir() && p.is_dir() {
+                    // The folder's own name ("Dokumente"), not the English one
+                    let name = crate::i18n::special_dir_name(&p, name);
                     v.push((key, icon, name, Loc::Dir(gio::File::for_path(p))));
                 }
             }
         }
-        v.push(("trash", "user-trash-symbolic", "Trash", Loc::Dir(gio::File::for_uri("trash:///"))));
+        v.push(("trash", "user-trash-symbolic", "Trash".into(), Loc::Dir(gio::File::for_uri("trash:///"))));
 
         // Apply the user's drag-and-drop order
         let order = self.config.borrow().places_order.clone();
@@ -2385,7 +2390,7 @@ impl App {
         self.sidebar_targets.borrow_mut().clear();
 
         for (key, icon, name, loc) in self.places() {
-            self.side_row(icon, name, loc, None, Some(format!("place:{key}")));
+            self.side_row(icon, &name, loc, None, Some(format!("place:{key}")));
         }
 
         self.side_header("Pinned");
@@ -3327,7 +3332,7 @@ impl App {
                 (f, orig, i.file_type() == gio::FileType::Directory)
             })
             .collect();
-        let busy = format!("Restoring {} item(s)…", items.len());
+        let busy = ntr(items.len(), "Restoring {n} item…", "Restoring {n} items…");
         self.status.set_text(&busy);
         // Runs on after the window closes; the result then goes elsewhere
         let job = crate::jobs::start(&busy, None);

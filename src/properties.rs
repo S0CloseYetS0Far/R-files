@@ -111,15 +111,33 @@ fn set_exec(mode: u32, on: bool) -> u32 {
 
 /// 1234567 -> "1,234,567"
 pub(crate) fn group_digits(n: u64) -> String {
+    group_digits_with(n, crate::i18n::thousands_separator())
+}
+
+fn group_digits_with(n: u64, sep: &str) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
         if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
+            out.push_str(sep);
         }
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod group_digits_with_tests {
+    use super::group_digits_with;
+
+    #[test]
+    fn uses_the_given_separator() {
+        assert_eq!(group_digits_with(1234567, ","), "1,234,567");
+        assert_eq!(group_digits_with(1234567, "."), "1.234.567");
+        assert_eq!(group_digits_with(1234567, "\u{202f}"), "1\u{202f}234\u{202f}567");
+        assert_eq!(group_digits_with(999, ","), "999");
+        assert_eq!(group_digits_with(0, ","), "0");
+    }
 }
 
 /// "1.2 MB (1,234,567 bytes)", or "512 bytes" for small sizes.
@@ -1044,7 +1062,7 @@ fn time_attr(info: &gio::FileInfo, attr: &str) -> Option<String> {
     }
     let secs = i64::try_from(info.attribute_uint64(attr)).ok()?;
     let dt = glib::DateTime::from_unix_local(secs).ok()?;
-    dt.format("%Y-%m-%d  %H:%M:%S").ok().map(|s| s.to_string())
+    dt.format(DATE_TIME_FORMAT).ok().map(|s| s.to_string())
 }
 
 /// Opens the Properties window for `files` (one or more).
