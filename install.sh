@@ -56,12 +56,20 @@ case "${1:-}" in
         exit 0
         ;;
     set-default)
-        [[ -x "$BIN_DIR/rfiles" ]] || { echo "Install RFiles first: ./install.sh"; exit 1; }
+        # The script install lives in ~/.local/bin, the .deb in /usr/bin
+        if [[ -x "$BIN_DIR/rfiles" ]]; then
+            BIN="$BIN_DIR/rfiles"
+        elif [[ -x /usr/bin/rfiles ]]; then
+            BIN=/usr/bin/rfiles
+        else
+            echo "Install RFiles first: the .deb from Releases, or ./install.sh"
+            exit 1
+        fi
         # Folders open in RFiles
         xdg-mime default rfiles.desktop inode/directory
         # "Show in folder" from browsers, editors and the desktop portal
         mkdir -p "$DBUS_DIR"
-        sed "s|@BIN@|$BIN_DIR/rfiles|" rfiles-filemanager1.service > "$DBUS_FILE"
+        sed "s|@BIN@|$BIN|" rfiles-filemanager1.service > "$DBUS_FILE"
         reload_dbus
         echo "RFiles is now your default file manager."
         echo "If GNOME Files is open right now, close it (or log out and back in) so \"Show in folder\" switches over."

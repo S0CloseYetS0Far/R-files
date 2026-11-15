@@ -1,0 +1,49 @@
+name: Release
+
+# Pushing a tag such as v0.2.0 builds the .deb and attaches it to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deb:
+    name: Build .deb
+    # 24.04 is the oldest supported Ubuntu; a package built there also installs on newer ones.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libpoppler-glib-dev build-essential pkg-config
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build the package
+        run: cargo deb --locked
+
+      - name: Show the package
+        run: |
+          dpkg-deb -I target/debian/rfiles_*.deb
+          dpkg-deb -c target/debian/rfiles_*.deb
+
+      - name: Attach to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" target/debian/rfiles_*.deb --clobber
