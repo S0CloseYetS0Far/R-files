@@ -25,7 +25,7 @@ Click once on a PDF to read it page by page, or on a folder to see what's inside
 - **Copy / cut / paste** (works together with GNOME Files); copies, moves, deletes, compress and extract keep running after their window is closed, and Ctrl+Q asks before stopping them
 - **Drag and drop** files between folders, the sidebar and other apps (same drive moves, other drive copies; Ctrl copies, Shift moves)
 - **Thumbnails** for images and PDFs, and for videos, fonts and other files that an installed `.thumbnailer` handles (run the same sandboxed way), made in the background for the files on screen and shared with GNOME Files. Files are decoded in a separate, time- and memory-limited process, inside a bubblewrap sandbox (no network, only that one file visible) where bwrap works
-- **Compress / extract**: .zip, .tar.gz and .tar.xz (Compress… and Extract Here in the right-click menu)
+- **Compress / extract**: .zip, .tar.gz, .tar.xz, .tar.bz2 and .tar.zst (Compress…, Extract Here and Extract to… in the right-click menu)
 - **Properties**: size (live folder totals, plus size on disk), free space, default app, dates, owner and editable permissions (also applied to enclosed files)
 - **Batch rename** several files at once: find & replace, or numbering like `Holiday ###`, with a live preview
 - **Open in Terminal** from any folder
@@ -63,7 +63,7 @@ on a laptop with Intel + NVIDIA graphics; numbers vary with the graphics driver)
 | Undo (Ctrl+Z) | ✅ rename, move, copy, new folder, move to trash (not permanent delete or replace) | ✅ |
 | Drag and drop files | ✅ | ✅ |
 | Creates thumbnails | ✅ images, PDFs and videos (system thumbnailers) | ✅ also videos |
-| Compress / extract | ✅ zip, tar.gz, tar.xz | ✅ more formats |
+| Compress / extract | ✅ zip, tar.gz, tar.xz, tar.bz2, tar.zst | ✅ more formats |
 | Properties dialog | ✅ | ✅ |
 | Batch rename | ✅ find & replace, numbering | ✅ |
 

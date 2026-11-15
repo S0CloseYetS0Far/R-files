@@ -1,4 +1,4 @@
-//! Compress and extract archives: .zip, .tar, .tar.gz/.tgz and .tar.xz/.txz.
+//! Compress and extract archives: .zip, .tar, .tar.gz/.tgz, .tar.xz/.txz, .tar.bz2/.tbz2 and .tar.zst/.tzst.
 //!
 //! Everything is streamed (no file is ever read into memory as a whole)
 //! and runs on a worker thread, with progress in the status bar.
@@ -11,6 +11,8 @@
 //! - Nothing is overwritten. The archive is unpacked into a hidden scratch
 //!   folder next to it, then moved to a free name; on failure the scratch
 //!   folder is removed, so no partial output is left behind.
+//! - Unpacking stops before it fills the drive: it may write at most the free space measured at the start, minus a
+//!   small reserve, and a zip that declares more than the free space is refused up front.
 
 use crate::banner::Notice;
 use gtk::prelude::*;
@@ -31,20 +33,32 @@ pub(crate) enum Format {
     Tar,
     TarGz,
     TarXz,
+    TarBz2,
+    TarZst,
 }
 
 /// Recognised extensions, checked case-insensitively, longest match first.
 const EXTS: &[(&str, Format)] = &[
     (".tar.gz", Format::TarGz),
     (".tar.xz", Format::TarXz),
+    (".tar.bz2", Format::TarBz2),
+    (".tar.zst", Format::TarZst),
     (".tgz", Format::TarGz),
     (".txz", Format::TarXz),
+    (".tbz2", Format::TarBz2),
+    (".tzst", Format::TarZst),
     (".tar", Format::Tar),
     (".zip", Format::Zip),
 ];
 
 /// Formats offered in the Compress dialog (the first one is the default).
-const CHOICES: &[(&str, Format)] = &[(".zip", Format::Zip), (".tar.gz", Format::TarGz), (".tar.xz", Format::TarXz)];
+const CHOICES: &[(&str, Format)] = &[
+    (".zip", Format::Zip),
+    (".tar.gz", Format::TarGz),
+    (".tar.xz", Format::TarXz),
+    (".tar.bz2", Format::TarBz2),
+    (".tar.zst", Format::TarZst),
+];
 
 /// Files that are already compressed: stored as-is in a zip instead of
 /// wasting time deflating them again.
@@ -381,6 +395,77 @@ fn tar_into<W: Write>(w: W, sources: &[PathBuf], skip: (u64, u64), p: &Progress)
     b.into_inner()
 }
 
+/// Writes zstd. ruzstd can only compress from a reader to a writer and panics when the writer fails, so the tar
+/// stream is cut into chunks, each compressed in memory as its own frame (frames simply follow each other, and
+/// `ZstdReader` and the zstd tool read them back to back).
+struct ZstdWriter<W: Write> {
+    inner: W,
+    buf: Vec<u8>,
+}
+
+const ZSTD_CHUNK: usize = 4 * 1024 * 1024;
+
+impl<W: Write> ZstdWriter<W> {
+    fn flush_chunk(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let mut out = Vec::with_capacity(self.buf.len() / 2);
+        ruzstd::encoding::compress(&self.buf[..], &mut out, ruzstd::encoding::CompressionLevel::Fastest);
+        self.buf.clear();
+        self.inner.write_all(&out)
+    }
+
+    fn finish(mut self) -> io::Result<W> {
+        self.flush_chunk()?;
+        Ok(self.inner)
+    }
+}
+
+impl<W: Write> Write for ZstdWriter<W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= ZSTD_CHUNK {
+            self.flush_chunk()?;
+        }
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Reads a zstd file made of one or more frames in a row.
+struct ZstdReader<R: io::BufRead> {
+    frame: Option<ruzstd::decoding::StreamingDecoder<R, ruzstd::decoding::FrameDecoder>>,
+}
+
+impl<R: io::BufRead> ZstdReader<R> {
+    fn new(src: R) -> io::Result<Self> {
+        let frame = ruzstd::decoding::StreamingDecoder::new(src).map_err(|e| err(format!("not a valid zstd file: {e}")))?;
+        Ok(ZstdReader { frame: Some(frame) })
+    }
+}
+
+impl<R: io::BufRead> Read for ZstdReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let Some(f) = self.frame.as_mut() else { return Ok(0) };
+            let n = f.read(buf)?;
+            if n > 0 || buf.is_empty() {
+                return Ok(n);
+            }
+            // This frame is done: start the next one if the file goes on
+            let mut src = self.frame.take().map(|f| f.into_inner()).unwrap();
+            if src.fill_buf()?.is_empty() {
+                return Ok(0);
+            }
+            let next = ruzstd::decoding::StreamingDecoder::new(src).map_err(|e| err(format!("bad zstd data: {e}")))?;
+            self.frame = Some(next);
+        }
+    }
+}
+
 fn write_archive(file: File, fmt: Format, sources: &[PathBuf], p: &Progress) -> io::Result<()> {
     let md = file.metadata()?;
     let skip = (md.dev(), md.ino());
@@ -398,6 +483,10 @@ fn write_archive(file: File, fmt: Format, sources: &[PathBuf], p: &Progress) -> 
             let xz = lzma_rust2::XzWriter::new(w, lzma_rust2::XzOptions::with_preset(6))?;
             tar_into(xz, sources, skip, p)?.finish()?
         }
+        Format::TarBz2 => {
+            tar_into(bzip2::write::BzEncoder::new(w, bzip2::Compression::default()), sources, skip, p)?.finish()?
+        }
+        Format::TarZst => tar_into(ZstdWriter { inner: w, buf: Vec::new() }, sources, skip, p)?.finish()?,
     };
     w.into_inner().map_err(|e| e.into_error())?;
     Ok(())
@@ -429,11 +518,14 @@ struct Extractor {
     dirs: Vec<(PathBuf, u32, Option<SystemTime>)>,
     buf: Vec<u8>,
     skipped: usize,
+    /// Most file bytes this run may write, and how many it has written (keeps the drive from filling up).
+    limit: u64,
+    written: u64,
 }
 
 impl Extractor {
     fn new(root: PathBuf) -> Self {
-        Extractor { root, checked: PathBuf::new(), dirs: Vec::new(), buf: vec![0; 64 * 1024], skipped: 0 }
+        Extractor { root, checked: PathBuf::new(), dirs: Vec::new(), buf: vec![0; 64 * 1024], skipped: 0, limit: u64::MAX, written: 0 }
     }
 
     /// Makes sure every parent of `rel` is a real folder inside the root
@@ -487,6 +579,13 @@ impl Extractor {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(at(rel)(e)),
             };
+            self.written += n as u64;
+            if self.written > self.limit {
+                return Err(err(format!(
+                    "stopped: the archive unpacks to more than the free space on this drive ({})",
+                    glib::format_size(self.limit)
+                )));
+            }
             f.write_all(&self.buf[..n]).map_err(at(rel))?;
         }
         if let Some(t) = mtime {
@@ -543,6 +642,32 @@ impl Extractor {
     }
 }
 
+/// Free space kept back when extracting, so the drive isn't left completely full.
+const RESERVE: u64 = 100 << 20;
+
+/// The most one extraction may write: the free space minus the reserve (no limit when it isn't known).
+fn write_limit(free: Option<u64>) -> u64 {
+    free.map_or(u64::MAX, |f| f.saturating_sub(RESERVE))
+}
+
+/// Whether `needed` bytes fit into `free` (`None`: the file system didn't say, so go ahead).
+fn check_space(needed: u64, free: Option<u64>) -> io::Result<()> {
+    match free {
+        Some(free) if needed > free => Err(err(format!(
+            "not enough free space: it needs about {} and only {} is free",
+            glib::format_size(needed),
+            glib::format_size(free)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Free bytes on the file system holding `dir`.
+fn free_space(dir: &Path) -> Option<u64> {
+    let info = gio::File::for_path(dir).query_filesystem_info("filesystem::free", None::<&gio::Cancellable>).ok()?;
+    info.has_attribute("filesystem::free").then(|| info.attribute_uint64("filesystem::free"))
+}
+
 fn extract_tar<R: Read>(r: R, ex: &mut Extractor) -> io::Result<()> {
     let mut ar = tar::Archive::new(r);
     for entry in ar.entries()? {
@@ -575,9 +700,13 @@ fn extract_tar<R: Read>(r: R, ex: &mut Extractor) -> io::Result<()> {
     Ok(())
 }
 
-fn extract_zip(file: File, ex: &mut Extractor, p: &Progress) -> io::Result<()> {
+fn extract_zip(file: File, ex: &mut Extractor, p: &Progress, free: Option<u64>) -> io::Result<()> {
     let mut z = zip::ZipArchive::new(BufReader::new(file)).map_err(zip_err)?;
-    p.reset(z.decompressed_size().and_then(|s| u64::try_from(s).ok()).unwrap_or(0));
+    let declared = z.decompressed_size().and_then(|s| u64::try_from(s).ok());
+    p.reset(declared.unwrap_or(0));
+    if let Some(d) = declared {
+        check_space(d, free)?;
+    }
     for i in 0..z.len() {
         let mut f = z.by_index(i).map_err(zip_err)?;
         let rel = match f.enclosed_name() {
@@ -632,21 +761,36 @@ fn place(tmp: &Path, dest: &Path, stem: &OsStr) -> io::Result<(PathBuf, Option<O
 /// Extracts `archive` into `dest`. Returns the created folder and the
 /// number of skipped special entries. Runs on a worker thread.
 pub(crate) fn extract(archive: &Path, dest: &Path, p: &Progress) -> io::Result<(PathBuf, usize)> {
+    extract_limited(archive, dest, p, None)
+}
+
+/// `extract` with the most it may write given (tests use a low one); `None` means the free space rule.
+fn extract_limited(archive: &Path, dest: &Path, p: &Progress, limit: Option<u64>) -> io::Result<(PathBuf, usize)> {
     let name = archive.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let (stem, _, fmt) = split_archive_name(name).ok_or_else(|| err("not a supported archive"))?;
     let stem = if stem.is_empty() { "Extracted" } else { stem };
     let file = File::open(archive)?;
+    let len = file.metadata()?.len();
+    let free = free_space(dest);
+    let limit = limit.unwrap_or_else(|| write_limit(free));
+    if fmt == Format::Tar {
+        // A plain tar holds about its own size; compressed streams don't say, so the write limit guards those
+        check_space(len, free)?;
+    }
     let tmp = create_unique_dir(dest, OsStr::new(&format!(".{name}.extracting")))?;
     let mut ex = Extractor::new(tmp.clone());
+    ex.limit = limit;
     let res = (|| {
         if fmt == Format::Zip {
-            extract_zip(file, &mut ex, p)?;
+            extract_zip(file, &mut ex, p, free)?;
         } else {
-            p.reset(file.metadata()?.len());
+            p.reset(len);
             let raw = BufReader::with_capacity(64 * 1024, Counting::new(file, &p.done));
             match fmt {
                 Format::TarGz => extract_tar(flate2::bufread::MultiGzDecoder::new(raw), &mut ex)?,
                 Format::TarXz => extract_tar(lzma_rust2::XzReader::new(raw, true), &mut ex)?,
+                Format::TarBz2 => extract_tar(bzip2::bufread::MultiBzDecoder::new(raw), &mut ex)?,
+                Format::TarZst => extract_tar(ZstdReader::new(raw)?, &mut ex)?,
                 _ => extract_tar(raw, &mut ex)?,
             }
         }
@@ -662,6 +806,91 @@ pub(crate) fn extract(archive: &Path, dest: &Path, p: &Progress) -> io::Result<(
             let _ = fs::remove_dir_all(&tmp);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod more_formats_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rfiles-archive47-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn bz2_and_zst_round_trip() {
+        for (ext, fmt) in [(".tar.bz2", Format::TarBz2), (".tar.zst", Format::TarZst)] {
+            let d = scratch(&ext[5..]);
+            let proj = d.join("proj");
+            fs::create_dir_all(proj.join("sub")).unwrap();
+            fs::write(proj.join("small.txt"), "hello").unwrap();
+            // Bigger than one zstd chunk, so several frames follow each other
+            let big: Vec<u8> = (0..9_500_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+            fs::write(proj.join("sub/big.bin"), &big).unwrap();
+            let p = Progress::default();
+            let out = compress(&[proj], &d, "proj", ext, fmt, &p).unwrap();
+            let (res, _) = extract(&out, &d, &p).unwrap();
+            assert_eq!(res, d.join("proj (2)"));
+            assert_eq!(fs::read_to_string(res.join("small.txt")).unwrap(), "hello");
+            assert!(fs::read(res.join("sub/big.bin")).unwrap() == big, "{ext}");
+            fs::remove_dir_all(&d).unwrap();
+        }
+    }
+
+    #[test]
+    fn short_extensions() {
+        assert_eq!(split_archive_name("a.TBZ2"), Some(("a", ".TBZ2", Format::TarBz2)));
+        assert_eq!(split_archive_name("a.tzst"), Some(("a", ".tzst", Format::TarZst)));
+        assert_eq!(split_archive_name("a.tar.bz2"), Some(("a", ".tar.bz2", Format::TarBz2)));
+        assert!(is_archive("a.tar.zst"));
+        assert!(!is_archive("a.zst"));
+    }
+
+    #[test]
+    fn bad_zstd_is_an_error_and_leaves_nothing() {
+        let d = scratch("badzst");
+        let a = d.join("x.tar.zst");
+        fs::write(&a, b"not zstd at all").unwrap();
+        assert!(extract(&a, &d, &Progress::default()).is_err());
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 1);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn write_limit_stops_and_cleans_up() {
+        let d = scratch("limit");
+        let src = d.join("zeros");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("z.bin"), vec![0u8; 5_000_000]).unwrap();
+        let p = Progress::default();
+        let dest = d.join("dest");
+        fs::create_dir(&dest).unwrap();
+        for (ext, fmt) in [(".zip", Format::Zip), (".tar.gz", Format::TarGz), (".tar.bz2", Format::TarBz2)] {
+            let a = compress(&[src.clone()], &d, "zeros", ext, fmt, &p).unwrap();
+            assert!(fs::metadata(&a).unwrap().len() < 100_000, "{ext} should be small");
+            let e = extract_limited(&a, &dest, &p, Some(1_000_000)).unwrap_err();
+            assert!(e.to_string().contains("more than the free space"), "{ext}: {e}");
+            assert_eq!(fs::read_dir(&dest).unwrap().count(), 0, "{ext}: partial output left");
+            // A limit above its content, however well it compresses (5 MB from under 100 KB), is fine
+            assert!(extract_limited(&a, &dest, &p, Some(6_000_000)).is_ok(), "{ext}");
+            assert!(extract(&a, &dest, &p).is_ok(), "{ext}"); // and under the free space rule
+            fs::remove_dir_all(&dest).unwrap();
+            fs::create_dir(&dest).unwrap();
+        }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn limits_and_space_decisions() {
+        assert_eq!(write_limit(Some(10 << 30)), (10 << 30) - RESERVE);
+        assert_eq!(write_limit(Some(RESERVE / 2)), 0);
+        assert_eq!(write_limit(None), u64::MAX);
+        assert!(check_space(100, Some(100)).is_ok());
+        assert!(check_space(101, Some(100)).unwrap_err().to_string().contains("not enough free space"));
+        assert!(check_space(u64::MAX, None).is_ok());
     }
 }
 
@@ -812,6 +1041,11 @@ pub fn compress_dialog(
 
 /// Extracts each archive next to itself.
 pub fn extract_here(status: &gtk::Label, notify: Notify, archives: Vec<PathBuf>) {
+    extract_into(status, notify, archives, None)
+}
+
+/// Extracts each archive into `dest`, or next to itself when that is `None`.
+pub fn extract_into(status: &gtk::Label, notify: Notify, archives: Vec<PathBuf>, dest: Option<PathBuf>) {
     let busy = match archives.as_slice() {
         [] => return,
         [one] => format!("Extracting “{}”…", display_name(one)),
@@ -820,7 +1054,7 @@ pub fn extract_here(status: &gtk::Label, notify: Notify, archives: Vec<PathBuf>)
     run_job(status, busy, notify, move |p| {
         let (mut done, mut skipped, mut errors) = (Vec::new(), 0, Vec::new());
         for a in &archives {
-            let res = match a.parent() {
+            let res = match dest.as_deref().or(a.parent()) {
                 Some(dest) => extract(a, dest, p),
                 None => Err(err("no parent folder")),
             };

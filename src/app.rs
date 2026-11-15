@@ -1754,6 +1754,7 @@ impl App {
             let sel = self.selected_infos();
             if sel.iter().all(|i| !is_dir_like(i) && crate::archive::is_archive(&i.name().to_string_lossy())) {
                 m.push(mi(tr("Extract Here"), "win.extract-here", ""));
+                m.push(mi(tr("Extract to…"), "win.extract-to", ""));
             }
         }
         m.push(None);
@@ -4071,6 +4072,30 @@ impl App {
                 return;
             }
             crate::archive::extract_here(&a.status, a.notifier(), paths);
+        }));
+        add("extract-to", Box::new(|a| {
+            let infos = a.selected_infos();
+            let paths: Vec<PathBuf> = infos.iter().filter_map(|i| item_file(i).path()).collect();
+            if a.in_trash() || paths.is_empty() {
+                return;
+            }
+            if paths.len() != infos.len() {
+                a.status.set_text("Can only extract local files");
+                return;
+            }
+            let dlg = gtk::FileDialog::builder().title("Extract to").modal(true).accept_label("Extract").build();
+            if let Some(dir) = a.current_dir() {
+                dlg.set_initial_folder(Some(&dir));
+            }
+            let (status, notify) = (a.status.downgrade(), a.notifier());
+            dlg.select_folder(Some(&a.window), None::<&gio::Cancellable>, move |r| {
+                // Cancelling is an error from the dialog: nothing to do
+                let (Ok(dir), Some(status)) = (r, status.upgrade()) else { return };
+                match dir.path() {
+                    Some(dest) => crate::archive::extract_into(&status, notify, paths, Some(dest)),
+                    None => status.set_text("Can only extract into a local folder"),
+                }
+            });
         }));
         add("trash", Box::new(|a| a.delete_selected(false)));
         add("delete-permanently", Box::new(|a| a.delete_selected(true)));
