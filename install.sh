@@ -12,6 +12,8 @@ ICON_FILE="$HOME/.local/share/icons/hicolor/scalable/apps/io.github.rfiles.Files
 DBUS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dbus-1/services"
 DBUS_FILE="$DBUS_DIR/org.freedesktop.FileManager1.service"
 LOCALE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/locale"
+# Starts `rfiles --keep-file-manager` at login, which keeps "Show in folder" in RFiles even when Nautilus runs
+AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/rfiles-file-manager.desktop"
 cd "$(dirname "$0")"
 
 reload_dbus() {
@@ -19,8 +21,13 @@ reload_dbus() {
         --method org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 || true
 }
 
+stop_keeper() {
+    pkill -u "$USER" -f -- '/rfiles --keep-file-manager$' 2>/dev/null || true
+}
+
 unset_default() {
-    rm -f "$DBUS_FILE"
+    rm -f "$DBUS_FILE" "$AUTOSTART_FILE"
+    stop_keeper
     reload_dbus
     if [[ "$(xdg-mime query default inode/directory 2>/dev/null)" == "rfiles.desktop" ]]; then
         xdg-mime default org.gnome.Nautilus.desktop inode/directory
@@ -72,6 +79,11 @@ case "${1:-}" in
         mkdir -p "$DBUS_DIR"
         sed "s|@BIN@|$BIN|" rfiles-filemanager1.service > "$DBUS_FILE"
         reload_dbus
+        # Holds the "Show in folder" name from login on, so Nautilus (started by the desktop icons) can't take it
+        mkdir -p "$(dirname "$AUTOSTART_FILE")"
+        printf '[Desktop Entry]\nType=Application\nName=RFiles (Show in folder)\nExec=%s --keep-file-manager\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n' "$BIN" > "$AUTOSTART_FILE"
+        stop_keeper
+        setsid "$BIN" --keep-file-manager </dev/null >/dev/null 2>&1 &
         echo "RFiles is now your default file manager."
         echo "If GNOME Files is open right now, close it (or log out and back in) so \"Show in folder\" switches over."
         exit 0
