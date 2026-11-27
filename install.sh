@@ -4,6 +4,8 @@
 #   ./install.sh uninstall      remove it again
 #   ./install.sh set-default    make RFiles your default file manager
 #   ./install.sh unset-default  go back to GNOME Files
+#   ./install.sh update         get the newest RFiles from GitHub and install it (if there is a newer one)
+#   ./install.sh auto-update on|off   run "update" every hour in the background
 set -euo pipefail
 
 BIN_DIR="$HOME/.local/bin"
@@ -14,6 +16,9 @@ DBUS_FILE="$DBUS_DIR/org.freedesktop.FileManager1.service"
 LOCALE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/locale"
 # Starts `rfiles --keep-file-manager` at login, which keeps "Show in folder" in RFiles even when Nautilus runs
 AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/rfiles-file-manager.desktop"
+# "update" builds in its own clone, so a work-in-progress checkout is never touched
+UPDATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/rfiles"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 cd "$(dirname "$0")"
 
 reload_dbus() {
@@ -56,9 +61,69 @@ switch_running_rfiles() {
     echo "Close all RFiles windows (or press Ctrl+Q in one) to switch to the new version."
 }
 
+auto_update_off() {
+    systemctl --user disable --now rfiles-update.timer >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/rfiles-update.service" "$UNIT_DIR/rfiles-update.timer"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+}
+
+SKIP_DEPS=no
 case "${1:-}" in
+    --no-deps)
+        # Used by "update": the build dependencies are already there
+        SKIP_DEPS=yes
+        ;;
+    update)
+        mkdir -p "$UPDATE_DIR"
+        src="$UPDATE_DIR/src"
+        if [[ ! -d "$src/.git" ]]; then
+            git clone --quiet "$(git remote get-url origin)" "$src"
+        fi
+        git -C "$src" fetch --quiet origin main
+        new="$(git -C "$src" rev-parse origin/main)"
+        if [[ "$new" == "$(cat "$UPDATE_DIR/installed-rev" 2>/dev/null)" && -x "$BIN_DIR/rfiles" ]]; then
+            echo "RFiles is up to date."
+            exit 0
+        fi
+        # Its own clone: nothing local to keep
+        git -C "$src" reset --quiet --hard "$new"
+        "$src/install.sh" --no-deps
+        echo "$new" > "$UPDATE_DIR/installed-rev"
+        notify-send -i io.github.rfiles.Files "RFiles was updated" \
+            "$(git -C "$src" log -1 --format=%s)" >/dev/null 2>&1 || true
+        exit 0
+        ;;
+    auto-update)
+        case "${2:-}" in
+            on)
+                mkdir -p "$UNIT_DIR" "$UPDATE_DIR"
+                # The timer runs the script in RFiles' own clone, so it keeps working whatever happens to this one
+                if [[ ! -d "$UPDATE_DIR/src/.git" ]]; then
+                    git clone --quiet "$(git remote get-url origin)" "$UPDATE_DIR/src"
+                fi
+                printf '[Unit]\nDescription=Update RFiles from GitHub\nAfter=network-online.target\n\n[Service]\nType=oneshot\nEnvironment=PATH=%s/.cargo/bin:/usr/local/bin:/usr/bin:/bin\nExecStart=%s update\nNice=10\n' \
+                    "$HOME" "$UPDATE_DIR/src/install.sh" > "$UNIT_DIR/rfiles-update.service"
+                printf '[Unit]\nDescription=Check for a newer RFiles every hour\n\n[Timer]\nOnStartupSec=2min\nOnUnitActiveSec=1h\n\n[Install]\nWantedBy=timers.target\n' \
+                    > "$UNIT_DIR/rfiles-update.timer"
+                systemctl --user daemon-reload
+                systemctl --user enable --now rfiles-update.timer
+                echo "RFiles now checks GitHub for updates every hour and installs them by itself."
+                echo "See what it did: journalctl --user -u rfiles-update"
+                ;;
+            off)
+                auto_update_off
+                echo "Automatic updates are off."
+                ;;
+            *)
+                echo "Usage: ./install.sh auto-update on|off"
+                exit 1
+                ;;
+        esac
+        exit 0
+        ;;
     uninstall)
         unset_default
+        auto_update_off
         rm -f "$BIN_DIR/rfiles" "$APP_DIR/rfiles.desktop" "$ICON_FILE"
         echo "RFiles removed. (Your settings are kept in ~/.config/rfiles)"
         exit 0
@@ -95,9 +160,11 @@ case "${1:-}" in
         ;;
 esac
 
-echo "==> Installing build dependencies (needs your password)"
-sudo apt-get update -qq
-sudo apt-get install -y libgtk-4-dev libpoppler-glib-dev build-essential pkg-config curl
+if [[ "$SKIP_DEPS" == no ]]; then
+    echo "==> Installing build dependencies (needs your password)"
+    sudo apt-get update -qq
+    sudo apt-get install -y libgtk-4-dev libpoppler-glib-dev build-essential pkg-config curl
+fi
 
 # Puts rustup's cargo (in ~/.cargo/bin) first on PATH, installing rustup if needed.
 use_rustup_cargo() {
@@ -177,3 +244,4 @@ switch_running_rfiles
 echo
 echo "Done! Open \"RFiles\" from your app grid, or run: rfiles"
 echo "To make it your default file manager: ./install.sh set-default"
+echo "To get updates from GitHub by itself: ./install.sh auto-update on"
