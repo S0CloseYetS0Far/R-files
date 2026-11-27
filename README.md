@@ -140,6 +140,20 @@ Optional extras:
 Keep GNOME Files installed; Ubuntu uses it in a few places. To switch back:
 `./install.sh unset-default`.
 
+### Automatic updates
+
+```bash
+./install.sh auto-update on
+```
+
+Two minutes after you log in, and then every hour, RFiles checks GitHub. When
+`main` has something new, it builds and installs it, and shows a notification.
+It builds in its own copy of the code (`~/.local/share/rfiles/src`), not in your
+clone. Open RFiles windows switch to the new version once you close them. Run
+`./install.sh update` to check right now, `journalctl --user -u rfiles-update`
+to see what it did, and `./install.sh auto-update off` to stop it.
+It needs the script install (`./install.sh`), not the `.deb`.
+
 ## Shortcuts
 
 | Action | How |
