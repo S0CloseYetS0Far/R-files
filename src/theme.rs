@@ -287,11 +287,16 @@ button.pinned { color: @accent_text; background-color: @accent_a18; }
 /* ---------- files (pitch black in the Black theme) ---------- */
 .files, .files viewport, gridview.files, columnview.files, columnview.files listview,
 columnview.files > listview > row, .files-area { background-color: @files_bg; color: @files_fg; }
-gridview.files > child { padding: 6px 4px; margin: 2px; border-radius: 10px; }
+/* Space inside the tile, not around it (child padding, Yaru's 12px box margin), so a press anywhere on a tile starts a drag */
+gridview.files > child { padding: 0; margin: 2px; border-radius: 10px; }
+gridview.files > child > .tile { margin: 0; padding: 18px 16px; }
 gridview.files > child:hover { background-color: @files_hover; }
 gridview.files > child:selected { background-color: @accent_a38; }
 columnview.files > listview > row:hover { background-color: @row_hover; }
 columnview.files > listview > row:selected { background-color: @accent_a38; }
+/* The cell's padding moves into the row content, so a press anywhere on a row starts a drag, not a rubber band */
+columnview.files > listview > row > cell { padding: 0; }
+columnview.files .list-cell { padding: 8px 6px; }
 columnview.files > header { background-color: @colhead_bg; }
 columnview.files > header > button { background: @colhead_bg; color: @header_fg; border-color: @colhead_edge; }
 .empty-view { color: @dim_fg; font-size: 15px; }

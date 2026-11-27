@@ -170,6 +170,7 @@ impl App {
             let Some(a) = a.upgrade() else { return };
             let li = obj.downcast_ref::<gtk::ListItem>().unwrap();
             let bx = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            bx.add_css_class("list-cell");
             if kind == 0 {
                 let img = gtk::Image::new();
                 img.set_pixel_size(32);
