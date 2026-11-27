@@ -195,6 +195,11 @@ fn main() -> glib::ExitCode {
     // Before anything else: see gpu.rs
     gpu::keep_sleeping_cards_asleep();
 
+    // `--keep-file-manager`: started at login by `install.sh set-default` (see dbus_service.rs)
+    if std::env::args().nth(1).as_deref() == Some("--keep-file-manager") {
+        dbus_service::keep_role();
+    }
+
     // `--dbus-service`: started by D-Bus for a "Show in folder" request.
     // It becomes the shared RFiles process but opens no window by itself.
     let mut args: Vec<String> = std::env::args().collect();

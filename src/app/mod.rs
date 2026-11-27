@@ -52,6 +52,8 @@ fn grid_columns_for_width(width: f64) -> u32 {
 pub enum Loc {
     Dir(gio::File),
     Starred,
+    /// The newest entries of the Downloads folder, newest first
+    RecentDownloads,
     Search { root: gio::File, query: String, results: Rc<Vec<PathBuf>>, end: SearchEnd },
 }
 
@@ -81,6 +83,7 @@ impl Loc {
         match self {
             Loc::Dir(f) => file_title(f),
             Loc::Starred => "Starred".into(),
+            Loc::RecentDownloads => "Recent Downloads".into(),
             Loc::Search { query, .. } => format!("“{query}”"),
         }
     }
@@ -88,6 +91,7 @@ impl Loc {
         match self {
             Loc::Dir(f) => icon_for_file(f),
             Loc::Starred => "starred-symbolic",
+            Loc::RecentDownloads => "folder-download-symbolic",
             Loc::Search { .. } => "system-search-symbolic",
         }
     }
@@ -95,6 +99,7 @@ impl Loc {
         match self {
             Loc::Dir(f) => f.uri().trim_end_matches('/').to_string(),
             Loc::Starred => "starred:".into(),
+            Loc::RecentDownloads => "recent-downloads:".into(),
             Loc::Search { query, .. } => format!("search:{query}"),
         }
     }
@@ -228,6 +233,10 @@ pub struct App {
     sort: Rc<Cell<(SortKey, bool)>>,
     /// The file model's sorter; reads `sort`
     sorter: gtk::CustomSorter,
+    /// Set while the model is already in its order (Recent Downloads): the sorter keeps it
+    keep_order: Rc<Cell<bool>>,
+    /// Watches Downloads while Recent Downloads is shown, so new downloads appear
+    downloads_monitor: RefCell<Option<gio::FileMonitor>>,
 }
 
 thread_local! {

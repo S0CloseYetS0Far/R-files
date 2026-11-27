@@ -5,6 +5,7 @@ pub(super) fn loc_path_text(loc: &Loc) -> String {
     match loc {
         Loc::Dir(f) => display_path(f),
         Loc::Starred => "Starred".into(),
+        Loc::RecentDownloads => "Recent Downloads".into(),
         Loc::Search { root, query, end, .. } => {
             let mut text = format!("Search “{query}” in {}", display_path(root));
             if let Some(note) = end.note() {

@@ -125,7 +125,12 @@ For that, RFiles answers the standard `org.freedesktop.FileManager1` D-Bus
 service. All RFiles windows share one process, so when RFiles is already open
 a "Show in folder" window appears in about 30 ms; otherwise it starts on demand
 and exits 30 seconds after its last window closes.
-If GNOME Files is already running, close it (or log out and in) first.
+
+GNOME Files (Nautilus) wants the same role, and Ubuntu's desktop icons start it
+at login. So `set-default` also starts a small helper at login,
+`rfiles --keep-file-manager` (no window, no GTK). It holds the role and passes
+each request to RFiles. If GNOME Files got there first, the helper takes over
+as soon as GNOME Files closes, and GNOME Files can't take it back.
 
 Optional extras:
 

@@ -60,6 +60,7 @@ impl App {
         });
         self.grid.set_factory(Some(&f));
         crate::thumbs::watch_scroll(&self.grid_scroll);
+        crate::thumbs::watch_scroll(&self.list_scroll);
 
         // Keep the column limit just above what fits in the current width
         let grid = self.grid.downgrade();
@@ -171,7 +172,7 @@ impl App {
             let bx = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             if kind == 0 {
                 let img = gtk::Image::new();
-                img.set_pixel_size(20);
+                img.set_pixel_size(32);
                 bx.append(&img);
             }
             let lbl = gtk::Label::builder()
@@ -194,7 +195,8 @@ impl App {
             match kind {
                 0 => {
                     let img = bx.first_child().and_downcast::<gtk::Image>().unwrap();
-                    set_icon(&img, &info, false);
+                    set_icon(&img, &info, true);
+                    crate::thumbs::bind(li, &img, &info);
                     lbl.set_text(&info.display_name());
                 }
                 1 => lbl.set_text(&format_size(&info)),
@@ -375,6 +377,7 @@ impl App {
             Loc::Dir(f) if f.uri().trim_end_matches('/') == "trash:" => Place::Trash,
             Loc::Dir(_) => Place::Dir,
             Loc::Starred => Place::Starred,
+            Loc::RecentDownloads => Place::Dir,
             Loc::Search { .. } => Place::Search,
         };
         let dir = matches!(loc, Loc::Dir(_));

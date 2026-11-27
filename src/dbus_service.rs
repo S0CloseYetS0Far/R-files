@@ -6,6 +6,12 @@
 //! RFiles is already open, "Show in folder" costs no process start at all.
 //! When it isn't running, D-Bus starts `rfiles --dbus-service`, which
 //! becomes that process (see `main.rs`).
+//!
+//! Nautilus claims the name too, and once it has it RFiles can't take it
+//! over (GNOME's desktop icons start Nautilus at login). So `install.sh
+//! set-default` also starts `rfiles --keep-file-manager` at login: a small
+//! process without GTK that holds the name (or waits in line for it) and
+//! hands every request to RFiles.
 
 use gtk::prelude::*;
 use gtk::{gio, glib};
@@ -111,9 +117,15 @@ thread_local! {
     /// Loop to stop when the first request arrives (service start-up).
     static WAITING: RefCell<Option<glib::MainLoop>> = const { RefCell::new(None) };
     static OWNED: Cell<bool> = const { Cell::new(false) };
+    /// This is the `--keep-file-manager` process: requests start or reach RFiles as a normal launch
+    static KEEPER: Cell<bool> = const { Cell::new(false) };
 }
 
 fn dispatch(uri: String, startup_id: String) {
+    if KEEPER.get() {
+        hand_to_rfiles(&uri, &startup_id);
+        return;
+    }
     match APP.with(|a| a.borrow().as_ref().and_then(|w| w.upgrade())) {
         Some(app) => crate::open_location(&app, &gio::File::for_uri(&uri), Some(&startup_id)),
         None => {
@@ -173,6 +185,33 @@ pub fn own_name() {
             }
         },
     );
+}
+
+/// `rfiles <uri>`: the running RFiles opens it (or this starts one), selecting a file in its folder.
+fn hand_to_rfiles(uri: &str, startup_id: &str) {
+    // The path it was started as, not current_exe: after an update that file is the new version
+    let Some(exe) = std::env::args_os().next() else { return };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(uri);
+    if !startup_id.is_empty() {
+        // GTK reads these to raise the new window, as for a launch from the desktop
+        cmd.env("XDG_ACTIVATION_TOKEN", startup_id).env("DESKTOP_STARTUP_ID", startup_id);
+    }
+    match cmd.spawn() {
+        // Waited on so it doesn't stay a zombie
+        Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+        Err(e) => eprintln!("rfiles: couldn't start RFiles for {uri}: {e}"),
+    }
+}
+
+/// `rfiles --keep-file-manager`: holds the name for good, or waits in line until whoever
+/// holds it (Nautilus) exits, then takes it. Never returns.
+pub fn keep_role() -> ! {
+    KEEPER.set(true);
+    own_name();
+    loop {
+        glib::MainContext::default().iteration(true);
+    }
 }
 
 /// Service start-up: claims the name and waits (without GTK) until the
