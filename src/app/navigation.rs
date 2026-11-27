@@ -1,5 +1,8 @@
 use super::*;
 
+/// How many entries Recent Downloads shows
+const RECENT_DOWNLOADS: usize = 100;
+
 impl App {
     // ================= navigation =================
     pub fn navigate(self: &Rc<Self>, loc: Loc) {
@@ -60,6 +63,11 @@ impl App {
             }
             Loc::Search { root, .. } => self.navigate_with(Loc::Dir(root), Nav::Up),
             Loc::Starred => {}
+            Loc::RecentDownloads => {
+                if let Some(d) = crate::util::downloads_dir() {
+                    self.navigate_with(Loc::Dir(d), Nav::Up);
+                }
+            }
         }
     }
 
@@ -85,6 +93,13 @@ impl App {
         self.fwd_btn.set_sensitive(can_fwd);
         *self.previewed.borrow_mut() = None;
         self.preview.clear();
+        let keep = matches!(loc, Loc::RecentDownloads);
+        if self.keep_order.replace(keep) != keep {
+            self.sorter.changed(gtk::SorterChange::Different);
+        }
+        if !keep {
+            *self.downloads_monitor.borrow_mut() = None;
+        }
 
         let new_query = match &loc {
             Loc::Dir(f) => {
@@ -100,6 +115,18 @@ impl App {
                 self.filter_model.set_model(Some(&store));
                 self.drop_dead_stars();
                 self.up_btn.set_sensitive(false);
+                String::new()
+            }
+            Loc::RecentDownloads => {
+                let store = gio::ListStore::new::<gio::FileInfo>();
+                if let Some(dir) = crate::util::downloads_dir() {
+                    store.extend_from_slice(&crate::util::recent_downloads(&dir, RECENT_DOWNLOADS));
+                    if self.downloads_monitor.borrow().is_none() {
+                        self.watch_downloads(&dir);
+                    }
+                }
+                self.filter_model.set_model(Some(&store));
+                self.up_btn.set_sensitive(true);
                 String::new()
             }
             Loc::Search { query, results, .. } => {
@@ -191,6 +218,26 @@ impl App {
         self.dir_list.set_file(None::<&gio::File>);
         self.preview.clear();
         self.cancel_search();
+    }
+
+    /// Reloads Recent Downloads when a file appears in, leaves or is renamed in Downloads
+    /// (a finished download is renamed from its .crdownload or .part name).
+    fn watch_downloads(self: &Rc<Self>, dir: &gio::File) {
+        let Ok(mon) = dir.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, None::<&gio::Cancellable>) else {
+            return;
+        };
+        let a = Rc::downgrade(self);
+        mon.connect_changed(move |_, _, _, ev| {
+            use gio::FileMonitorEvent as E;
+            if !matches!(ev, E::Created | E::Deleted | E::MovedIn | E::MovedOut | E::Renamed) {
+                return;
+            }
+            let Some(a) = a.upgrade() else { return };
+            if matches!(a.current_loc(), Loc::RecentDownloads) {
+                a.reload();
+            }
+        });
+        *self.downloads_monitor.borrow_mut() = Some(mon);
     }
 
     pub(crate) fn reload(self: &Rc<Self>) {

@@ -168,10 +168,16 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
     let filter_model = gtk::FilterListModel::new(Some(dir_list.clone()), Some(filter.clone()));
     let sort = Rc::new(Cell::new((config.sort, config.sort_desc)));
     let s = sort.clone();
+    let keep_order = Rc::new(Cell::new(false));
+    let k = keep_order.clone();
     let sorter = gtk::CustomSorter::new(move |a, b| {
         let (Some(a), Some(b)) = (a.downcast_ref::<gio::FileInfo>(), b.downcast_ref::<gio::FileInfo>()) else {
             return gtk::Ordering::Equal;
         };
+        // GTK's sort is stable, so Equal keeps the model's own order
+        if k.get() {
+            return gtk::Ordering::Equal;
+        }
         let (key, desc) = s.get();
         compare_infos(a, b, key, desc).into()
     });
@@ -347,6 +353,8 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         save_pending: Cell::new(false),
         sort,
         sorter,
+        keep_order,
+        downloads_monitor: RefCell::new(None),
     });
 
     OPEN.with(|o| o.borrow_mut().push(app.clone()));
@@ -497,6 +505,10 @@ impl App {
             let root = match a.current_loc() {
                 Loc::Dir(f) => f,
                 Loc::Search { root, .. } => root,
+                Loc::RecentDownloads => match crate::util::downloads_dir() {
+                    Some(d) => d,
+                    None => return,
+                },
                 Loc::Starred => return,
             };
             a.run_search(root, q);

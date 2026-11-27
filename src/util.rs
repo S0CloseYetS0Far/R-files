@@ -183,7 +183,7 @@ fn size_of(info: &gio::FileInfo) -> Option<i64> {
     info.has_attribute("standard::size").then(|| info.size())
 }
 
-fn modified_of(info: &gio::FileInfo) -> Option<(u64, u32)> {
+pub(crate) fn modified_of(info: &gio::FileInfo) -> Option<(u64, u32)> {
     info.has_attribute("time::modified").then(|| {
         let usec = if info.has_attribute("time::modified-usec") { info.attribute_uint32("time::modified-usec") } else { 0 };
         (info.attribute_uint64("time::modified"), usec)
@@ -492,6 +492,35 @@ pub fn is_trash(f: &gio::File) -> bool {
 /// Build a list of FileInfos for an arbitrary set of files (Starred,
 /// search results). The "standard::file" attribute is set the same way
 /// GtkDirectoryList does it, so the rest of the code treats them alike.
+/// The user's Downloads folder, if it exists and isn't the home folder itself.
+pub fn downloads_dir() -> Option<gio::File> {
+    let p = glib::user_special_dir(glib::UserDirectory::Downloads)?;
+    (p != glib::home_dir() && p.is_dir()).then(|| gio::File::for_path(p))
+}
+
+/// The newest `limit` entries directly in `dir`, newest first. Hidden files and downloads
+/// still in progress (Chromium's .crdownload, Firefox's .part) are left out.
+// shortcut: lists the folder on the UI thread, fine for a Downloads folder of a few thousand files; move to a thread if that's slow
+pub fn recent_downloads(dir: &gio::File, limit: usize) -> Vec<gio::FileInfo> {
+    let Ok(en) = dir.enumerate_children(ATTRS, gio::FileQueryInfoFlags::NONE, None::<&gio::Cancellable>) else {
+        return Vec::new();
+    };
+    let mut v: Vec<gio::FileInfo> = en
+        .flatten()
+        .filter(|i| {
+            let name = i.name();
+            let name = name.to_string_lossy();
+            !i.is_hidden() && ![".crdownload", ".part", ".download"].iter().any(|s| name.ends_with(s))
+        })
+        .collect();
+    v.sort_by(|a, b| modified_of(b).cmp(&modified_of(a)).then_with(|| a.name().cmp(&b.name())));
+    v.truncate(limit);
+    for i in &v {
+        i.set_attribute_object("standard::file", &dir.child(i.name()));
+    }
+    v
+}
+
 pub fn infos_store(files: impl Iterator<Item = gio::File>) -> gio::ListStore {
     let store = gio::ListStore::new::<gio::FileInfo>();
     for f in files {
@@ -514,6 +543,26 @@ pub(crate) fn gvfs_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod location_tests {
     use super::*;
+
+    #[test]
+    fn recent_downloads_newest_first_without_unfinished() {
+        let dir = std::env::temp_dir().join(format!("rfiles-dl-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        let now = std::time::SystemTime::now();
+        for (name, age) in [("old.pdf", 300), ("new.zip", 10), ("mid.png", 100), ("x.zip.crdownload", 1), (".hidden", 2), ("y.part", 3)] {
+            let f = std::fs::File::create(dir.join(name)).unwrap();
+            f.set_modified(now - std::time::Duration::from_secs(age)).unwrap();
+        }
+        std::fs::File::open(dir.join("folder")).unwrap().set_modified(now - std::time::Duration::from_secs(50)).unwrap();
+        let names = |limit| -> Vec<String> {
+            recent_downloads(&gio::File::for_path(&dir), limit).iter().map(|i| i.name().to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(names(10), ["new.zip", "folder", "mid.png", "old.pdf"]);
+        assert_eq!(names(2), ["new.zip", "folder"]);
+        let first = &recent_downloads(&gio::File::for_path(&dir), 1)[0];
+        assert_eq!(item_file(first).path().unwrap(), dir.join("new.zip"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn path(p: &std::path::Path) -> gio::File {
         gio::File::for_path(p)

@@ -66,7 +66,7 @@ fn eject_message(name: &str, eject: bool, err: Option<&str>) -> String {
 fn loc_on_mount(loc: &Loc, root: &gio::File) -> bool {
     let f = match loc {
         Loc::Dir(f) | Loc::Search { root: f, .. } => f,
-        Loc::Starred => return false,
+        Loc::Starred | Loc::RecentDownloads => return false,
     };
     f.equal(root) || f.has_prefix(root)
 }
@@ -138,6 +138,9 @@ impl App {
             ("recent", "document-open-recent-symbolic", "Recent".into(), Loc::Dir(gio::File::for_uri("recent:///"))),
             ("starred", "starred-symbolic", "Starred".into(), Loc::Starred),
         ];
+        if crate::util::downloads_dir().is_some() {
+            v.push(("recent-downloads", "folder-download-symbolic", "Recent Downloads".into(), Loc::RecentDownloads));
+        }
         let specials = [
             ("desktop", glib::UserDirectory::Desktop, "user-desktop-symbolic", "Desktop"),
             ("documents", glib::UserDirectory::Documents, "folder-documents-symbolic", "Documents"),
