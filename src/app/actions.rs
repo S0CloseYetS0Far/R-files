@@ -101,6 +101,14 @@ impl App {
                 a.new_tab(Loc::Dir(item_file(&i)));
             }
         }));
+        add("open-location", Box::new(|a| {
+            let Some(i) = a.selected_info() else { return };
+            let f = item_file(&i);
+            if let (Some(dir), Some(name)) = (f.parent(), f.basename()) {
+                a.navigate(Loc::Dir(dir));
+                a.select_when_loaded(name.to_string_lossy().into_owned());
+            }
+        }));
         add("open-with", Box::new(|a| {
             if let Some(i) = a.selected_info() {
                 a.launch(&item_file(&i), true);

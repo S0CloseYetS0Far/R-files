@@ -265,6 +265,10 @@ impl App {
             } else {
                 m.push(mi(tr("Open With…"), "win.open-with", ""));
             }
+            // Recent Downloads, Starred and search results list files from other folders
+            if !matches!(self.current_loc(), Loc::Dir(_)) {
+                m.push(mi(tr("Open File Location"), "win.open-location", ""));
+            }
             m.push(None);
         }
         if !trash {
