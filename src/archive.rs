@@ -1,4 +1,5 @@
 //! Compress and extract archives: .zip, .tar, .tar.gz/.tgz, .tar.xz/.txz, .tar.bz2/.tbz2 and .tar.zst/.tzst.
+//! .rar and .7z are extracted only, through the system's libarchive (see `extract_libarchive`).
 //!
 //! Everything is streamed (no file is ever read into memory as a whole)
 //! and runs on a worker thread, with progress in the status bar.
@@ -35,6 +36,8 @@ pub(crate) enum Format {
     TarXz,
     TarBz2,
     TarZst,
+    /// Extract only, read by libarchive
+    Other,
 }
 
 /// Recognised extensions, checked case-insensitively, longest match first.
@@ -49,6 +52,8 @@ const EXTS: &[(&str, Format)] = &[
     (".tzst", Format::TarZst),
     (".tar", Format::Tar),
     (".zip", Format::Zip),
+    (".rar", Format::Other),
+    (".7z", Format::Other),
 ];
 
 /// Formats offered in the Compress dialog (the first one is the default).
@@ -487,6 +492,7 @@ fn write_archive(file: File, fmt: Format, sources: &[PathBuf], p: &Progress) -> 
             tar_into(bzip2::write::BzEncoder::new(w, bzip2::Compression::default()), sources, skip, p)?.finish()?
         }
         Format::TarZst => tar_into(ZstdWriter { inner: w, buf: Vec::new() }, sources, skip, p)?.finish()?,
+        Format::Other => return Err(err("RFiles can't create this kind of archive")),
     };
     w.into_inner().map_err(|e| e.into_error())?;
     Ok(())
@@ -740,6 +746,172 @@ fn extract_zip(file: File, ex: &mut Extractor, p: &Progress, free: Option<u64>) 
     Ok(())
 }
 
+// ================= .rar and .7z: the system's libarchive =================
+
+type Arch = *mut std::ffi::c_void;
+type Entry = *mut std::ffi::c_void;
+type CStrPtr = *const std::ffi::c_char;
+
+/// The few libarchive calls used for reading. Loaded when first needed, so building needs no
+/// libarchive headers; Ubuntu desktops have it already (GNOME Files extracts with it).
+struct LibArchive {
+    read_new: unsafe extern "C" fn() -> Arch,
+    support_filter_all: unsafe extern "C" fn(Arch) -> i32,
+    support_format_all: unsafe extern "C" fn(Arch) -> i32,
+    open_filename: unsafe extern "C" fn(Arch, CStrPtr, usize) -> i32,
+    next_header: unsafe extern "C" fn(Arch, *mut Entry) -> i32,
+    read_data: unsafe extern "C" fn(Arch, *mut std::ffi::c_void, usize) -> isize,
+    filter_bytes: unsafe extern "C" fn(Arch, i32) -> i64,
+    error_string: unsafe extern "C" fn(Arch) -> CStrPtr,
+    read_free: unsafe extern "C" fn(Arch) -> i32,
+    pathname_utf8: unsafe extern "C" fn(Entry) -> CStrPtr,
+    pathname: unsafe extern "C" fn(Entry) -> CStrPtr,
+    filetype: unsafe extern "C" fn(Entry) -> u32,
+    perm: unsafe extern "C" fn(Entry) -> u32,
+    mtime: unsafe extern "C" fn(Entry) -> i64,
+    mtime_is_set: unsafe extern "C" fn(Entry) -> i32,
+    symlink: unsafe extern "C" fn(Entry) -> CStrPtr,
+    hardlink: unsafe extern "C" fn(Entry) -> CStrPtr,
+}
+
+impl LibArchive {
+    unsafe fn load() -> Option<Self> {
+        let h = libc::dlopen(c"libarchive.so.13".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        if h.is_null() {
+            return None;
+        }
+        macro_rules! sym {
+            ($n:literal) => {{
+                let p = libc::dlsym(h, concat!($n, "\0").as_ptr().cast());
+                if p.is_null() {
+                    return None;
+                }
+                // A function pointer is the size of a data pointer on Linux
+                std::mem::transmute_copy::<*mut std::ffi::c_void, _>(&p)
+            }};
+        }
+        Some(LibArchive {
+            read_new: sym!("archive_read_new"),
+            support_filter_all: sym!("archive_read_support_filter_all"),
+            support_format_all: sym!("archive_read_support_format_all"),
+            open_filename: sym!("archive_read_open_filename"),
+            next_header: sym!("archive_read_next_header"),
+            read_data: sym!("archive_read_data"),
+            filter_bytes: sym!("archive_filter_bytes"),
+            error_string: sym!("archive_error_string"),
+            read_free: sym!("archive_read_free"),
+            pathname_utf8: sym!("archive_entry_pathname_utf8"),
+            pathname: sym!("archive_entry_pathname"),
+            filetype: sym!("archive_entry_filetype"),
+            perm: sym!("archive_entry_perm"),
+            mtime: sym!("archive_entry_mtime"),
+            mtime_is_set: sym!("archive_entry_mtime_is_set"),
+            symlink: sym!("archive_entry_symlink"),
+            hardlink: sym!("archive_entry_hardlink"),
+        })
+    }
+
+    fn get() -> io::Result<&'static LibArchive> {
+        static LIB: std::sync::OnceLock<Option<LibArchive>> = std::sync::OnceLock::new();
+        // SAFETY: the signatures above match libarchive 3's API
+        LIB.get_or_init(|| unsafe { Self::load() })
+            .as_ref()
+            .ok_or_else(|| err("opening this kind of archive needs libarchive (the libarchive13 package)"))
+    }
+
+    unsafe fn error(&self, a: Arch) -> io::Error {
+        match cstr((self.error_string)(a)) {
+            Some(m) => err(String::from_utf8_lossy(m.as_bytes()).into_owned()),
+            None => err("the archive can't be read"),
+        }
+    }
+}
+
+/// A C string from libarchive as a path piece; None for NULL.
+unsafe fn cstr<'a>(p: CStrPtr) -> Option<&'a OsStr> {
+    (!p.is_null()).then(|| OsStr::from_bytes(std::ffi::CStr::from_ptr(p).to_bytes()))
+}
+
+/// Closes the reader however extraction ends.
+struct ArchReader(&'static LibArchive, Arch);
+
+impl Drop for ArchReader {
+    fn drop(&mut self) {
+        unsafe { (self.0.read_free)(self.1) };
+    }
+}
+
+/// The current entry's data.
+struct EntryData<'a> {
+    r: &'a ArchReader,
+    p: &'a Progress,
+}
+
+impl Read for EntryData<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let (lib, a) = (self.r.0, self.r.1);
+        let n = unsafe { (lib.read_data)(a, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            return Err(unsafe { lib.error(a) });
+        }
+        // Archive bytes read so far, for the percentage
+        self.p.done.store(unsafe { (lib.filter_bytes)(a, -1) }.max(0) as u64, Ordering::Relaxed);
+        Ok(n as usize)
+    }
+}
+
+/// Feeds every entry of any archive libarchive reads (.rar, .7z, …) to `ex`, which applies the usual safety rules.
+fn extract_libarchive(archive: &Path, ex: &mut Extractor, p: &Progress) -> io::Result<()> {
+    const ARCHIVE_EOF: i32 = 1;
+    const ARCHIVE_WARN: i32 = -20;
+    let lib = LibArchive::get()?;
+    let path = std::ffi::CString::new(archive.as_os_str().as_bytes()).map_err(|_| err("bad file name"))?;
+    unsafe {
+        let a = (lib.read_new)();
+        if a.is_null() {
+            return Err(err("out of memory"));
+        }
+        let r = ArchReader(lib, a);
+        (lib.support_filter_all)(a);
+        (lib.support_format_all)(a);
+        if (lib.open_filename)(a, path.as_ptr(), 64 * 1024) != 0 {
+            return Err(lib.error(a));
+        }
+        loop {
+            let mut e: Entry = std::ptr::null_mut();
+            match (lib.next_header)(a, &mut e) {
+                0 | ARCHIVE_WARN => {}
+                ARCHIVE_EOF => break,
+                _ => return Err(lib.error(a)),
+            }
+            let name = cstr((lib.pathname_utf8)(e))
+                .or_else(|| cstr((lib.pathname)(e)))
+                .ok_or_else(|| err("an entry has a name that can't be read"))?;
+            let rel = safe_rel(Path::new(name))?;
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let mtime = ((lib.mtime_is_set)(e) != 0).then(|| UNIX_EPOCH + Duration::from_secs((lib.mtime)(e).max(0) as u64));
+            // Archives made on Windows may carry no Unix mode
+            let mode = Some((lib.perm)(e)).filter(|m| m & 0o777 != 0);
+            if let Some(target) = cstr((lib.hardlink)(e)) {
+                ex.hardlink(&rel, &safe_rel(Path::new(target))?)?;
+                continue;
+            }
+            match (lib.filetype)(e) & 0o170000 {
+                0o100000 => ex.file(&rel, mode.unwrap_or(0o644), mtime, &mut EntryData { r: &r, p })?,
+                0o040000 => ex.dir(&rel, mode.unwrap_or(0o755), mtime)?,
+                0o120000 => {
+                    let t = cstr((lib.symlink)(e)).ok_or_else(|| err(format!("{}: symlink without target", rel.display())))?;
+                    ex.symlink(&rel, Path::new(t))?
+                }
+                _ => ex.skipped += 1,
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Moves the unpacked content of `tmp` into `dest`: a single top folder
 /// is moved as-is, anything else goes into a folder named `stem`.
 fn place(tmp: &Path, dest: &Path, stem: &OsStr) -> io::Result<(PathBuf, Option<OsString>)> {
@@ -783,6 +955,9 @@ fn extract_limited(archive: &Path, dest: &Path, p: &Progress, limit: Option<u64>
     let res = (|| {
         if fmt == Format::Zip {
             extract_zip(file, &mut ex, p, free)?;
+        } else if fmt == Format::Other {
+            p.reset(len);
+            extract_libarchive(archive, &mut ex, p)?;
         } else {
             p.reset(len);
             let raw = BufReader::with_capacity(64 * 1024, Counting::new(file, &p.done));
@@ -1245,6 +1420,24 @@ mod tests {
         assert!(r.is_err(), "{archive_name} was accepted");
         // Partial output cleaned up
         assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    /// .rar / .7z go through libarchive, which reads by content, so a tar.gz named .7z exercises that path
+    #[test]
+    fn libarchive_extracts_and_keeps_the_safety_rules() {
+        let d = scratch();
+        let proj = make_tree(&d);
+        let p = Progress::default();
+        let tgz = compress(&[proj], &d, "proj", ".tar.gz", Format::TarGz, &p).unwrap();
+        let seven = d.join("proj.7z");
+        fs::rename(&tgz, &seven).unwrap();
+        let (res, skipped) = extract(&seven, &d, &p).unwrap();
+        assert_eq!((res.clone(), skipped), (d.join("proj (2)"), 0));
+        check_tree(&res);
+        assert!(p.done.load(Ordering::Relaxed) > 0);
+        assert_rejected(&d, "dotdot.rar", &evil_tar("../evil.txt", tar::EntryType::Regular, None, b"x"));
+        assert_rejected(&d, "garbage.rar", b"not an archive at all");
+        assert!(!d.join("evil.txt").exists());
     }
 
     #[test]

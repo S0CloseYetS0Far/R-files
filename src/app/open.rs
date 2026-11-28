@@ -46,6 +46,9 @@ impl App {
         let file = item_file(info);
         if is_dir_like(info) {
             self.navigate(Loc::Dir(file));
+        } else if crate::archive::is_archive(&info.name().to_string_lossy()) && file.path().is_some() && !self.in_trash() {
+            // Like GNOME Files: opening an archive unpacks it next to itself (its default app may be GNOME Files)
+            self.activate("extract-here");
         } else {
             self.launch(&file, false);
         }
