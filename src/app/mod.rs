@@ -17,6 +17,7 @@ mod menus;
 mod navigation;
 mod open;
 mod path_entry;
+mod picker;
 mod search;
 mod settings;
 mod sidebar;
@@ -25,6 +26,7 @@ mod view_restore;
 mod views;
 mod window;
 
+pub use self::picker::{build_picker, PickDone, PickKind};
 pub use self::window::build;
 use self::file_actions::*;
 use self::menus::*;
@@ -237,6 +239,8 @@ pub struct App {
     keep_order: Rc<Cell<bool>>,
     /// Watches Downloads while Recent Downloads is shown, so new downloads appear
     downloads_monitor: RefCell<Option<gio::FileMonitor>>,
+    /// Set when this window is a Save / Open dialog for another app
+    picker: RefCell<Option<Rc<picker::Picker>>>,
 }
 
 thread_local! {

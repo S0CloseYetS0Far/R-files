@@ -355,6 +355,7 @@ pub fn build(gapp: &gtk::Application, start: gio::File) -> Rc<App> {
         sorter,
         keep_order,
         downloads_monitor: RefCell::new(None),
+        picker: RefCell::new(None),
     });
 
     OPEN.with(|o| o.borrow_mut().push(app.clone()));
@@ -554,6 +555,7 @@ impl App {
         let a = Rc::downgrade(self);
         self.window.connect_close_request(move |_| {
             let Some(a) = a.upgrade() else { return glib::Propagation::Proceed };
+            a.pick_answer(None);
             a.save_layout();
             a.teardown();
             // Release the window's data once GTK has finished closing it

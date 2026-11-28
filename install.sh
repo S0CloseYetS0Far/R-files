@@ -19,6 +19,12 @@ AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/rfiles-file-manager.
 # "update" builds in its own clone, so a work-in-progress checkout is never touched
 UPDATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/rfiles"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+# RFiles as the Save / Open dialog: a D-Bus service, the portal backend file (system-wide, needs sudo) and
+# the user's portal config choosing it. The portal only reads backend files from /usr/share.
+CHOOSER_DBUS_FILE="$DBUS_DIR/io.github.rfiles.FileChooser.service"
+PORTAL_FILE=/usr/share/xdg-desktop-portal/portals/rfiles.portal
+PORTAL_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/xdg-desktop-portal/gnome-portals.conf"
+PORTAL_MARK="# Written by RFiles install.sh"
 cd "$(dirname "$0")"
 
 reload_dbus() {
@@ -31,9 +37,14 @@ stop_keeper() {
 }
 
 unset_default() {
-    rm -f "$DBUS_FILE" "$AUTOSTART_FILE"
+    rm -f "$DBUS_FILE" "$AUTOSTART_FILE" "$CHOOSER_DBUS_FILE"
     stop_keeper
     reload_dbus
+    # Only a config this script wrote
+    if grep -qxF "$PORTAL_MARK" "$PORTAL_CONF" 2>/dev/null; then
+        rm -f "$PORTAL_CONF"
+        systemctl --user try-restart xdg-desktop-portal.service >/dev/null 2>&1 || true
+    fi
     if [[ "$(xdg-mime query default inode/directory 2>/dev/null)" == "rfiles.desktop" ]]; then
         xdg-mime default org.gnome.Nautilus.desktop inode/directory
     fi
@@ -149,6 +160,29 @@ case "${1:-}" in
         printf '[Desktop Entry]\nType=Application\nName=RFiles (Show in folder)\nExec=%s --keep-file-manager\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n' "$BIN" > "$AUTOSTART_FILE"
         stop_keeper
         setsid "$BIN" --keep-file-manager </dev/null >/dev/null 2>&1 &
+        # Save / Open dialogs (Brave's "Save as", uploads, ...) as RFiles windows instead of GNOME Files
+        printf '[D-BUS Service]\nName=io.github.rfiles.FileChooser\nExec=%s --file-chooser\n' "$BIN" > "$CHOOSER_DBUS_FILE"
+        reload_dbus
+        if [[ ! -f "$PORTAL_FILE" ]]; then
+            echo "To make Save / Open dialogs RFiles too, one file goes in /usr/share (asks for your password):"
+            printf '[portal]\nDBusName=io.github.rfiles.FileChooser\nInterfaces=org.freedesktop.impl.portal.FileChooser\n' \
+                | sudo tee "$PORTAL_FILE" >/dev/null || true
+        fi
+        if [[ ! -f "$PORTAL_FILE" ]]; then
+            echo "Save / Open dialogs stay GNOME Files."
+        elif [[ -f "$PORTAL_CONF" ]] && ! grep -qxF "$PORTAL_MARK" "$PORTAL_CONF"; then
+            echo "You have your own $PORTAL_CONF, so it was left alone. For RFiles Save / Open dialogs, add to it:"
+            echo "  org.freedesktop.impl.portal.FileChooser=rfiles;gnome;"
+        else
+            mkdir -p "$(dirname "$PORTAL_CONF")"
+            # The system's GNOME choices, plus RFiles for file dialogs (GNOME's if RFiles can't answer)
+            {
+                echo "$PORTAL_MARK"
+                cat /usr/share/xdg-desktop-portal/gnome-portals.conf 2>/dev/null || printf '[preferred]\ndefault=gnome;gtk;\n'
+                echo 'org.freedesktop.impl.portal.FileChooser=rfiles;gnome;'
+            } > "$PORTAL_CONF"
+            systemctl --user try-restart xdg-desktop-portal.service >/dev/null 2>&1 || true
+        fi
         echo "RFiles is now your default file manager."
         echo "If GNOME Files is open right now, close it (or log out and back in) so \"Show in folder\" switches over."
         exit 0
