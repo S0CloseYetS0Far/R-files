@@ -19,6 +19,10 @@ impl App {
 
     /// Opens every selected item: files in their default app, the first folder here, other folders in new tabs.
     pub(super) fn open_selected(self: &Rc<Self>) {
+        if self.is_picker() {
+            self.pick_accept();
+            return;
+        }
         let infos = self.selected_infos();
         let plan = plan_open(&infos.iter().map(is_dir_like).collect::<Vec<_>>());
         for &i in &plan.files {
@@ -36,6 +40,9 @@ impl App {
     }
 
     pub fn open_info(self: &Rc<Self>, info: &gio::FileInfo) {
+        if self.pick_activate(info) {
+            return;
+        }
         let file = item_file(info);
         if is_dir_like(info) {
             self.navigate(Loc::Dir(file));

@@ -132,6 +132,13 @@ at login. So `set-default` also starts a small helper at login,
 each request to RFiles. If GNOME Files got there first, the helper takes over
 as soon as GNOME Files closes, and GNOME Files can't take it back.
 
+`set-default` also makes RFiles the **Save / Open dialog** of other apps: Brave's
+and Firefox's "Save as", file uploads, and every app that asks the desktop
+portal for a file dialog. The dialog is an RFiles window with a name box and
+Save / Open at the bottom. This needs one small file in `/usr/share` (the portal
+only looks there), so it asks for your password once. `unset-default` gives the
+dialogs back to GNOME Files.
+
 Optional extras:
 
 - **Dock:** right-click RFiles in the app grid → *Pin to Dash*, and unpin Files.

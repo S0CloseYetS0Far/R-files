@@ -6,6 +6,7 @@ mod config;
 mod dbus_service;
 mod dnd;
 mod docs;
+mod file_chooser;
 mod fileops;
 mod gpu;
 mod i18n;
@@ -198,6 +199,11 @@ fn main() -> glib::ExitCode {
     // `--keep-file-manager`: started at login by `install.sh set-default` (see dbus_service.rs)
     if std::env::args().nth(1).as_deref() == Some("--keep-file-manager") {
         dbus_service::keep_role();
+    }
+
+    // `--file-chooser`: the desktop's Save / Open dialog, started by D-Bus (see file_chooser.rs)
+    if std::env::args().nth(1).as_deref() == Some("--file-chooser") {
+        return file_chooser::run();
     }
 
     // `--dbus-service`: started by D-Bus for a "Show in folder" request.
